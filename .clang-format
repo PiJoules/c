@@ -1,0 +1,4 @@
+BasedOnStyle: google
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: true
+BracedInitializerIndentWidth: 2
