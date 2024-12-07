@@ -165,6 +165,8 @@ LLVMValueRef LLVMBuildPtrToInt(LLVMBuilderRef, LLVMValueRef Val,
                                LLVMTypeRef DestTy, const char *Name);
 LLVMValueRef LLVMBuildIntToPtr(LLVMBuilderRef, LLVMValueRef Val,
                                LLVMTypeRef DestTy, const char *Name);
+LLVMValueRef LLVMBuildMul(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
+                          const char *Name);
 LLVMValueRef LLVMBuildAdd(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                           const char *Name);
 LLVMValueRef LLVMBuildSub(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
@@ -193,6 +195,45 @@ LLVMValueRef LLVMBuildURem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                            const char *Name);
 LLVMValueRef LLVMBuildSRem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                            const char *Name);
+LLVMValueRef LLVMGetLastInstruction(LLVMBasicBlockRef BB);
+
+typedef enum {
+  LLVMArgumentValueKind,
+  LLVMBasicBlockValueKind,
+  LLVMMemoryUseValueKind,
+  LLVMMemoryDefValueKind,
+  LLVMMemoryPhiValueKind,
+
+  LLVMFunctionValueKind,
+  LLVMGlobalAliasValueKind,
+  LLVMGlobalIFuncValueKind,
+  LLVMGlobalVariableValueKind,
+  LLVMBlockAddressValueKind,
+  LLVMConstantExprValueKind,
+  LLVMConstantArrayValueKind,
+  LLVMConstantStructValueKind,
+  LLVMConstantVectorValueKind,
+
+  LLVMUndefValueValueKind,
+  LLVMConstantAggregateZeroValueKind,
+  LLVMConstantDataArrayValueKind,
+  LLVMConstantDataVectorValueKind,
+  LLVMConstantIntValueKind,
+  LLVMConstantFPValueKind,
+  LLVMConstantPointerNullValueKind,
+  LLVMConstantTokenNoneValueKind,
+
+  LLVMMetadataAsValueValueKind,
+  LLVMInlineAsmValueKind,
+
+  LLVMInstructionValueKind,
+  LLVMPoisonValueValueKind,
+  LLVMConstantTargetNoneValueKind,
+  LLVMConstantPtrAuthValueKind,
+} LLVMValueKind;
+LLVMValueKind LLVMGetValueKind(LLVMValueRef Val);
+
+LLVMValueRef LLVMIsATerminatorInst(LLVMValueRef Inst);
 
 typedef enum {
   LLVMIntEQ = 32, /**< equal */
@@ -5627,6 +5668,7 @@ static bool should_use_icmp(LLVMTypeRef type) {
   }
 }
 
+// NOTE: This always returns an i1.
 LLVMValueRef compile_to_bool(Compiler *compiler, LLVMBuilderRef builder,
                              const Expr *expr, TreeMap *local_ctx,
                              TreeMap *local_allocas) {
@@ -5687,6 +5729,13 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
 LLVMValueRef compile_implicit_cast(Compiler *compiler, LLVMBuilderRef builder,
                                    const Expr *from, const Type *to,
                                    TreeMap *local_ctx, TreeMap *local_allocas) {
+  to = sema_resolve_maybe_named_type(compiler->sema, to);
+  if (is_builtin_type(to, BTK_Bool)) {
+    LLVMValueRef res =
+        compile_to_bool(compiler, builder, from, local_ctx, local_allocas);
+    return LLVMBuildZExt(builder, res, LLVMInt8Type(), "");
+  }
+
   LLVMValueRef llvm_from =
       compile_expr(compiler, builder, from, local_ctx, local_allocas);
 
@@ -5789,6 +5838,10 @@ LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
   return phi;
 }
 
+LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
+                                const Expr *expr, TreeMap *local_ctx,
+                                TreeMap *local_allocas);
+
 LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
                            const BinOp *expr, TreeMap *local_ctx,
                            TreeMap *local_allocas) {
@@ -5804,7 +5857,8 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
         sema_get_type_of_expr_in_ctx(compiler->sema, expr->lhs, local_ctx);
     rhs = compile_implicit_cast(compiler, builder, expr->rhs, lhs_ty, local_ctx,
                                 local_allocas);
-    lhs = compile_expr(compiler, builder, expr->lhs, local_ctx, local_allocas);
+    lhs = compile_lvalue_ptr(compiler, builder, expr->lhs, local_ctx,
+                             local_allocas);
   } else {
     common_ty = sema_get_common_type_of_exprs(compiler->sema, expr->lhs,
                                               expr->rhs, local_ctx);
@@ -5867,6 +5921,9 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
     case BOK_Sub:
       res = LLVMBuildSub(builder, lhs, rhs, "");
       break;
+    case BOK_Mul:
+      res = LLVMBuildMul(builder, lhs, rhs, "");
+      break;
     case BOK_BitwiseAnd:
       res = LLVMBuildAnd(builder, lhs, rhs, "");
       break;
@@ -5916,15 +5973,19 @@ LLVMTypeRef get_llvm_type_of_expr_global_ctx(Compiler *compiler,
 
 // Returns a vector of LLVMValueRefs.
 // `args` is a vector of Expr* (the same as `Call::args`).
+// `func_args` is a vector of FunctionArg (same as `FunctionType::pos_args`).
 vector compile_call_args(Compiler *compiler, LLVMBuilderRef builder,
-                         const vector *args, TreeMap *local_ctx,
-                         TreeMap *local_allocas) {
+                         const vector *args, const vector *func_args,
+                         TreeMap *local_ctx, TreeMap *local_allocas) {
   vector llvm_args;
   vector_construct(&llvm_args, sizeof(LLVMValueRef), alignof(LLVMValueRef));
   for (size_t i = 0; i < args->size; ++i) {
+    const FunctionArg *func_arg_ty = vector_at(func_args, i);
+
     LLVMValueRef *storage = vector_append_storage(&llvm_args);
     const Expr *arg = *(const Expr **)vector_at(args, i);
-    *storage = compile_expr(compiler, builder, arg, local_ctx, local_allocas);
+    *storage = compile_implicit_cast(compiler, builder, arg, func_arg_ty->type,
+                                     local_ctx, local_allocas);
   }
   return llvm_args;
 }
@@ -5957,33 +6018,14 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
     case EK_DeclRef: {
       const DeclRef *decl = (const DeclRef *)expr;
       bool is_func = LLVMGetTypeKind(type) == LLVMFunctionTypeKind;
-
-      LLVMValueRef val = NULL;
-      tree_map_get(local_allocas, decl->name, (void *)&val);
-      if (!val) {
-        // If not in the local scope, check the global scope.
-        //
-        // TODO: How come there's no wrapper for Module::getNamedValue?
-        // Without it, I need to explicitly call the individual getters for
-        // functions, global variables, adn aliases.
-        if (is_func)
-          val = LLVMGetNamedFunction(compiler->mod, decl->name);
-        else
-          val = LLVMGetNamedGlobal(compiler->mod, decl->name);
-
-        if (!val) {
-          printf("Couldn't find alloca or global for '%s'\n", decl->name);
-          LLVMValueRef fn =
-              LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
-          LLVMDumpValue(fn);
-          __builtin_trap();
-        }
+      if (is_func) {
+        LLVMValueRef val = LLVMGetNamedFunction(compiler->mod, decl->name);
+        assert(val);
+        return val;
       }
 
-      if (is_func)
-        return val;
-
-      assert(LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind);
+      LLVMValueRef val =
+          compile_lvalue_ptr(compiler, builder, expr, local_ctx, local_allocas);
       return LLVMBuildLoad2(builder, type, val, "");
     }
     case EK_Call: {
@@ -6004,14 +6046,17 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
         }
       }
 
-      const Type *func_ty =
+      const Type *ty =
           sema_get_type_of_expr_in_ctx(compiler->sema, call->base, local_ctx);
-      LLVMTypeRef llvm_func_ty = get_llvm_type(compiler, func_ty);
+      assert(ty->vtable->kind == TK_FunctionType);
+      const FunctionType *func_ty = (const FunctionType *)ty;
+      LLVMTypeRef llvm_func_ty = get_llvm_type(compiler, ty);
       LLVMValueRef llvm_func =
           compile_expr(compiler, builder, call->base, local_ctx, local_allocas);
 
-      vector llvm_args = compile_call_args(compiler, builder, &call->args,
-                                           local_ctx, local_allocas);
+      vector llvm_args =
+          compile_call_args(compiler, builder, &call->args, &func_ty->pos_args,
+                            local_ctx, local_allocas);
 
       LLVMValueRef res =
           LLVMBuildCall2(builder, llvm_func_ty, llvm_func, llvm_args.data,
@@ -6025,18 +6070,13 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
       const MemberAccess *access = (const MemberAccess *)expr;
       const StructType *base_ty = sema_get_struct_type_from_member_access(
           compiler->sema, access, local_ctx);
-      size_t offset;
       const StructMember *member =
-          struct_get_member(base_ty, access->member, &offset);
-      LLVMValueRef base_llvm = compile_expr(compiler, builder, access->base,
-                                            local_ctx, local_allocas);
-      LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
-      LLVMValueRef llvm_offset = LLVMConstInt(
-          get_llvm_type(compiler, member->type), offset, /*signed=*/0);
-      LLVMValueRef offsets[] = {llvm_offset};
-      LLVMValueRef gep =
-          LLVMBuildGEP2(builder, llvm_base_ty, base_llvm, offsets, 1, "");
-      return gep;
+          struct_get_member(base_ty, access->member, NULL);
+      LLVMValueRef ptr =
+          compile_lvalue_ptr(compiler, builder, expr, local_ctx, local_allocas);
+      LLVMValueRef val = LLVMBuildLoad2(
+          builder, get_llvm_type(compiler, member->type), ptr, "");
+      return val;
     }
     case EK_Conditional: {
       const Conditional *conditional = (const Conditional *)expr;
@@ -6107,7 +6147,12 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
   // Emit if BB.
   LLVMPositionBuilderAtEnd(builder, ifbb);
   compile_statement(compiler, builder, stmt->body, local_ctx, local_allocas);
-  LLVMBuildBr(builder, mergebb);
+
+  ifbb = LLVMGetInsertBlock(builder);
+  LLVMValueRef last = LLVMGetLastInstruction(ifbb);
+  if (!LLVMIsATerminatorInst(last))
+    LLVMBuildBr(builder, mergebb);
+
   ifbb = LLVMGetInsertBlock(builder);  // Codegen of 'if' can change the current
                                        // block, update ifbb for the PHI.
 
@@ -6117,8 +6162,14 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
   if (stmt->else_stmt) {
     compile_if_statement(compiler, builder, stmt->else_stmt, local_ctx,
                          local_allocas);
+    elsebb = LLVMGetInsertBlock(builder);
+    last = LLVMGetLastInstruction(elsebb);
+    if (!LLVMIsATerminatorInst(last))
+      LLVMBuildBr(builder, mergebb);
+  } else {
+    LLVMBuildBr(builder, mergebb);
   }
-  LLVMBuildBr(builder, mergebb);
+
   elsebb =
       LLVMGetInsertBlock(builder);  // Codegen of 'else' can change the current
                                     // block, update ifbb for the PHI.
@@ -6140,6 +6191,12 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
       return compile_if_statement(compiler, builder, (const IfStmt *)stmt,
                                   local_ctx, local_allocas);
     case SK_ReturnStmt: {
+      // LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
+      // LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+      // LLVMBasicBlockRef retbb = LLVMAppendBasicBlockInContext(ctx, fn,
+      // "ret"); LLVMBuildBr(builder, retbb); LLVMPositionBuilderAtEnd(builder,
+      // retbb);
+
       const ReturnStmt *ret = (const ReturnStmt *)stmt;
       if (!ret->expr) {
         LLVMBuildRetVoid(builder);
@@ -6148,6 +6205,14 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
       LLVMValueRef val =
           compile_expr(compiler, builder, ret->expr, local_ctx, local_allocas);
       LLVMBuildRet(builder, val);
+      return;
+    }
+    case SK_CompoundStmt: {
+      const CompoundStmt *compound = (const CompoundStmt *)stmt;
+      for (size_t i = 0; i < compound->body.size; ++i) {
+        Statement *stmt = *(Statement **)vector_at(&compound->body, i);
+        compile_statement(compiler, builder, stmt, local_ctx, local_allocas);
+      }
       return;
     }
     default:
@@ -6195,10 +6260,8 @@ void compile_function_definition(Compiler *compiler,
   }
 
   // TODO: Track argument names.
-  for (size_t i = 0; i < f->body->body.size; ++i) {
-    Statement *stmt = *(Statement **)vector_at(&f->body->body, i);
-    compile_statement(compiler, builder, stmt, &local_ctx, &local_allocas);
-  }
+  compile_statement(compiler, builder, &f->body->base, &local_ctx,
+                    &local_allocas);
 
   if (is_void_type(func_ty->return_type))
     LLVMBuildRetVoid(builder);
@@ -6215,8 +6278,60 @@ void compile_function_definition(Compiler *compiler,
   if (LLVMVerifyFunction(func, LLVMPrintMessageAction)) {
     printf("Verify function '%s' failed\n", f->name);
     LLVMDumpValue(func);
-    LLVMDumpModule(compiler->mod);
+    // LLVMDumpModule(compiler->mod);
     __builtin_trap();
+  }
+}
+
+LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
+                                const Expr *expr, TreeMap *local_ctx,
+                                TreeMap *local_allocas) {
+  switch (expr->vtable->kind) {
+    case EK_DeclRef: {
+      const DeclRef *decl = (const DeclRef *)expr;
+
+      LLVMValueRef val = NULL;
+      tree_map_get(local_allocas, decl->name, (void *)&val);
+      if (!val) {
+        // If not in the local scope, check the global scope.
+        //
+        // TODO: How come there's no wrapper for Module::getNamedValue?
+        // Without it, I need to explicitly call the individual getters for
+        // functions, global variables, adn aliases.
+        val = LLVMGetNamedGlobal(compiler->mod, decl->name);
+
+        if (!val) {
+          printf("Couldn't find alloca or global for '%s'\n", decl->name);
+          LLVMValueRef fn =
+              LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+          LLVMDumpValue(fn);
+          __builtin_trap();
+        }
+      }
+
+      assert(LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind);
+      return val;
+    }
+    case EK_MemberAccess: {
+      const MemberAccess *access = (const MemberAccess *)expr;
+      const StructType *base_ty = sema_get_struct_type_from_member_access(
+          compiler->sema, access, local_ctx);
+      size_t offset;
+      const StructMember *member =
+          struct_get_member(base_ty, access->member, &offset);
+      LLVMValueRef base_llvm = compile_expr(compiler, builder, access->base,
+                                            local_ctx, local_allocas);
+      LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
+      LLVMValueRef llvm_offset = LLVMConstInt(
+          get_llvm_type(compiler, member->type), offset, /*signed=*/0);
+      LLVMValueRef offsets[] = {llvm_offset};
+      LLVMValueRef gep =
+          LLVMBuildGEP2(builder, llvm_base_ty, base_llvm, offsets, 1, "");
+      return gep;
+    }
+    default:
+      printf("TODO: Handle lvalue for EK %d\n", expr->vtable->kind);
+      __builtin_trap();
   }
 }
 
