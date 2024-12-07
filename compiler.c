@@ -161,6 +161,10 @@ LLVMValueRef LLVMBuildRetVoid(LLVMBuilderRef);
 LLVMValueRef LLVMBuildRet(LLVMBuilderRef, LLVMValueRef V);
 LLVMValueRef LLVMConstIntToPtr(LLVMValueRef ConstantVal, LLVMTypeRef ToType);
 LLVMValueRef LLVMConstPtrToInt(LLVMValueRef ConstantVal, LLVMTypeRef ToType);
+LLVMValueRef LLVMBuildPtrToInt(LLVMBuilderRef, LLVMValueRef Val,
+                               LLVMTypeRef DestTy, const char *Name);
+LLVMValueRef LLVMBuildIntToPtr(LLVMBuilderRef, LLVMValueRef Val,
+                               LLVMTypeRef DestTy, const char *Name);
 LLVMValueRef LLVMBuildAdd(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                           const char *Name);
 LLVMValueRef LLVMBuildSub(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
@@ -182,7 +186,13 @@ LLVMValueRef LLVMBuildXor(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
 LLVMValueRef LLVMBuildGEP2(LLVMBuilderRef B, LLVMTypeRef Ty,
                            LLVMValueRef Pointer, LLVMValueRef *Indices,
                            unsigned NumIndices, const char *Name);
-LLVMValueRef 	LLVMBuildPhi (LLVMBuilderRef, LLVMTypeRef Ty, const char *Name);
+LLVMValueRef LLVMBuildPhi(LLVMBuilderRef, LLVMTypeRef Ty, const char *Name);
+void LLVMAddIncoming(LLVMValueRef PhiNode, LLVMValueRef *IncomingValues,
+                     LLVMBasicBlockRef *IncomingBlocks, unsigned Count);
+LLVMValueRef LLVMBuildURem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
+                           const char *Name);
+LLVMValueRef LLVMBuildSRem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
+                           const char *Name);
 
 typedef enum {
   LLVMIntEQ = 32, /**< equal */
@@ -4963,6 +4973,11 @@ const Type *sema_get_type_of_unop_expr(const Sema *sema, const UnOp *expr,
 
 size_t sema_eval_sizeof_type(const Sema *sema, const Type *type);
 
+bool sema_is_unsigned_integral_type(const Sema *sema, const Type *type) {
+  type = sema_resolve_maybe_named_type(sema, type);
+  return is_unsigned_integral_type(type);
+}
+
 const Type *sema_get_corresponding_unsigned_type(const Sema *sema,
                                                  const BuiltinType *bt) {
   if (is_unsigned_integral_type(&bt->type))
@@ -5169,8 +5184,7 @@ const Type *sema_get_type_of_expr_in_ctx(const Sema *sema, const Expr *expr,
     case EK_Conditional: {
       const Conditional *conditional = (const Conditional *)expr;
       return sema_get_common_type_of_exprs(sema, conditional->true_expr,
-                                           conditional->false_expr,
-                                           local_ctx);
+                                           conditional->false_expr, local_ctx);
     }
     default:
       printf("TODO: Implement sema_get_type_of_expr for this expression %d\n",
@@ -5724,13 +5738,13 @@ LLVMValueRef compile_local_variable(Compiler *compiler, LLVMBuilderRef builder,
 }
 
 LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
-                          const Conditional *expr, TreeMap *local_ctx,
-                          TreeMap *local_allocas) {
+                                 const Conditional *expr, TreeMap *local_ctx,
+                                 TreeMap *local_allocas) {
   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
   LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
 
   LLVMValueRef cond =
-      compile_expr(compiler, builder, expr->cond, local_ctx, local_allocas);
+      compile_to_bool(compiler, builder, expr->cond, local_ctx, local_allocas);
 
   assert(LLVMGetTypeKind(LLVMTypeOf(cond)) == LLVMIntegerTypeKind);
   assert(LLVMGetIntTypeWidth(LLVMTypeOf(cond)) == 1);
@@ -5745,7 +5759,8 @@ LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
 
   // Emit if BB.
   LLVMPositionBuilderAtEnd(builder, ifbb);
-  LLVMValueRef true_expr = compile_expr(compiler, builder, expr->true_expr, local_ctx, local_allocas);
+  LLVMValueRef true_expr = compile_expr(compiler, builder, expr->true_expr,
+                                        local_ctx, local_allocas);
   LLVMBuildBr(builder, mergebb);
   ifbb = LLVMGetInsertBlock(builder);  // Codegen of 'if' can change the current
                                        // block, update ifbb for the PHI.
@@ -5753,7 +5768,8 @@ LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
   // Emit potential else BB.
   LLVMAppendExistingBasicBlock(fn, elsebb);
   LLVMPositionBuilderAtEnd(builder, elsebb);
-  LLVMValueRef false_expr = compile_expr(compiler, builder, expr->false_expr, local_ctx, local_allocas);
+  LLVMValueRef false_expr = compile_expr(compiler, builder, expr->false_expr,
+                                         local_ctx, local_allocas);
   LLVMBuildBr(builder, mergebb);
   elsebb =
       LLVMGetInsertBlock(builder);  // Codegen of 'else' can change the current
@@ -5763,13 +5779,21 @@ LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
   LLVMAppendExistingBasicBlock(fn, mergebb);
   LLVMPositionBuilderAtEnd(builder, mergebb);
 
-  LLVMValueRef phi = LLVMBuildPhi(builder, 
+  const Type *common_ty = sema_get_common_type_of_exprs(
+      compiler->sema, expr->true_expr, expr->false_expr, local_ctx);
+  LLVMValueRef phi =
+      LLVMBuildPhi(builder, get_llvm_type(compiler, common_ty), "");
+  LLVMValueRef incoming_vals[] = {true_expr, false_expr};
+  LLVMBasicBlockRef incoming_blocks[] = {ifbb, elsebb};
+  LLVMAddIncoming(phi, incoming_vals, incoming_blocks, 2);
+  return phi;
 }
 
 LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
                            const BinOp *expr, TreeMap *local_ctx,
                            TreeMap *local_allocas) {
   LLVMValueRef lhs, rhs;
+  const Type *common_ty;
   if (is_logical_binop(expr->op)) {
     lhs =
         compile_to_bool(compiler, builder, expr->lhs, local_ctx, local_allocas);
@@ -5782,8 +5806,8 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
                                 local_allocas);
     lhs = compile_expr(compiler, builder, expr->lhs, local_ctx, local_allocas);
   } else {
-    const Type *common_ty = sema_get_common_type_of_exprs(
-        compiler->sema, expr->lhs, expr->rhs, local_ctx);
+    common_ty = sema_get_common_type_of_exprs(compiler->sema, expr->lhs,
+                                              expr->rhs, local_ctx);
     lhs = compile_implicit_cast(compiler, builder, expr->lhs, common_ty,
                                 local_ctx, local_allocas);
     rhs = compile_implicit_cast(compiler, builder, expr->rhs, common_ty,
@@ -5793,11 +5817,49 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
   LLVMValueRef res;
 
   switch (expr->op) {
+    case BOK_Lt: {
+      LLVMIntPredicate op =
+          sema_is_unsigned_integral_type(compiler->sema, common_ty)
+              ? LLVMIntULT
+              : LLVMIntSLT;
+      res = LLVMBuildICmp(builder, op, lhs, rhs, "");
+      break;
+    }
+    case BOK_Gt: {
+      LLVMIntPredicate op =
+          sema_is_unsigned_integral_type(compiler->sema, common_ty)
+              ? LLVMIntUGT
+              : LLVMIntSGT;
+      res = LLVMBuildICmp(builder, op, lhs, rhs, "");
+      break;
+    }
+    case BOK_Le: {
+      LLVMIntPredicate op =
+          sema_is_unsigned_integral_type(compiler->sema, common_ty)
+              ? LLVMIntULE
+              : LLVMIntSLE;
+      res = LLVMBuildICmp(builder, op, lhs, rhs, "");
+      break;
+    }
+    case BOK_Ge: {
+      LLVMIntPredicate op =
+          sema_is_unsigned_integral_type(compiler->sema, common_ty)
+              ? LLVMIntUGE
+              : LLVMIntSGE;
+      res = LLVMBuildICmp(builder, op, lhs, rhs, "");
+      break;
+    }
     case BOK_Ne:
       res = LLVMBuildICmp(builder, LLVMIntNE, lhs, rhs, "");
       break;
     case BOK_Eq:
       res = LLVMBuildICmp(builder, LLVMIntEQ, lhs, rhs, "");
+      break;
+    case BOK_Mod:
+      if (sema_is_unsigned_integral_type(compiler->sema, common_ty))
+        res = LLVMBuildURem(builder, lhs, rhs, "");
+      else
+        res = LLVMBuildSRem(builder, lhs, rhs, "");
       break;
     case BOK_Add:
       res = LLVMBuildAdd(builder, lhs, rhs, "");
@@ -5977,7 +6039,40 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
       return gep;
     }
     case EK_Conditional: {
-      const Conditional *conditional = (const Conditional *expr);
+      const Conditional *conditional = (const Conditional *)expr;
+      return compile_conditional(compiler, builder, conditional, local_ctx,
+                                 local_allocas);
+    }
+    case EK_Cast: {
+      const Cast *cast = (const Cast *)expr;
+
+      LLVMValueRef from =
+          compile_expr(compiler, builder, cast->base, local_ctx, local_allocas);
+
+      LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, cast->to);
+      LLVMTypeRef llvm_from_ty = LLVMTypeOf(from);
+
+      if (llvm_to_ty == llvm_from_ty)
+        return from;
+
+      if (LLVMGetTypeKind(llvm_from_ty) == LLVMPointerTypeKind) {
+        if (LLVMGetTypeKind(llvm_to_ty) == LLVMIntegerTypeKind) {
+          // TODO: Check the size.
+          // unsigned int_width = LLVMGetIntTypeWidth(llvm_from_ty);
+          return LLVMBuildPtrToInt(builder, from, llvm_to_ty, "");
+        }
+      }
+
+      // if (is_integral_type(from_ty) && is_integral_type(to_ty)) {
+      //   size_t from_size = builtin_type_get_size((const BuiltinType
+      //   *)from_ty); size_t to_size = builtin_type_get_size((const BuiltinType
+      //   *)to_ty);
+      // }
+
+      printf("TODO: Unhandled implicit cast conversion\n");
+      LLVMDumpType(llvm_from_ty);
+      LLVMDumpType(llvm_to_ty);
+      __builtin_trap();
     }
     default:
       printf("TODO: implement compile_expr for this expr %d\n",
@@ -5996,7 +6091,7 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
   LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
   LLVMValueRef cond =
-      compile_expr(compiler, builder, stmt->cond, local_ctx, local_allocas);
+      compile_to_bool(compiler, builder, stmt->cond, local_ctx, local_allocas);
 
   assert(LLVMGetTypeKind(LLVMTypeOf(cond)) == LLVMIntegerTypeKind);
   assert(LLVMGetIntTypeWidth(LLVMTypeOf(cond)) == 1);
@@ -6120,6 +6215,7 @@ void compile_function_definition(Compiler *compiler,
   if (LLVMVerifyFunction(func, LLVMPrintMessageAction)) {
     printf("Verify function '%s' failed\n", f->name);
     LLVMDumpValue(func);
+    LLVMDumpModule(compiler->mod);
     __builtin_trap();
   }
 }
