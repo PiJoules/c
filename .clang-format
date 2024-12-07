@@ -1,4 +1,5 @@
 BasedOnStyle: google
 AllowShortIfStatementsOnASingleLine: Never
 AllowShortLoopsOnASingleLine: true
-BracedInitializerIndentWidth: 2
+# Only available since clang-17
+#BracedInitializerIndentWidth: 2

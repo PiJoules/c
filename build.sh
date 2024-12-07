@@ -4,7 +4,7 @@ OUTPUT_BIN=c
 
 CC=${CC:-clang}
 COMPILE_FLAGS="-fsanitize=address -fsanitize=undefined -fPIC -Wall -Werror \
-  -Wconversion -Wno-builtin-requires-header -std=c23 -g -Wimplicit-fallthrough \
+  -Wconversion -Wno-builtin-requires-header -std=c2x -g -Wimplicit-fallthrough \
   -ftrivial-auto-var-init=pattern -Wno-incompatible-library-redeclaration \
   -fsanitize=bounds -fuse-ld=lld -fno-sanitize-recover=all"
 

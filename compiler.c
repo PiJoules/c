@@ -179,6 +179,10 @@ LLVMValueRef LLVMBuildGlobalStringPtr(LLVMBuilderRef B, const char *Str,
                                       const char *Name);
 LLVMValueRef LLVMBuildXor(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                           const char *Name);
+LLVMValueRef LLVMBuildGEP2(LLVMBuilderRef B, LLVMTypeRef Ty,
+                           LLVMValueRef Pointer, LLVMValueRef *Indices,
+                           unsigned NumIndices, const char *Name);
+LLVMValueRef 	LLVMBuildPhi (LLVMBuilderRef, LLVMTypeRef Ty, const char *Name);
 
 typedef enum {
   LLVMIntEQ = 32, /**< equal */
@@ -850,9 +854,9 @@ int file_input_stream_read(InputStream *);
 int file_input_stream_eof(InputStream *);
 
 const InputStreamVtable FileInputStreamVtable = {
-  .dtor = file_input_stream_destroy,
-  .read = file_input_stream_read,
-  .eof = file_input_stream_eof,
+    .dtor = file_input_stream_destroy,
+    .read = file_input_stream_read,
+    .eof = file_input_stream_eof,
 };
 
 typedef struct {
@@ -885,9 +889,9 @@ int string_input_stream_read(InputStream *);
 int string_input_stream_eof(InputStream *);
 
 const InputStreamVtable StringInputStreamVtable = {
-  .dtor = string_input_stream_destroy,
-  .read = string_input_stream_read,
-  .eof = string_input_stream_eof,
+    .dtor = string_input_stream_destroy,
+    .read = string_input_stream_read,
+    .eof = string_input_stream_eof,
 };
 
 typedef struct {
@@ -1215,7 +1219,8 @@ Token lex(Lexer *lexer) {
 
       if (lexer_peek_char(lexer) == '/') {
         // This is a comment. Consume all characters until the newline.
-        while (lexer_get_char(lexer) != '\n');
+        while (lexer_get_char(lexer) != '\n')
+          ;
         string_clear(&tok.chars);
         continue;
       }
@@ -1550,8 +1555,8 @@ typedef struct {
 void replacement_sentinel_type_destroy(Type *) {}
 
 const TypeVtable ReplacementSentinelTypeVtable = {
-  .kind = TK_ReplacementSentinelType,
-  .dtor = replacement_sentinel_type_destroy,
+    .kind = TK_ReplacementSentinelType,
+    .dtor = replacement_sentinel_type_destroy,
 };
 
 ReplacementSentinelType GetSentinel() {
@@ -1582,8 +1587,8 @@ typedef enum {
 void builtin_type_destroy(Type *) {}
 
 const TypeVtable BuiltinTypeVtable = {
-  .kind = TK_BuiltinType,
-  .dtor = builtin_type_destroy,
+    .kind = TK_BuiltinType,
+    .dtor = builtin_type_destroy,
 };
 
 typedef struct {
@@ -1684,8 +1689,8 @@ bool is_bool_type(const Type *type) { return is_builtin_type(type, BTK_Bool); }
 void struct_type_destroy(Type *);
 
 const TypeVtable StructTypeVtable = {
-  .kind = TK_StructType,
-  .dtor = struct_type_destroy,
+    .kind = TK_StructType,
+    .dtor = struct_type_destroy,
 };
 
 typedef struct {
@@ -1731,14 +1736,18 @@ void struct_type_destroy(Type *type) {
   }
 }
 
-const StructMember *struct_get_member(const StructType *st, const char *name) {
+const StructMember *struct_get_member(const StructType *st, const char *name,
+                                      size_t *offset) {
   if (!st->members)
     return NULL;
 
   for (size_t i = 0; i < st->members->size; ++i) {
     const StructMember *member = vector_at(st->members, i);
-    if (strcmp(member->name, name) == 0)
+    if (strcmp(member->name, name) == 0) {
+      if (offset)
+        *offset = i;
       return member;
+    }
   }
 
   return NULL;
@@ -1747,8 +1756,8 @@ const StructMember *struct_get_member(const StructType *st, const char *name) {
 void enum_type_destroy(Type *);
 
 const TypeVtable EnumTypeVtable = {
-  .kind = TK_EnumType,
-  .dtor = enum_type_destroy,
+    .kind = TK_EnumType,
+    .dtor = enum_type_destroy,
 };
 
 struct Expr;
@@ -1801,8 +1810,8 @@ void enum_type_destroy(Type *type) {
 void function_type_destroy(Type *);
 
 const TypeVtable FunctionTypeVtable = {
-  .kind = TK_FunctionType,
-  .dtor = function_type_destroy,
+    .kind = TK_FunctionType,
+    .dtor = function_type_destroy,
 };
 
 typedef struct {
@@ -1848,8 +1857,8 @@ Type *get_arg_type(const FunctionType *func, size_t i) {
 void array_type_destroy(Type *);
 
 const TypeVtable ArrayTypeVtable = {
-  .kind = TK_ArrayType,
-  .dtor = array_type_destroy,
+    .kind = TK_ArrayType,
+    .dtor = array_type_destroy,
 };
 
 typedef struct {
@@ -1884,8 +1893,8 @@ void array_type_destroy(Type *type) {
 void pointer_type_destroy(Type *);
 
 const TypeVtable PointerTypeVtable = {
-  .kind = TK_PointerType,
-  .dtor = pointer_type_destroy,
+    .kind = TK_PointerType,
+    .dtor = pointer_type_destroy,
 };
 
 typedef struct {
@@ -1923,8 +1932,8 @@ const Type *get_pointee(const Type *type) {
 void named_type_destroy(Type *);
 
 const TypeVtable NamedTypeVtable = {
-  .kind = TK_NamedType,
-  .dtor = named_type_destroy,
+    .kind = TK_NamedType,
+    .dtor = named_type_destroy,
 };
 
 typedef struct {
@@ -2142,8 +2151,8 @@ void node_destroy(Node *node) { node->vtable->dtor(node); }
 void typedef_destroy(Node *);
 
 const NodeVtable TypedefVtable = {
-  .kind = NK_Typedef,
-  .dtor = typedef_destroy,
+    .kind = NK_Typedef,
+    .dtor = typedef_destroy,
 };
 
 typedef struct {
@@ -2178,8 +2187,8 @@ bool is_next_token_type_token(Parser *);
 void static_assert_destroy(Node *);
 
 const NodeVtable StaticAssertVtable = {
-  .kind = NK_StaticAssert,
-  .dtor = static_assert_destroy,
+    .kind = NK_StaticAssert,
+    .dtor = static_assert_destroy,
 };
 
 typedef struct {
@@ -2201,8 +2210,8 @@ void static_assert_destroy(Node *node) {
 void global_variable_destroy(Node *);
 
 const NodeVtable GlobalVariableVtable = {
-  .kind = NK_GlobalVariable,
-  .dtor = global_variable_destroy,
+    .kind = NK_GlobalVariable,
+    .dtor = global_variable_destroy,
 };
 
 typedef struct {
@@ -2266,8 +2275,8 @@ void statement_destroy(Statement *stmt) { stmt->vtable->dtor(stmt); }
 void if_stmt_destroy(Statement *);
 
 const StatementVtable IfStmtVtable = {
-  .kind = SK_IfStmt,
-  .dtor = if_stmt_destroy,
+    .kind = SK_IfStmt,
+    .dtor = if_stmt_destroy,
 };
 
 struct IfStmt {
@@ -2305,8 +2314,8 @@ void if_stmt_destroy(Statement *stmt) {
 void compound_stmt_destroy(Statement *);
 
 const StatementVtable CompoundStmtVtable = {
-  .kind = SK_CompoundStmt,
-  .dtor = compound_stmt_destroy,
+    .kind = SK_CompoundStmt,
+    .dtor = compound_stmt_destroy,
 };
 
 typedef struct {
@@ -2332,8 +2341,8 @@ void compound_stmt_destroy(Statement *stmt) {
 void return_stmt_destroy(Statement *);
 
 const StatementVtable ReturnStmtVtable = {
-  .kind = SK_ReturnStmt,
-  .dtor = return_stmt_destroy,
+    .kind = SK_ReturnStmt,
+    .dtor = return_stmt_destroy,
 };
 
 typedef struct {
@@ -2357,8 +2366,8 @@ void return_stmt_destroy(Statement *stmt) {
 void expr_stmt_destroy(Statement *);
 
 const StatementVtable ExprStmtVtable = {
-  .kind = SK_ExprStmt,
-  .dtor = expr_stmt_destroy,
+    .kind = SK_ExprStmt,
+    .dtor = expr_stmt_destroy,
 };
 
 typedef struct {
@@ -2380,8 +2389,8 @@ void expr_stmt_destroy(Statement *stmt) {
 void function_definition_destroy(Node *);
 
 const NodeVtable FunctionDefinitionVtable = {
-  .kind = NK_FunctionDefinition,
-  .dtor = function_definition_destroy,
+    .kind = NK_FunctionDefinition,
+    .dtor = function_definition_destroy,
 };
 
 typedef struct {
@@ -2955,8 +2964,8 @@ Type *parse_type(Parser *parser) {
 void sizeof_destroy(Expr *expr);
 
 const ExprVtable SizeOfVtable = {
-  .kind = EK_SizeOf,
-  .dtor = sizeof_destroy,
+    .kind = EK_SizeOf,
+    .dtor = sizeof_destroy,
 };
 
 typedef struct {
@@ -3023,8 +3032,8 @@ typedef enum {
 void unop_destroy(Expr *expr);
 
 const ExprVtable UnOpVtable = {
-  .kind = EK_UnOp,
-  .dtor = unop_destroy,
+    .kind = EK_UnOp,
+    .dtor = unop_destroy,
 };
 
 typedef struct {
@@ -3066,7 +3075,8 @@ typedef enum {
   BOK_Div,
   BOK_Mod,
 
-  BOK_Assign,
+  BOK_AssignFirst,
+  BOK_Assign = BOK_AssignFirst,
   BOK_MulAssign,
   BOK_DivAssign,
   BOK_ModAssign,
@@ -3077,17 +3087,22 @@ typedef enum {
   BOK_AndAssign,
   BOK_OrAssign,
   BOK_XorAssign,
+  BOK_AssignLast = BOK_XorAssign,
 } BinOpKind;
 
 bool is_logical_binop(BinOpKind kind) {
   return kind == BOK_LogicalOr || kind == BOK_LogicalAnd;
 }
 
+bool is_assign_binop(BinOpKind kind) {
+  return BOK_AssignFirst <= kind && kind <= BOK_AssignLast;
+}
+
 void binop_destroy(Expr *expr);
 
 const ExprVtable BinOpVtable = {
-  .kind = EK_BinOp,
-  .dtor = binop_destroy,
+    .kind = EK_BinOp,
+    .dtor = binop_destroy,
 };
 
 typedef struct {
@@ -3115,8 +3130,8 @@ void binop_destroy(Expr *expr) {
 void conditional_destroy(Expr *expr);
 
 const ExprVtable ConditionalVtable = {
-  .kind = EK_Conditional,
-  .dtor = conditional_destroy,
+    .kind = EK_Conditional,
+    .dtor = conditional_destroy,
 };
 
 typedef struct {
@@ -3147,8 +3162,8 @@ void conditional_destroy(Expr *expr) {
 void declref_destroy(Expr *expr);
 
 const ExprVtable DeclRefVtable = {
-  .kind = EK_DeclRef,
-  .dtor = declref_destroy,
+    .kind = EK_DeclRef,
+    .dtor = declref_destroy,
 };
 
 typedef struct {
@@ -3172,8 +3187,8 @@ void declref_destroy(Expr *expr) {
 void int_destroy(Expr *expr);
 
 const ExprVtable IntVtable = {
-  .kind = EK_Int,
-  .dtor = int_destroy,
+    .kind = EK_Int,
+    .dtor = int_destroy,
 };
 
 typedef struct {
@@ -3196,8 +3211,8 @@ void int_destroy(Expr *expr) {
 void string_literal_destroy(Expr *expr);
 
 const ExprVtable StringLiteralVtable = {
-  .kind = EK_String,
-  .dtor = string_literal_destroy,
+    .kind = EK_String,
+    .dtor = string_literal_destroy,
 };
 
 typedef struct {
@@ -3275,8 +3290,8 @@ Expr *parse_primary_expr(Parser *parser) {
 void index_destroy(Expr *expr);
 
 const ExprVtable IndexVtable = {
-  .kind = EK_UnOp,
-  .dtor = index_destroy,
+    .kind = EK_UnOp,
+    .dtor = index_destroy,
 };
 
 typedef struct {
@@ -3302,8 +3317,8 @@ void index_destroy(Expr *expr) {
 void call_destroy(Expr *expr);
 
 const ExprVtable CallVtable = {
-  .kind = EK_Call,
-  .dtor = call_destroy,
+    .kind = EK_Call,
+    .dtor = call_destroy,
 };
 
 typedef struct {
@@ -3334,8 +3349,8 @@ void call_destroy(Expr *expr) {
 void member_access_destroy(Expr *expr);
 
 const ExprVtable MemberAccessVtable = {
-  .kind = EK_MemberAccess,
-  .dtor = member_access_destroy,
+    .kind = EK_MemberAccess,
+    .dtor = member_access_destroy,
 };
 
 typedef struct {
@@ -3530,8 +3545,8 @@ Expr *parse_unary_expr(Parser *parser) {
 void function_param_destroy(Expr *) {}
 
 const ExprVtable FunctionParamVtable = {
-  .kind = EK_FunctionParam,
-  .dtor = function_param_destroy,
+    .kind = EK_FunctionParam,
+    .dtor = function_param_destroy,
 };
 
 typedef struct {
@@ -3551,8 +3566,8 @@ void function_param_construct(FunctionParam *param, const char *name,
 void cast_destroy(Expr *expr);
 
 const ExprVtable CastVtable = {
-  .kind = EK_Cast,
-  .dtor = cast_destroy,
+    .kind = EK_Cast,
+    .dtor = cast_destroy,
 };
 
 typedef struct {
@@ -5078,6 +5093,22 @@ const Type *sema_get_type_of_binop_expr(const Sema *sema, const BinOp *expr,
   }
 }
 
+const StructType *sema_get_struct_type_from_member_access(
+    const Sema *sema, const MemberAccess *access, const TreeMap *local_ctx) {
+  const Type *base_ty =
+      sema_get_type_of_expr_in_ctx(sema, access->base, local_ctx);
+  base_ty = sema_resolve_maybe_named_type(sema, base_ty);
+
+  if (access->is_arrow) {
+    assert(sema_is_pointer_to(sema, base_ty, TK_StructType, local_ctx));
+    base_ty = sema_get_pointee(sema, base_ty, local_ctx);
+    base_ty = sema_resolve_maybe_named_type(sema, base_ty);
+  }
+  assert(sema_is_struct_type(sema, base_ty, local_ctx));
+
+  return (const StructType *)base_ty;
+}
+
 // Infer the type of this expression. The caller of this is not in charge of
 // destroying the type.
 const Type *sema_get_type_of_expr_in_ctx(const Sema *sema, const Expr *expr,
@@ -5122,26 +5153,24 @@ const Type *sema_get_type_of_expr_in_ctx(const Sema *sema, const Expr *expr,
       assert(ty->vtable->kind == TK_FunctionType);
       return ((const FunctionType *)ty)->return_type;
     }
-    case EK_Cast:
+    case EK_Cast: {
       const Cast *cast = (const Cast *)expr;
       return cast->to;
+    }
     case EK_MemberAccess: {
       const MemberAccess *access = (const MemberAccess *)expr;
-      const Type *base_ty =
-          sema_get_type_of_expr_in_ctx(sema, access->base, local_ctx);
-      base_ty = sema_resolve_maybe_named_type(sema, base_ty);
-
-      if (access->is_arrow) {
-        assert(sema_is_pointer_to(sema, base_ty, TK_StructType, local_ctx));
-        base_ty = sema_get_pointee(sema, base_ty, local_ctx);
-        base_ty = sema_resolve_maybe_named_type(sema, base_ty);
-      } else {
-        assert(sema_is_struct_type(sema, base_ty, local_ctx));
-      }
+      const StructType *base_ty =
+          sema_get_struct_type_from_member_access(sema, access, local_ctx);
 
       const StructMember *member =
-          struct_get_member((const StructType *)base_ty, access->member);
+          struct_get_member(base_ty, access->member, /*offset=*/NULL);
       return member->type;
+    }
+    case EK_Conditional: {
+      const Conditional *conditional = (const Conditional *)expr;
+      return sema_get_common_type_of_exprs(sema, conditional->true_expr,
+                                           conditional->false_expr,
+                                           local_ctx);
     }
     default:
       printf("TODO: Implement sema_get_type_of_expr for this expression %d\n",
@@ -5256,13 +5285,13 @@ int compare_constexpr_result_types(const ConstExprResult *lhs,
 }
 
 const ConstExprResult TrueResult = {
-  .result_kind = RK_Boolean,
-  .result.b = true,
+    .result_kind = RK_Boolean,
+    .result.b = true,
 };
 
 const ConstExprResult FalseResult = {
-  .result_kind = RK_Boolean,
-  .result.b = false,
+    .result_kind = RK_Boolean,
+    .result.b = false,
 };
 
 size_t sema_eval_sizeof_array(const Sema *sema, const ArrayType *arr) {
@@ -5305,8 +5334,8 @@ ConstExprResult sema_eval_sizeof(const Sema *sema, const SizeOf *so) {
 
   size_t size = sema_eval_sizeof_type(sema, type);
   ConstExprResult res = {
-    .result_kind = RK_UnsignedLongLong,
-    .result.ull = size,
+      .result_kind = RK_UnsignedLongLong,
+      .result.ull = size,
   };
   return res;
 }
@@ -5319,8 +5348,8 @@ ConstExprResult sema_eval_expr(const Sema *sema, const Expr *expr) {
       return sema_eval_sizeof(sema, (const SizeOf *)expr);
     case EK_Int: {
       ConstExprResult res = {
-        .result_kind = RK_UnsignedLongLong,
-        .result.ull = ((const Int *)expr)->val,
+          .result_kind = RK_UnsignedLongLong,
+          .result.ull = ((const Int *)expr)->val,
       };
       return res;
     }
@@ -5457,9 +5486,10 @@ LLVMTypeRef get_llvm_builtin_type(Compiler *compiler, const BuiltinType *bt) {
     case BTK_Long:
     case BTK_UnsignedLong:
     case BTK_LongLong:
-    case BTK_UnsignedLongLong:
+    case BTK_UnsignedLongLong: {
       size_t size = builtin_type_get_size(bt);
       return LLVMIntType((unsigned)(size * kCharBit));
+    }
     case BTK_Float:
       return LLVMFloatTypeInContext(ctx);
     case BTK_Double:
@@ -5477,10 +5507,11 @@ LLVMTypeRef get_llvm_type(Compiler *compiler, const Type *type) {
   switch (type->vtable->kind) {
     case TK_BuiltinType:
       return get_llvm_builtin_type(compiler, (const BuiltinType *)type);
-    case TK_EnumType:
+    case TK_EnumType: {
       const BuiltinType *repr = sema_get_integral_type_for_enum(
           compiler->sema, (const EnumType *)type);
       return get_llvm_type(compiler, &repr->type);
+    }
     case TK_NamedType:
       return get_llvm_type(
           compiler,
@@ -5620,17 +5651,19 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
                           const UnOp *expr, TreeMap *local_ctx,
                           TreeMap *local_allocas) {
   switch (expr->op) {
-    case UOK_Not:
+    case UOK_Not: {
       // Result is always an i1.
       LLVMValueRef to_bool = compile_to_bool(compiler, builder, expr->subexpr,
                                              local_ctx, local_allocas);
       LLVMValueRef zero = LLVMConstNull(LLVMInt1Type());
       return LLVMBuildICmp(builder, LLVMIntEQ, to_bool, zero, "not");
-    case UOK_BitNot:
+    }
+    case UOK_BitNot: {
       LLVMValueRef val = compile_expr(compiler, builder, expr->subexpr,
                                       local_ctx, local_allocas);
       LLVMValueRef ones = LLVMConstAllOnes(LLVMTypeOf(val));
       return LLVMBuildXor(builder, val, ones, "");
+    }
     default:
       printf("TODO: implement compile_unop for this op %d\n", expr->op);
       __builtin_trap();
@@ -5676,6 +5709,63 @@ LLVMValueRef compile_implicit_cast(Compiler *compiler, LLVMBuilderRef builder,
   __builtin_trap();
 }
 
+LLVMValueRef compile_local_variable(Compiler *compiler, LLVMBuilderRef builder,
+                                    const char *name, const Type *ty,
+                                    TreeMap *local_ctx,
+                                    TreeMap *local_allocas) {
+  void *val;
+  if (tree_map_get(local_allocas, name, &val))
+    return val;
+
+  LLVMTypeRef llvm_ty = get_llvm_type(compiler, ty);
+  LLVMValueRef alloca = LLVMBuildAlloca(builder, llvm_ty, name);
+  tree_map_set(local_allocas, name, alloca);
+  return alloca;
+}
+
+LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
+                          const Conditional *expr, TreeMap *local_ctx,
+                          TreeMap *local_allocas) {
+  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+  LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
+
+  LLVMValueRef cond =
+      compile_expr(compiler, builder, expr->cond, local_ctx, local_allocas);
+
+  assert(LLVMGetTypeKind(LLVMTypeOf(cond)) == LLVMIntegerTypeKind);
+  assert(LLVMGetIntTypeWidth(LLVMTypeOf(cond)) == 1);
+
+  // Create blocks for the then and else cases. Insert the 'if' block at the
+  // end of the function.
+  LLVMBasicBlockRef ifbb = LLVMAppendBasicBlockInContext(ctx, fn, "if");
+  LLVMBasicBlockRef elsebb = LLVMCreateBasicBlockInContext(ctx, "else");
+  LLVMBasicBlockRef mergebb = LLVMCreateBasicBlockInContext(ctx, "merge");
+
+  LLVMBuildCondBr(builder, cond, ifbb, elsebb);
+
+  // Emit if BB.
+  LLVMPositionBuilderAtEnd(builder, ifbb);
+  LLVMValueRef true_expr = compile_expr(compiler, builder, expr->true_expr, local_ctx, local_allocas);
+  LLVMBuildBr(builder, mergebb);
+  ifbb = LLVMGetInsertBlock(builder);  // Codegen of 'if' can change the current
+                                       // block, update ifbb for the PHI.
+
+  // Emit potential else BB.
+  LLVMAppendExistingBasicBlock(fn, elsebb);
+  LLVMPositionBuilderAtEnd(builder, elsebb);
+  LLVMValueRef false_expr = compile_expr(compiler, builder, expr->false_expr, local_ctx, local_allocas);
+  LLVMBuildBr(builder, mergebb);
+  elsebb =
+      LLVMGetInsertBlock(builder);  // Codegen of 'else' can change the current
+                                    // block, update ifbb for the PHI.
+
+  // Emit merge BB.
+  LLVMAppendExistingBasicBlock(fn, mergebb);
+  LLVMPositionBuilderAtEnd(builder, mergebb);
+
+  LLVMValueRef phi = LLVMBuildPhi(builder, 
+}
+
 LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
                            const BinOp *expr, TreeMap *local_ctx,
                            TreeMap *local_allocas) {
@@ -5685,6 +5775,12 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
         compile_to_bool(compiler, builder, expr->lhs, local_ctx, local_allocas);
     rhs =
         compile_to_bool(compiler, builder, expr->rhs, local_ctx, local_allocas);
+  } else if (is_assign_binop(expr->op)) {
+    const Type *lhs_ty =
+        sema_get_type_of_expr_in_ctx(compiler->sema, expr->lhs, local_ctx);
+    rhs = compile_implicit_cast(compiler, builder, expr->rhs, lhs_ty, local_ctx,
+                                local_allocas);
+    lhs = compile_expr(compiler, builder, expr->lhs, local_ctx, local_allocas);
   } else {
     const Type *common_ty = sema_get_common_type_of_exprs(
         compiler->sema, expr->lhs, expr->rhs, local_ctx);
@@ -5720,6 +5816,10 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
       break;
     case BOK_LogicalOr:
       res = LLVMBuildOr(builder, lhs, rhs, "");
+      break;
+    case BOK_Assign:
+      LLVMBuildStore(builder, rhs, lhs);
+      res = rhs;
       break;
     default:
       printf("TODO: implement compile_binop for this op %d\n", expr->op);
@@ -5861,6 +5961,23 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
     }
     case EK_MemberAccess: {
       const MemberAccess *access = (const MemberAccess *)expr;
+      const StructType *base_ty = sema_get_struct_type_from_member_access(
+          compiler->sema, access, local_ctx);
+      size_t offset;
+      const StructMember *member =
+          struct_get_member(base_ty, access->member, &offset);
+      LLVMValueRef base_llvm = compile_expr(compiler, builder, access->base,
+                                            local_ctx, local_allocas);
+      LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
+      LLVMValueRef llvm_offset = LLVMConstInt(
+          get_llvm_type(compiler, member->type), offset, /*signed=*/0);
+      LLVMValueRef offsets[] = {llvm_offset};
+      LLVMValueRef gep =
+          LLVMBuildGEP2(builder, llvm_base_ty, base_llvm, offsets, 1, "");
+      return gep;
+    }
+    case EK_Conditional: {
+      const Conditional *conditional = (const Conditional *expr);
     }
     default:
       printf("TODO: implement compile_expr for this expr %d\n",
@@ -6108,7 +6225,7 @@ int main(int argc, char **argv) {
       assert(top_level_decl);
 
       switch (top_level_decl->vtable->kind) {
-        case NK_Typedef:
+        case NK_Typedef: {
           Typedef *td = (Typedef *)top_level_decl;
           sema_add_typedef_type(&sema, td->name, td->type);
           // if (td->type->vtable->kind == TK_StructType) {
@@ -6116,20 +6233,24 @@ int main(int argc, char **argv) {
           //   __builtin_trap();
           // }
           break;
-        case NK_StaticAssert:
+        }
+        case NK_StaticAssert: {
           StaticAssert *sa = (StaticAssert *)top_level_decl;
           sema_verify_static_assert_condition(&sema, sa->expr);
           break;
-        case NK_GlobalVariable:
+        }
+        case NK_GlobalVariable: {
           GlobalVariable *gv = (GlobalVariable *)top_level_decl;
           sema_handle_global_variable(&sema, gv);
           compile_global_variable(&compiler, gv);
           break;
-        case NK_FunctionDefinition:
+        }
+        case NK_FunctionDefinition: {
           FunctionDefinition *f = (FunctionDefinition *)top_level_decl;
           sema_handle_function_definition(&sema, f);
           compile_function_definition(&compiler, f);
           break;
+        }
       }
 
       Node **storage = vector_append_storage(&nodes_to_destroy);
