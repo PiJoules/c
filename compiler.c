@@ -2301,6 +2301,7 @@ typedef enum {
   SK_IfStmt,
   SK_CompoundStmt,
   SK_ReturnStmt,
+  SK_Declaration,
 } StatementKind;
 
 struct Statement;
@@ -2322,6 +2323,39 @@ void statement_construct(Statement *stmt, const StatementVtable *vtable) {
 }
 
 void statement_destroy(Statement *stmt) { stmt->vtable->dtor(stmt); }
+
+void declaration_destroy(Statement *);
+
+const StatementVtable DeclarationVtable = {
+    .kind = SK_Declaration,
+    .dtor = declaration_destroy,
+};
+
+typedef struct {
+  Statement base;
+  char *name;
+  Type *type;
+  Expr *initializer;  // Optional.
+} Declaration;
+
+void declaration_construct(Declaration *decl, const char *name, Type *type,
+                           Expr *init) {
+  statement_construct(&decl->base, &DeclarationVtable);
+  decl->name = strdup(name);
+  decl->type = type;
+  decl->initializer = init;
+}
+
+void declaration_destroy(Statement *stmt) {
+  Declaration *decl = (Declaration *)stmt;
+  free(decl->name);
+  type_destroy(decl->type);
+  free(decl->type);
+  if (decl->initializer) {
+    expr_destroy(decl->initializer);
+    free(decl->initializer);
+  }
+}
 
 void if_stmt_destroy(Statement *);
 
@@ -4206,6 +4240,18 @@ Statement *parse_statement(Parser *parser) {
     return &ret->base;
   }
 
+  if (is_token_type_token(parser, peek)) {
+    // This is a declaration.
+    FoundStorageClasses storage;
+    char *name;
+    Type *type = parse_type_for_declaration(parser, &name, &storage);
+
+    if (next_token_is(parser, TK_Assign)) {
+      parser_consume_token(parser, TK_Assign);
+      Expr *init = parse_expr(parser);
+    }
+  }
+
   // Default is an expression statement.
   Expr *expr = parse_expr(parser);
   parser_consume_token(parser, TK_Semicolon);
@@ -4268,7 +4314,6 @@ Node *parse_global_variable_or_function_definition(Parser *parser) {
   if (storage.thread_local_)
     gv->is_thread_local = true;
 
-  // TODO: Parse potential initializer.
   if (next_token_is(parser, TK_Assign)) {
     parser_consume_token(parser, TK_Assign);
     Expr *init = parse_expr(parser);
