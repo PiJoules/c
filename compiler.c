@@ -537,14 +537,17 @@ void tree_map_destroy(TreeMap *map) {
   if (map->left) {
     tree_map_destroy(map->left);
     free(map->left);
+    map->left = NULL;
   }
 
   if (map->right) {
     tree_map_destroy(map->right);
     free(map->right);
+    map->right = NULL;
   }
 
   map->key_dtor(map->key);
+  map->key = NULL;
 }
 
 void tree_map_set(TreeMap *map, const void *key, void *val) {
@@ -593,6 +596,34 @@ bool tree_map_get(const TreeMap *map, const void *key, void **val) {
     if (val)
       *val = map->value;
     return true;
+  }
+}
+
+void tree_map_clear(TreeMap *map) {
+  tree_map_destroy(map);
+  tree_map_construct(map, map->cmp, map->key_ctor, map->key_dtor);
+}
+
+void tree_map_clone(TreeMap *dst, const TreeMap *src) {
+  tree_map_clear(dst);
+
+  dst->key = src->key_ctor(src->key);
+  dst->value = src->value;
+
+  if (src->left) {
+    dst->left = malloc(sizeof(TreeMap));
+    tree_map_construct(dst->left, src->cmp, src->key_ctor, src->key_dtor);
+    tree_map_clone(dst->left, src->left);
+  } else {
+    dst->left = NULL;
+  }
+
+  if (src->right) {
+    dst->right = malloc(sizeof(TreeMap));
+    tree_map_construct(dst->right, src->cmp, src->key_ctor, src->key_dtor);
+    tree_map_clone(dst->right, src->right);
+  } else {
+    dst->right = NULL;
   }
 }
 
@@ -682,10 +713,47 @@ static void TestTreeMapOverrideKeyValue() {
   tree_map_destroy(&m);
 }
 
+static void TestTreeMapClone() {
+  TreeMap m;
+  string_tree_map_construct(&m);
+
+  const char *val = "val";
+  tree_map_set(&m, "key", (char *)val);
+
+  tree_map_clear(&m);
+  assert(m.key == NULL);
+  assert(m.left == NULL);
+  assert(m.right == NULL);
+
+  TreeMap m2;
+  string_tree_map_construct(&m2);
+  tree_map_set(&m2, "key", (char *)val);
+  const char *val2 = "val2";
+  tree_map_set(&m2, "key2", (char *)val2);
+
+  tree_map_clone(&m, &m2);
+  assert(strcmp(m.key, "key") == 0);
+  assert(strcmp(m2.key, "key") == 0);
+
+  void *res = NULL;
+  assert(tree_map_get(&m, "key", &res));
+  assert(strcmp(res, val) == 0);
+  assert(tree_map_get(&m2, "key", &res));
+  assert(strcmp(res, val) == 0);
+  assert(tree_map_get(&m, "key2", &res));
+  assert(strcmp(res, val2) == 0);
+  assert(tree_map_get(&m2, "key2", &res));
+  assert(strcmp(res, val2) == 0);
+
+  tree_map_destroy(&m);
+  tree_map_destroy(&m2);
+}
+
 static void RunTreeMapTests() {
   TestTreeMapConstruction();
   TestTreeMapInsertion();
   TestTreeMapOverrideKeyValue();
+  TestTreeMapClone();
 }
 
 ///
@@ -4243,13 +4311,21 @@ Statement *parse_statement(Parser *parser) {
   if (is_token_type_token(parser, peek)) {
     // This is a declaration.
     FoundStorageClasses storage;
-    char *name;
+    char *name = NULL;
     Type *type = parse_type_for_declaration(parser, &name, &storage);
+    assert(name);
 
+    Expr *init = NULL;
     if (next_token_is(parser, TK_Assign)) {
       parser_consume_token(parser, TK_Assign);
-      Expr *init = parse_expr(parser);
+      init = parse_expr(parser);
     }
+
+    parser_consume_token(parser, TK_Semicolon);
+
+    Declaration *decl = malloc(sizeof(Declaration));
+    declaration_construct(decl, name, type, init);
+    return &decl->base;
   }
 
   // Default is an expression statement.
@@ -5050,6 +5126,12 @@ const Type *sema_get_type_of_unop_expr(const Sema *sema, const UnOp *expr,
     case UOK_Not:
       return &sema->bt_Bool.type;
     case UOK_BitNot:
+    case UOK_PostInc:
+    case UOK_PreInc:
+    case UOK_PostDec:
+    case UOK_PreDec:
+    case UOK_Plus:
+    case UOK_Negate:
       return sema_get_type_of_expr_in_ctx(sema, expr->subexpr, local_ctx);
     default:
       printf("TODO: Implement get type for unop kind %d\n", expr->op);
@@ -5088,8 +5170,10 @@ const Type *sema_get_corresponding_unsigned_type(const Sema *sema,
 }
 
 // Find the common type for usual arithmetic conversions.
-const Type *sema_get_common_type(const Sema *sema, const Type *lhs_ty,
-                                 const Type *rhs_ty, const TreeMap *local_ctx) {
+const Type *sema_get_common_arithmetic_type(const Sema *sema,
+                                            const Type *lhs_ty,
+                                            const Type *rhs_ty,
+                                            const TreeMap *local_ctx) {
   if (lhs_ty->vtable->kind == TK_NamedType)
     lhs_ty = sema_resolve_named_type(sema, (const NamedType *)lhs_ty);
   if (rhs_ty->vtable->kind == TK_NamedType)
@@ -5148,12 +5232,13 @@ const Type *sema_get_common_type(const Sema *sema, const Type *lhs_ty,
                                               (const BuiltinType *)signed_ty);
 }
 
-const Type *sema_get_common_type_of_exprs(const Sema *sema, const Expr *lhs,
-                                          const Expr *rhs,
-                                          const TreeMap *local_ctx) {
+const Type *sema_get_common_arithmetic_type_of_exprs(const Sema *sema,
+                                                     const Expr *lhs,
+                                                     const Expr *rhs,
+                                                     const TreeMap *local_ctx) {
   const Type *lhs_ty = sema_get_type_of_expr_in_ctx(sema, lhs, local_ctx);
   const Type *rhs_ty = sema_get_type_of_expr_in_ctx(sema, rhs, local_ctx);
-  return sema_get_common_type(sema, lhs_ty, rhs_ty, local_ctx);
+  return sema_get_common_arithmetic_type(sema, lhs_ty, rhs_ty, local_ctx);
 }
 
 const Type *sema_get_type_of_binop_expr(const Sema *sema, const BinOp *expr,
@@ -5179,12 +5264,17 @@ const Type *sema_get_type_of_binop_expr(const Sema *sema, const BinOp *expr,
     case BOK_Add:
     case BOK_Sub:
     case BOK_Mul:
+      if (sema_is_pointer_type(sema, lhs_ty, local_ctx))
+        return lhs_ty;
+      if (sema_is_pointer_type(sema, rhs_ty, local_ctx))
+        return rhs_ty;
+      [[fallthrough]];
     case BOK_Div:
     case BOK_Mod:
     case BOK_Xor:
     case BOK_BitwiseOr:
     case BOK_BitwiseAnd:
-      return sema_get_common_type(sema, lhs_ty, rhs_ty, local_ctx);
+      return sema_get_common_arithmetic_type(sema, lhs_ty, rhs_ty, local_ctx);
     case BOK_Assign:
       return rhs_ty;
     default:
@@ -5236,7 +5326,7 @@ const Type *sema_get_type_of_expr_in_ctx(const Sema *sema, const Expr *expr,
 
       // Not a global. Search the local scope.
       if (tree_map_get(local_ctx, decl->name, &val))
-        return sema_get_type_of_expr_in_ctx(sema, val, local_ctx);
+        return (const Type *)val;
 
       printf("Unknown symbol '%s'\n", decl->name);
       __builtin_trap();
@@ -5269,8 +5359,8 @@ const Type *sema_get_type_of_expr_in_ctx(const Sema *sema, const Expr *expr,
     }
     case EK_Conditional: {
       const Conditional *conditional = (const Conditional *)expr;
-      return sema_get_common_type_of_exprs(sema, conditional->true_expr,
-                                           conditional->false_expr, local_ctx);
+      return sema_get_common_arithmetic_type_of_exprs(
+          sema, conditional->true_expr, conditional->false_expr, local_ctx);
     }
     default:
       printf("TODO: Implement sema_get_type_of_expr for this expression %d\n",
@@ -5748,6 +5838,13 @@ LLVMValueRef compile_to_bool(Compiler *compiler, LLVMBuilderRef builder,
   }
 }
 
+LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
+                                const Expr *expr, TreeMap *local_ctx,
+                                TreeMap *local_allocas);
+
+LLVMTypeRef get_llvm_type_of_expr(Compiler *compiler, const Expr *expr,
+                                  TreeMap *local_ctx);
+
 LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
                           const UnOp *expr, TreeMap *local_ctx,
                           TreeMap *local_allocas) {
@@ -5764,6 +5861,17 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
                                       local_ctx, local_allocas);
       LLVMValueRef ones = LLVMConstAllOnes(LLVMTypeOf(val));
       return LLVMBuildXor(builder, val, ones, "");
+    }
+    case UOK_PostInc: {
+      LLVMValueRef ptr = compile_lvalue_ptr(compiler, builder, expr->subexpr,
+                                            local_ctx, local_allocas);
+      LLVMTypeRef llvm_type =
+          get_llvm_type_of_expr(compiler, expr->subexpr, local_ctx);
+      LLVMValueRef val = LLVMBuildLoad2(builder, llvm_type, ptr, "");
+      LLVMValueRef one = LLVMConstInt(llvm_type, 1, /*signed=*/0);
+      LLVMValueRef inc = LLVMBuildAdd(builder, val, one, "");
+      LLVMBuildStore(builder, inc, ptr);
+      return val;
     }
     default:
       printf("TODO: implement compile_unop for this op %d\n", expr->op);
@@ -5873,7 +5981,7 @@ LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
   LLVMAppendExistingBasicBlock(fn, mergebb);
   LLVMPositionBuilderAtEnd(builder, mergebb);
 
-  const Type *common_ty = sema_get_common_type_of_exprs(
+  const Type *common_ty = sema_get_common_arithmetic_type_of_exprs(
       compiler->sema, expr->true_expr, expr->false_expr, local_ctx);
   LLVMValueRef phi =
       LLVMBuildPhi(builder, get_llvm_type(compiler, common_ty), "");
@@ -5882,10 +5990,6 @@ LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
   LLVMAddIncoming(phi, incoming_vals, incoming_blocks, 2);
   return phi;
 }
-
-LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
-                                const Expr *expr, TreeMap *local_ctx,
-                                TreeMap *local_allocas);
 
 LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
                            const BinOp *expr, TreeMap *local_ctx,
@@ -5905,8 +6009,7 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
     lhs = compile_lvalue_ptr(compiler, builder, expr->lhs, local_ctx,
                              local_allocas);
   } else {
-    common_ty = sema_get_common_type_of_exprs(compiler->sema, expr->lhs,
-                                              expr->rhs, local_ctx);
+    common_ty = sema_get_type_of_binop_expr(compiler->sema, expr, local_ctx);
     lhs = compile_implicit_cast(compiler, builder, expr->lhs, common_ty,
                                 local_ctx, local_allocas);
     rhs = compile_implicit_cast(compiler, builder, expr->rhs, common_ty,
@@ -6191,7 +6294,20 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
 
   // Emit if BB.
   LLVMPositionBuilderAtEnd(builder, ifbb);
-  compile_statement(compiler, builder, stmt->body, local_ctx, local_allocas);
+
+  {
+    TreeMap local_ctx_cpy, local_allocas_cpy;
+    string_tree_map_construct(&local_ctx_cpy);
+    string_tree_map_construct(&local_allocas_cpy);
+    tree_map_clone(&local_ctx_cpy, local_ctx);
+    tree_map_clone(&local_allocas_cpy, local_allocas);
+
+    compile_statement(compiler, builder, stmt->body, &local_ctx_cpy,
+                      &local_allocas_cpy);
+
+    tree_map_destroy(&local_ctx_cpy);
+    tree_map_destroy(&local_allocas_cpy);
+  }
 
   ifbb = LLVMGetInsertBlock(builder);
   LLVMValueRef last = LLVMGetLastInstruction(ifbb);
@@ -6205,8 +6321,20 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
   LLVMAppendExistingBasicBlock(fn, elsebb);
   LLVMPositionBuilderAtEnd(builder, elsebb);
   if (stmt->else_stmt) {
-    compile_if_statement(compiler, builder, stmt->else_stmt, local_ctx,
-                         local_allocas);
+    {
+      TreeMap local_ctx_cpy, local_allocas_cpy;
+      string_tree_map_construct(&local_ctx_cpy);
+      string_tree_map_construct(&local_allocas_cpy);
+      tree_map_clone(&local_ctx_cpy, local_ctx);
+      tree_map_clone(&local_allocas_cpy, local_allocas);
+
+      compile_if_statement(compiler, builder, stmt->else_stmt, local_ctx,
+                           local_allocas);
+
+      tree_map_destroy(&local_ctx_cpy);
+      tree_map_destroy(&local_allocas_cpy);
+    }
+
     elsebb = LLVMGetInsertBlock(builder);
     last = LLVMGetLastInstruction(elsebb);
     if (!LLVMIsATerminatorInst(last))
@@ -6253,11 +6381,31 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
       return;
     }
     case SK_CompoundStmt: {
+      TreeMap local_ctx_cpy, local_allocas_cpy;
+      string_tree_map_construct(&local_ctx_cpy);
+      string_tree_map_construct(&local_allocas_cpy);
+      tree_map_clone(&local_ctx_cpy, local_ctx);
+      tree_map_clone(&local_allocas_cpy, local_allocas);
+
       const CompoundStmt *compound = (const CompoundStmt *)stmt;
       for (size_t i = 0; i < compound->body.size; ++i) {
         Statement *stmt = *(Statement **)vector_at(&compound->body, i);
-        compile_statement(compiler, builder, stmt, local_ctx, local_allocas);
+        compile_statement(compiler, builder, stmt, &local_ctx_cpy,
+                          &local_allocas_cpy);
       }
+
+      tree_map_destroy(&local_ctx_cpy);
+      tree_map_destroy(&local_allocas_cpy);
+      return;
+    }
+    case SK_Declaration: {
+      const Declaration *decl = (const Declaration *)stmt;
+      assert(!tree_map_get(local_allocas, decl->name, NULL));
+
+      LLVMTypeRef llvm_ty = get_llvm_type(compiler, decl->type);
+      LLVMValueRef alloca = LLVMBuildAlloca(builder, llvm_ty, decl->name);
+      tree_map_set(local_allocas, decl->name, alloca);
+      tree_map_set(local_ctx, decl->name, decl->type);
       return;
     }
     default:
@@ -6278,8 +6426,8 @@ void compile_function_definition(Compiler *compiler,
   FunctionType *func_ty = (FunctionType *)(f->type);
 
   // Storage for local variables.
-  vector local_storage;
-  vector_construct(&local_storage, sizeof(Expr *), alignof(Expr *));
+  // vector local_storage;
+  // vector_construct(&local_storage, sizeof(Expr *), alignof(Expr *));
 
   TreeMap local_ctx, local_allocas;
   string_tree_map_construct(&local_ctx);
@@ -6297,14 +6445,14 @@ void compile_function_definition(Compiler *compiler,
         LLVMBuildAlloca(builder, LLVMTypeOf(llvm_arg), arg->name);
     LLVMBuildStore(builder, llvm_arg, alloca);
 
-    FunctionParam *param = malloc(sizeof(FunctionParam));
-    function_param_construct(param, arg->name, arg->type);
+    // FunctionParam *param = malloc(sizeof(FunctionParam));
+    // function_param_construct(param, arg->name, arg->type);
 
-    tree_map_set(&local_ctx, arg->name, param);
+    // tree_map_set(&local_ctx, arg->name, param);
+    tree_map_set(&local_ctx, arg->name, arg->type);
     tree_map_set(&local_allocas, arg->name, alloca);
   }
 
-  // TODO: Track argument names.
   compile_statement(compiler, builder, &f->body->base, &local_ctx,
                     &local_allocas);
 
@@ -6312,11 +6460,11 @@ void compile_function_definition(Compiler *compiler,
     LLVMBuildRetVoid(builder);
 
   // Cleanup locals.
-  for (size_t i = 0; i < local_storage.size; ++i) {
-    Expr **storage = vector_at(&local_storage, i);
-    expr_destroy(*storage);
-  }
-  vector_destroy(&local_storage);
+  // for (size_t i = 0; i < local_storage.size; ++i) {
+  //  Expr **storage = vector_at(&local_storage, i);
+  //  expr_destroy(*storage);
+  //}
+  // vector_destroy(&local_storage);
   tree_map_destroy(&local_ctx);
   tree_map_destroy(&local_allocas);
 
