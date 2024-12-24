@@ -3205,6 +3205,12 @@ Type *parse_declarator(Parser *parser, Type *type, char **name,
 // <SPECIFIER/QUALIFIER MIX> <DECLARATOR>
 // DECLARATOR = <POINTER/QUALIFIER MIX> (nested declarators) (parens or sq
 // braces)
+//
+// `name` is an optional pointer to a char*. If provided, and a name is found,
+// the string address will be stored in `name. Callers of this are in charge of
+// freeing the string.
+//
+// `storage` is an optional parameter to indicate storage classes found.
 Type *parse_type_for_declaration(Parser *parser, char **name,
                                  FoundStorageClasses *storage) {
   Type *type = parse_specifiers_and_qualifiers_and_storage(parser, storage);
@@ -3212,6 +3218,21 @@ Type *parse_type_for_declaration(Parser *parser, char **name,
                                              /*type_usage_addr=*/NULL);
   return parse_declarator(parser, type, name, /*type_usage_addr=*/NULL);
 }
+
+// Example: struct TreeMapNode *left, *right
+//
+// `names` is an optional pointer to an array of strings. If provided, and at
+// least one name is found, the address of this malloc'd array will be stored
+// at `names` and the number of names found stored in `num_names`. Callers are
+// in charge of freeing both the array (*names) and each of the individual
+// strings in this array ((*names)[i]).
+// Type *parse_declarations(Parser *parser, char ***names, size_t *num_names,
+//                         FoundStorageClasses *storage) {
+//  Type *type = parse_specifiers_and_qualifiers_and_storage(parser, storage);
+//  type = maybe_parse_pointers_and_qualifiers(parser, type,
+//                                             /*type_usage_addr=*/NULL);
+//  return parse_declarator(parser, type, name, /*type_usage_addr=*/NULL);
+//}
 
 Type *parse_type(Parser *parser) {
   return parse_type_for_declaration(parser, /*name=*/NULL, /*storage=*/NULL);
@@ -6238,7 +6259,9 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
       LLVMValueRef ones = LLVMConstAllOnes(LLVMTypeOf(val));
       return LLVMBuildXor(builder, val, ones, "");
     }
+    case UOK_PreInc:
     case UOK_PostInc: {
+      bool is_pre = expr->op == UOK_PreInc;
       LLVMValueRef ptr = compile_lvalue_ptr(compiler, builder, expr->subexpr,
                                             local_ctx, local_allocas);
       LLVMTypeRef llvm_type =
@@ -6247,7 +6270,7 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
       LLVMValueRef one = LLVMConstInt(llvm_type, 1, /*signed=*/0);
       LLVMValueRef inc = LLVMBuildAdd(builder, val, one, "");
       LLVMBuildStore(builder, inc, ptr);
-      return val;
+      return is_pre ? inc : val;
     }
     case UOK_AddrOf:
       return compile_lvalue_ptr(compiler, builder, expr->subexpr, local_ctx,
@@ -6734,13 +6757,10 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
     tree_map_destroy(&local_allocas_cpy);
   }
 
-  ifbb = LLVMGetInsertBlock(builder);
-  LLVMValueRef last = LLVMGetLastInstruction(ifbb);
+  LLVMBasicBlockRef last_bb = LLVMGetInsertBlock(builder);
+  LLVMValueRef last = LLVMGetLastInstruction(last_bb);
   if (!LLVMIsATerminatorInst(last))
     LLVMBuildBr(builder, mergebb);
-
-  ifbb = LLVMGetInsertBlock(builder);  // Codegen of 'if' can change the current
-                                       // block, update ifbb for the PHI.
 
   // Emit potential else BB.
   LLVMAppendExistingBasicBlock(fn, elsebb);
@@ -6760,21 +6780,77 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
       tree_map_destroy(&local_allocas_cpy);
     }
 
-    elsebb = LLVMGetInsertBlock(builder);
-    last = LLVMGetLastInstruction(elsebb);
+    LLVMBasicBlockRef last_bb = LLVMGetInsertBlock(builder);
+    LLVMValueRef last = LLVMGetLastInstruction(last_bb);
     if (!LLVMIsATerminatorInst(last))
       LLVMBuildBr(builder, mergebb);
   } else {
     LLVMBuildBr(builder, mergebb);
   }
 
-  elsebb =
-      LLVMGetInsertBlock(builder);  // Codegen of 'else' can change the current
-                                    // block, update ifbb for the PHI.
-
   // Emit merge BB.
   LLVMAppendExistingBasicBlock(fn, mergebb);
   LLVMPositionBuilderAtEnd(builder, mergebb);
+}
+
+void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
+                           const ForStmt *stmt, TreeMap *local_ctx,
+                           TreeMap *local_allocas) {
+  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+  LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
+
+  // Scope local to the loop.
+  TreeMap local_ctx_cpy, local_allocas_cpy;
+  string_tree_map_construct(&local_ctx_cpy);
+  string_tree_map_construct(&local_allocas_cpy);
+  tree_map_clone(&local_ctx_cpy, local_ctx);
+  tree_map_clone(&local_allocas_cpy, local_allocas);
+
+  // Emit the initializer if any.
+  if (stmt->init) {
+    compile_statement(compiler, builder, stmt->init, &local_ctx_cpy,
+                      &local_allocas_cpy);
+  }
+
+  LLVMBasicBlockRef for_start =
+      LLVMAppendBasicBlockInContext(ctx, fn, "for_start");
+  LLVMBuildBr(builder, for_start);
+  LLVMPositionBuilderAtEnd(builder, for_start);
+
+  LLVMBasicBlockRef for_end = LLVMCreateBasicBlockInContext(ctx, "for_end");
+
+  // Check the condition if any.
+  if (stmt->cond) {
+    LLVMValueRef cond = compile_to_bool(compiler, builder, stmt->cond,
+                                        &local_ctx_cpy, &local_allocas_cpy);
+    LLVMBasicBlockRef for_body = LLVMCreateBasicBlockInContext(ctx, "for_body");
+    LLVMBuildCondBr(builder, cond, for_body, for_end);
+
+    LLVMAppendExistingBasicBlock(fn, for_body);
+    LLVMPositionBuilderAtEnd(builder, for_body);
+  }
+
+  // Now emit the body.
+  if (stmt->body) {
+    compile_statement(compiler, builder, stmt->body, &local_ctx_cpy,
+                      &local_allocas_cpy);
+  }
+
+  // Then do the iter.
+  if (stmt->iter) {
+    compile_expr(compiler, builder, stmt->iter, &local_ctx_cpy,
+                 &local_allocas_cpy);
+  }
+
+  // And branch back to the start.
+  LLVMBuildBr(builder, for_start);
+
+  // End of for loop.
+  LLVMAppendExistingBasicBlock(fn, for_end);
+  LLVMPositionBuilderAtEnd(builder, for_end);
+
+  tree_map_destroy(&local_ctx_cpy);
+  tree_map_destroy(&local_allocas_cpy);
 }
 
 void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
@@ -6788,13 +6864,10 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
     case SK_IfStmt:
       return compile_if_statement(compiler, builder, (const IfStmt *)stmt,
                                   local_ctx, local_allocas);
+    case SK_ForStmt:
+      return compile_for_statement(compiler, builder, (const ForStmt *)stmt,
+                                   local_ctx, local_allocas);
     case SK_ReturnStmt: {
-      // LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
-      // LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
-      // LLVMBasicBlockRef retbb = LLVMAppendBasicBlockInContext(ctx, fn,
-      // "ret"); LLVMBuildBr(builder, retbb); LLVMPositionBuilderAtEnd(builder,
-      // retbb);
-
       const ReturnStmt *ret = (const ReturnStmt *)stmt;
       if (!ret->expr) {
         LLVMBuildRetVoid(builder);
