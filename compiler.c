@@ -516,7 +516,8 @@ static const void *key_ctor_default(const void *key) { return key; }
 struct TreeMapNode {
   const void *key;
   void *value;
-  struct TreeMapNode *left, *right;
+  struct TreeMapNode *left;
+  struct TreeMapNode *right;
   TreeMapCmp cmp;
   KeyCtor key_ctor;
   KeyDtor key_dtor;
@@ -531,8 +532,8 @@ void tree_map_construct(TreeMap *map, TreeMapCmp cmp, KeyCtor ctor,
   map->key = NULL;
   map->value = NULL;
   map->cmp = cmp;
-  map->key_ctor = ctor ? ctor : key_ctor_default;
-  map->key_dtor = dtor ? dtor : key_dtor_default;
+  map->key_ctor = ctor ? ctor : &key_ctor_default;
+  map->key_dtor = dtor ? dtor : &key_dtor_default;
 }
 
 void tree_map_destroy(TreeMap *map) {
@@ -1886,8 +1887,10 @@ void struct_type_destroy(Type *type) {
 
 const StructMember *struct_get_member(const StructType *st, const char *name,
                                       size_t *offset) {
-  if (!st->members)
-    return NULL;
+  if (!st->members) {
+    printf("No members in struct '%s'\n", st->name);
+    __builtin_trap();
+  }
 
   for (size_t i = 0; i < st->members->size; ++i) {
     const StructMember *member = vector_at(st->members, i);
@@ -1898,7 +1901,8 @@ const StructMember *struct_get_member(const StructType *st, const char *name,
     }
   }
 
-  return NULL;
+  printf("No member named '%s'\n", name);
+  __builtin_trap();
 }
 
 void enum_type_destroy(Type *);
@@ -2269,6 +2273,7 @@ typedef enum {
   NK_StaticAssert,
   NK_GlobalVariable,  // Also accounts for function decls, but not function defs
   NK_FunctionDefinition,
+  NK_StructDeclaration,
 } NodeKind;
 
 struct Node;
@@ -2642,6 +2647,30 @@ void expr_stmt_destroy(Statement *stmt) {
   free(expr_stmt->expr);
 }
 
+void struct_declaration_destroy(Node *);
+
+const NodeVtable StructDeclarationVtable = {
+    .kind = NK_StructDeclaration,
+    .dtor = struct_declaration_destroy,
+};
+
+typedef struct {
+  Node node;
+  StructType type;
+} StructDeclaration;
+
+void struct_declaration_construct(StructDeclaration *decl, char *name,
+                                  vector *members) {
+  node_construct(&decl->node, &StructDeclarationVtable);
+  assert(name);  // The name for a struct declaration is mandatory.
+  struct_type_construct(&decl->type, name, members);
+}
+
+void struct_declaration_destroy(Node *node) {
+  StructDeclaration *decl = (StructDeclaration *)node;
+  type_destroy(&decl->type.type);
+}
+
 void function_definition_destroy(Node *);
 
 const NodeVtable FunctionDefinitionVtable = {
@@ -2736,36 +2765,35 @@ typedef struct {
 Type *parse_type_for_declaration(Parser *parser, char **name,
                                  FoundStorageClasses *);
 
-StructType *parse_struct_type(Parser *parser) {
+void parse_struct_name_and_members(Parser *parser, char **name,
+                                   vector **members) {
+  assert(name);
+  assert(members);
+
   parser_consume_token(parser, TK_Struct);
 
   const Token *peek = parser_peek_token(parser);
-  char *name;
   if (peek->kind == TK_Identifier) {
-    name = strdup(peek->chars.data);
+    *name = strdup(peek->chars.data);
     parser_consume_token(parser, TK_Identifier);
   } else {
-    name = NULL;
+    *name = NULL;
   }
 
-  StructType *struct_ty = malloc(sizeof(StructType));
-
-  if (!next_token_is(parser, TK_LCurlyBrace)) {
-    struct_type_construct(struct_ty, name, /*members=*/NULL);
-    return struct_ty;
-  }
+  if (!next_token_is(parser, TK_LCurlyBrace))
+    return;
 
   parser_consume_token(parser, TK_LCurlyBrace);
 
-  vector *members = malloc(sizeof(vector));
-  vector_construct(members, sizeof(StructMember), alignof(StructMember));
+  *members = malloc(sizeof(vector));
+  vector_construct(*members, sizeof(StructMember), alignof(StructMember));
   while (!next_token_is(parser, TK_RCurlyBrace)) {
     char *member_name = NULL;
     Type *member_ty =
         parse_type_for_declaration(parser, &member_name, /*storage=*/NULL);
     assert(member_name);
 
-    StructMember *member = vector_append_storage(members);
+    StructMember *member = vector_append_storage(*members);
     member->type = member_ty;
     member->name = member_name;
     // TODO: Handle bitfields.
@@ -2775,7 +2803,14 @@ StructType *parse_struct_type(Parser *parser) {
   }
 
   parser_consume_token(parser, TK_RCurlyBrace);
+}
 
+StructType *parse_struct_type(Parser *parser) {
+  char *name = NULL;
+  vector *members = NULL;
+  parse_struct_name_and_members(parser, &name, &members);
+
+  StructType *struct_ty = malloc(sizeof(StructType));
   struct_type_construct(struct_ty, name, members);
   return struct_ty;
 }
@@ -4645,6 +4680,16 @@ Node *parse_global_variable_or_function_definition(Parser *parser) {
   return &gv->node;
 }
 
+Node *parse_struct_declaration(Parser *parser) {
+  char *name = NULL;
+  vector *members = NULL;
+  parse_struct_name_and_members(parser, &name, &members);
+
+  StructDeclaration *decl = malloc(sizeof(StructDeclaration));
+  struct_declaration_construct(decl, name, members);
+  return &decl->node;
+}
+
 // NOTE: Callers of this function are in charge of destroying and freeing the
 // poiner.
 Node *parse_top_level_decl(Parser *parser) {
@@ -4658,6 +4703,9 @@ Node *parse_top_level_decl(Parser *parser) {
       break;
     case TK_StaticAssert:
       node = parse_static_assert(parser);
+      break;
+    case TK_Struct:
+      node = parse_struct_declaration(parser);
       break;
     default:
       if (is_token_type_token(parser, token) ||
@@ -4930,6 +4978,7 @@ static void RunParserTests() {
 
 typedef struct {
   TreeMap typedef_types;
+  TreeMap struct_types;
 
   // This is a map of all globals seen in this TU. If any of them are
   // definitions, those globals will be stored here over the ones without
@@ -4968,6 +5017,7 @@ void sema_handle_global_variable(Sema *sema, GlobalVariable *gv);
 
 void sema_construct(Sema *sema) {
   string_tree_map_construct(&sema->typedef_types);
+  string_tree_map_construct(&sema->struct_types);
   string_tree_map_construct(&sema->globals);
 
   builtin_type_construct(&sema->bt_Char, BTK_Char);
@@ -5014,6 +5064,7 @@ void sema_construct(Sema *sema) {
 
 void sema_destroy(Sema *sema) {
   tree_map_destroy(&sema->typedef_types);
+  tree_map_destroy(&sema->struct_types);
   tree_map_destroy(&sema->globals);
 
   // NOTE: We don't need to destroy the builtin types since they don't have
@@ -5075,6 +5126,32 @@ const Type *sema_resolve_maybe_named_type(const Sema *sema, const Type *type) {
   return type;
 }
 
+const StructType *sema_resolve_struct_type(const Sema *sema,
+                                           const StructType *st) {
+  if (st->members)
+    return st;
+
+  void *found;
+  if (!tree_map_get(&sema->struct_types, st->name, &found)) {
+    printf("No struct named '%s'\n", st->name);
+    __builtin_trap();
+  }
+
+  return found;
+}
+
+const StructMember *sema_get_struct_member(const Sema *sema,
+                                           const StructType *st,
+                                           const char *name, size_t *offset) {
+  return struct_get_member(sema_resolve_struct_type(sema, st), name, offset);
+}
+
+const Type *sema_resolve_maybe_struct_type(const Sema *sema, const Type *type) {
+  if (type->vtable->kind == TK_StructType)
+    return &sema_resolve_struct_type(sema, (const StructType *)type)->type;
+  return type;
+}
+
 bool sema_is_pointer_type(const Sema *sema, const Type *type,
                           const TreeMap *local_ctx) {
   type = sema_resolve_maybe_named_type(sema, type);
@@ -5132,6 +5209,21 @@ bool sema_types_are_compatible_impl(Sema *sema, const Type *lhs,
     return sema_types_are_compatible_impl(sema, lhs, resolved_rhs,
                                           ignore_quals);
   }
+
+  // TODO: Should this be handled here? Also is this correct?
+  // Handling comparisons of pointers and functions.
+  // if (lhs->vtable->kind == TK_PointerType &&
+  //    rhs->vtable->kind == TK_FunctionType) {
+  //  const PointerType *ptr = (const PointerType *)lhs;
+  //  return sema_types_are_compatible_impl(sema, ptr->pointee, rhs,
+  //                                        ignore_quals);
+  //}
+  // if (rhs->vtable->kind == TK_PointerType &&
+  //    lhs->vtable->kind == TK_FunctionType) {
+  //  const PointerType *ptr = (const PointerType *)rhs;
+  //  return sema_types_are_compatible_impl(sema, lhs, ptr->pointee,
+  //                                        ignore_quals);
+  //}
 
   if (lhs->vtable->kind != rhs->vtable->kind)
     return false;
@@ -5346,6 +5438,31 @@ void sema_handle_global_variable(Sema *sema, GlobalVariable *gv) {
   }
 }
 
+void sema_handle_struct_declaration_impl(Sema *sema, StructType *struct_ty) {
+  // This is an anonymous struct.
+  if (!struct_ty->name)
+    return;
+
+  // We received a struct declaration but not definition.
+  if (!struct_ty->members)
+    return;
+
+  void *found;
+  if (tree_map_get(&sema->struct_types, struct_ty->name, &found)) {
+    StructType *found_struct = found;
+    if (found_struct->members) {
+      printf("Duplicate struct definition '%s'\n", struct_ty->name);
+      __builtin_trap();
+    }
+  }
+
+  tree_map_set(&sema->struct_types, struct_ty->name, struct_ty);
+}
+
+void sema_handle_struct_declaration(Sema *sema, StructDeclaration *decl) {
+  sema_handle_struct_declaration_impl(sema, &decl->type);
+}
+
 void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
   if (tree_map_get(&sema->typedef_types, name, NULL)) {
     printf("sema_add_typedef_type: typedef for '%s' already exists\n", name);
@@ -5353,9 +5470,13 @@ void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
   }
 
   switch (type->vtable->kind) {
+    case TK_StructType: {
+      StructType *struct_ty = (StructType *)type;
+      sema_handle_struct_declaration_impl(sema, struct_ty);
+      [[fallthrough]];
+    }
     case TK_FunctionType:
     case TK_BuiltinType:
-    case TK_StructType:
     case TK_EnumType:  // TODO: Handle enum values.
     case TK_PointerType:
     case TK_ArrayType:
@@ -5465,12 +5586,12 @@ const Type *sema_get_common_arithmetic_type(Sema *sema, const Type *lhs_ty,
   if (rhs_ty->vtable->kind == TK_NamedType)
     rhs_ty = sema_resolve_named_type(sema, (const NamedType *)rhs_ty);
 
-  // TODO: Handle non-integral types also.
-  assert(is_integral_type(lhs_ty) && is_integral_type(rhs_ty));
-
   // If the types are the same, that type is the common type.
   if (sema_types_are_compatible(sema, lhs_ty, rhs_ty))
     return lhs_ty;
+
+  // TODO: Handle non-integral types also.
+  assert(is_integral_type(lhs_ty) && is_integral_type(rhs_ty));
 
   const BuiltinType *lhs_bt = (const BuiltinType *)lhs_ty;
   const BuiltinType *rhs_bt = (const BuiltinType *)rhs_ty;
@@ -5583,7 +5704,15 @@ const StructType *sema_get_struct_type_from_member_access(
   }
   assert(sema_is_struct_type(sema, base_ty, local_ctx));
 
-  return (const StructType *)base_ty;
+  return sema_resolve_struct_type(sema, (const StructType *)base_ty);
+}
+
+bool sema_is_function_or_function_ptr(Sema *sema, const Type *ty,
+                                      const TreeMap *local_ctx) {
+  if (ty->vtable->kind == TK_FunctionType)
+    return true;
+  return sema_is_pointer_type(sema, ty, local_ctx) &&
+         sema_get_pointee(sema, ty, local_ctx)->vtable->kind == TK_FunctionType;
 }
 
 // Infer the type of this expression. The caller of this is not in charge of
@@ -5628,7 +5757,7 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       const Call *call = (const Call *)expr;
       const Type *ty =
           sema_get_type_of_expr_in_ctx(sema, call->base, local_ctx);
-      assert(ty->vtable->kind == TK_FunctionType);
+      assert(sema_is_function_or_function_ptr(sema, ty, local_ctx));
       return ((const FunctionType *)ty)->return_type;
     }
     case EK_Cast: {
@@ -5640,8 +5769,8 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       const StructType *base_ty =
           sema_get_struct_type_from_member_access(sema, access, local_ctx);
 
-      const StructMember *member =
-          struct_get_member(base_ty, access->member, /*offset=*/NULL);
+      const StructMember *member = sema_get_struct_member(
+          sema, base_ty, access->member, /*offset=*/NULL);
       return member->type;
     }
     case EK_Conditional: {
@@ -6673,7 +6802,7 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
       const StructType *base_ty = sema_get_struct_type_from_member_access(
           compiler->sema, access, local_ctx);
       const StructMember *member =
-          struct_get_member(base_ty, access->member, NULL);
+          sema_get_struct_member(compiler->sema, base_ty, access->member, NULL);
       LLVMValueRef ptr =
           compile_lvalue_ptr(compiler, builder, expr, local_ctx, local_allocas);
       LLVMValueRef val = LLVMBuildLoad2(
@@ -6991,6 +7120,9 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
         // functions, global variables, adn aliases.
         val = LLVMGetNamedGlobal(compiler->mod, decl->name);
 
+        if (!val)
+          val = LLVMGetNamedFunction(compiler->mod, decl->name);
+
         if (!val) {
           printf("Couldn't find alloca or global for '%s'\n", decl->name);
           LLVMValueRef fn =
@@ -7008,8 +7140,8 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
       const StructType *base_ty = sema_get_struct_type_from_member_access(
           compiler->sema, access, local_ctx);
       size_t offset;
-      const StructMember *member =
-          struct_get_member(base_ty, access->member, &offset);
+      const StructMember *member = sema_get_struct_member(
+          compiler->sema, base_ty, access->member, &offset);
       LLVMValueRef base_llvm = compile_lvalue_ptr(
           compiler, builder, access->base, local_ctx, local_allocas);
       LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
@@ -7148,10 +7280,6 @@ int main(int argc, char **argv) {
         case NK_Typedef: {
           Typedef *td = (Typedef *)top_level_decl;
           sema_add_typedef_type(&sema, td->name, td->type);
-          // if (td->type->vtable->kind == TK_StructType) {
-          //   printf("TODO: Handle typedef structs\n");
-          //   __builtin_trap();
-          // }
           break;
         }
         case NK_StaticAssert: {
@@ -7169,6 +7297,11 @@ int main(int argc, char **argv) {
           FunctionDefinition *f = (FunctionDefinition *)top_level_decl;
           sema_handle_function_definition(&sema, f);
           compile_function_definition(&compiler, f);
+          break;
+        }
+        case NK_StructDeclaration: {
+          StructDeclaration *decl = (StructDeclaration *)top_level_decl;
+          sema_handle_struct_declaration(&sema, decl);
           break;
         }
       }
