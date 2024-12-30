@@ -5715,6 +5715,16 @@ bool sema_is_function_or_function_ptr(Sema *sema, const Type *ty,
          sema_get_pointee(sema, ty, local_ctx)->vtable->kind == TK_FunctionType;
 }
 
+const FunctionType *sema_get_function(Sema *sema, const Type *ty,
+                                      const TreeMap *local_ctx) {
+  if (ty->vtable->kind == TK_FunctionType)
+    return (const FunctionType *)ty;
+
+  ty = sema_get_pointee(sema, ty, local_ctx);
+  assert(ty->vtable->kind == TK_FunctionType);
+  return (const FunctionType *)ty;
+}
+
 // Infer the type of this expression. The caller of this is not in charge of
 // destroying the type.
 const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
@@ -5735,6 +5745,7 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
           GlobalVariable *gv = val;
           return gv->type;
         } else {
+          assert(((Node *)val)->vtable->kind == NK_FunctionDefinition);
           FunctionDefinition *f = val;
           return f->type;
         }
@@ -5758,7 +5769,7 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       const Type *ty =
           sema_get_type_of_expr_in_ctx(sema, call->base, local_ctx);
       assert(sema_is_function_or_function_ptr(sema, ty, local_ctx));
-      return ((const FunctionType *)ty)->return_type;
+      return sema_get_function(sema, ty, local_ctx)->return_type;
     }
     case EK_Cast: {
       const Cast *cast = (const Cast *)expr;
@@ -6681,8 +6692,9 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
 
 LLVMTypeRef get_llvm_type_of_expr(Compiler *compiler, const Expr *expr,
                                   TreeMap *local_ctx) {
-  return get_llvm_type(
-      compiler, sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx));
+  const Type *ty =
+      sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
+  return get_llvm_type(compiler, ty);
 }
 
 LLVMTypeRef get_llvm_type_of_expr_global_ctx(Compiler *compiler,
@@ -6779,9 +6791,9 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
 
       const Type *ty =
           sema_get_type_of_expr_in_ctx(compiler->sema, call->base, local_ctx);
-      assert(ty->vtable->kind == TK_FunctionType);
-      const FunctionType *func_ty = (const FunctionType *)ty;
-      LLVMTypeRef llvm_func_ty = get_llvm_type(compiler, ty);
+      const FunctionType *func_ty =
+          sema_get_function(compiler->sema, ty, local_ctx);
+      LLVMTypeRef llvm_func_ty = get_llvm_type(compiler, &func_ty->type);
       LLVMValueRef llvm_func =
           compile_expr(compiler, builder, call->base, local_ctx, local_allocas);
 
@@ -7140,13 +7152,12 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
       const StructType *base_ty = sema_get_struct_type_from_member_access(
           compiler->sema, access, local_ctx);
       size_t offset;
-      const StructMember *member = sema_get_struct_member(
-          compiler->sema, base_ty, access->member, &offset);
+      sema_get_struct_member(compiler->sema, base_ty, access->member, &offset);
       LLVMValueRef base_llvm = compile_lvalue_ptr(
           compiler, builder, access->base, local_ctx, local_allocas);
       LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
-      LLVMValueRef llvm_offset = LLVMConstInt(
-          get_llvm_type(compiler, member->type), offset, /*signed=*/0);
+      LLVMValueRef llvm_offset =
+          LLVMConstInt(LLVMInt32Type(), offset, /*signed=*/0);
       LLVMValueRef offsets[] = {llvm_offset};
       LLVMValueRef gep =
           LLVMBuildGEP2(builder, llvm_base_ty, base_llvm, offsets, 1, "");
