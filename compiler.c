@@ -1156,6 +1156,8 @@ typedef enum {
   TK_Else,
   TK_While,
   TK_For,
+  TK_True,
+  TK_False,
 
   TK_Identifier,
 
@@ -1620,6 +1622,10 @@ Token lex(Lexer *lexer) {
     tok.kind = TK_Register;
   } else if (string_equals(&tok.chars, "thread_local")) {
     tok.kind = TK_ThreadLocal;
+  } else if (string_equals(&tok.chars, "true")) {
+    tok.kind = TK_True;
+  } else if (string_equals(&tok.chars, "false")) {
+    tok.kind = TK_False;
   } else {
     tok.kind = TK_Identifier;
   }
@@ -1875,7 +1881,7 @@ void struct_type_destroy(Type *type) {
 
   if (st->members) {
     for (size_t i = 0; i < st->members->size; ++i) {
-      StructMember *sm = vector_at(st->members, 0);
+      StructMember *sm = vector_at(st->members, i);
       if (sm->name)
         free(sm->name);
       free(sm->type);
@@ -2240,6 +2246,7 @@ typedef enum {
   EK_Conditional,  // x ? y : z
   EK_DeclRef,
   EK_Int,
+  EK_Bool,  // true/false
   EK_String,
   EK_Index,         // [ ]
   EK_MemberAccess,  // . or ->
@@ -2499,7 +2506,7 @@ struct IfStmt {
   Expr *cond;  // Required only for the first If. All chained Ifs through the
                // else_stmt can have this optionally.
   Statement *body;
-  struct IfStmt *else_stmt;  // Optional.
+  Statement *else_stmt;  // Optional.
 };
 typedef struct IfStmt IfStmt;
 
@@ -2521,7 +2528,7 @@ void if_stmt_destroy(Statement *stmt) {
   free(ifstmt->body);
 
   if (ifstmt->else_stmt) {
-    statement_destroy(&ifstmt->else_stmt->base);
+    statement_destroy(ifstmt->else_stmt);
     free(ifstmt->else_stmt);
   }
 }
@@ -3559,6 +3566,23 @@ void declref_destroy(Expr *expr) {
   free(ref->name);
 }
 
+void bool_destroy(Expr *) {}
+
+const ExprVtable BoolVtable = {
+    .kind = EK_Bool,
+    .dtor = bool_destroy,
+};
+
+typedef struct {
+  Expr expr;
+  bool val;
+} Bool;
+
+void bool_construct(Bool *b, bool val) {
+  expr_construct(&b->expr, &BoolVtable);
+  b->val = val;
+}
+
 void int_destroy(Expr *expr);
 
 const ExprVtable IntVtable = {
@@ -3654,6 +3678,13 @@ Expr *parse_primary_expr(Parser *parser) {
     string_literal_construct(s, tok->chars.data + 1, size - 2);
     parser_consume_token(parser, TK_StringLiteral);
     return &s->expr;
+  }
+
+  if (tok->kind == TK_True || tok->kind == TK_False) {
+    Bool *b = malloc(sizeof(Bool));
+    bool_construct(b, tok->kind == TK_True);
+    parser_skip_next_token(parser);
+    return &b->expr;
   }
 
   printf("%llu:%llu: parse_primary_expr: Unhandled token (%d): '%s'\n",
@@ -4546,6 +4577,12 @@ Statement *parse_statement(Parser *parser) {
 
     IfStmt *ifstmt = malloc(sizeof(IfStmt));
     if_stmt_construct(ifstmt, cond, body);
+
+    if (next_token_is(parser, TK_Else)) {
+      parser_consume_token(parser, TK_Else);
+      ifstmt->else_stmt = parse_statement(parser);
+    }
+
     return &ifstmt->base;
   }
 
@@ -5737,6 +5774,8 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       return sema_resolve_named_type_from_name(sema, "size_t");
     case EK_Int:
       return &((const Int *)expr)->type.type;
+    case EK_Bool:
+      return &sema->bt_Bool.type;
     case EK_DeclRef: {
       const DeclRef *decl = (const DeclRef *)expr;
       void *val;
@@ -5922,6 +5961,27 @@ size_t sema_eval_alignof_type(Sema *sema, const Type *type) {
   }
 }
 
+size_t sema_eval_sizeof_struct_type(Sema *sema, const StructType *type) {
+  type = sema_resolve_struct_type(sema, type);
+  if (!type->members) {
+    assert(type->name);
+    printf("Taking sizeof incomplete struct type '%s'\n", type->name);
+    __builtin_trap();
+  }
+
+  size_t size = 0;
+  for (size_t i = 0; i < type->members->size; ++i) {
+    // TODO: Account for bitfields.
+    const StructMember *member = vector_at(type->members, i);
+    const Type *member_ty = member->type;
+    size_t align = sema_eval_alignof_type(sema, member_ty);
+    if (size % align != 0)
+      size = align_up(size, align);
+    size += sema_eval_sizeof_type(sema, member_ty);
+  }
+  return size;
+}
+
 size_t sema_eval_sizeof_type(Sema *sema, const Type *type) {
   switch (type->vtable->kind) {
     case TK_BuiltinType:
@@ -5949,8 +6009,7 @@ size_t sema_eval_sizeof_type(Sema *sema, const Type *type) {
       printf("Cannot take sizeof function type!\n");
       __builtin_trap();
     case TK_StructType:
-      printf("TODO: sema_eval_sizeof_type for StructType\n");
-      __builtin_trap();
+      return sema_eval_sizeof_struct_type(sema, (const StructType *)type);
     case TK_ReplacementSentinelType:
       printf("Replacement sentinel type should not be used\n");
       __builtin_trap();
@@ -6740,6 +6799,10 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
       bool has_sign = !is_unsigned_integral_type(&i->type.type);
       return LLVMConstInt(type, i->val, has_sign);
     }
+    case EK_Bool: {
+      const Bool *b = (const Bool *)expr;
+      return LLVMConstInt(type, b->val, /*UsSugbed=*/false);
+    }
     case EK_SizeOf: {
       ConstExprResult res =
           sema_eval_sizeof(compiler->sema, (const SizeOf *)expr);
@@ -6900,8 +6963,11 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
 
   LLVMBasicBlockRef last_bb = LLVMGetInsertBlock(builder);
   LLVMValueRef last = LLVMGetLastInstruction(last_bb);
-  if (!LLVMIsATerminatorInst(last))
+  bool all_branches_terminate = true;
+  if (!LLVMIsATerminatorInst(last)) {
     LLVMBuildBr(builder, mergebb);
+    all_branches_terminate = false;
+  }
 
   // Emit potential else BB.
   LLVMAppendExistingBasicBlock(fn, elsebb);
@@ -6914,8 +6980,8 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
       tree_map_clone(&local_ctx_cpy, local_ctx);
       tree_map_clone(&local_allocas_cpy, local_allocas);
 
-      compile_if_statement(compiler, builder, stmt->else_stmt, local_ctx,
-                           local_allocas);
+      compile_statement(compiler, builder, stmt->else_stmt, local_ctx,
+                        local_allocas);
 
       tree_map_destroy(&local_ctx_cpy);
       tree_map_destroy(&local_allocas_cpy);
@@ -6923,15 +6989,20 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
 
     LLVMBasicBlockRef last_bb = LLVMGetInsertBlock(builder);
     LLVMValueRef last = LLVMGetLastInstruction(last_bb);
-    if (!LLVMIsATerminatorInst(last))
+    if (!last || !LLVMIsATerminatorInst(last)) {
       LLVMBuildBr(builder, mergebb);
+      all_branches_terminate = false;
+    }
   } else {
     LLVMBuildBr(builder, mergebb);
+    all_branches_terminate = false;
   }
 
-  // Emit merge BB.
-  LLVMAppendExistingBasicBlock(fn, mergebb);
-  LLVMPositionBuilderAtEnd(builder, mergebb);
+  if (!all_branches_terminate) {
+    // Emit merge BB.
+    LLVMAppendExistingBasicBlock(fn, mergebb);
+    LLVMPositionBuilderAtEnd(builder, mergebb);
+  }
 }
 
 void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
