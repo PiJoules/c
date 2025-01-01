@@ -105,6 +105,7 @@ LLVMTypeRef LLVMIntType(unsigned NumBits);
 LLVMTypeRef LLVMFloatTypeInContext(LLVMContextRef C);
 LLVMTypeRef LLVMDoubleTypeInContext(LLVMContextRef C);
 LLVMTypeRef LLVMFP128TypeInContext(LLVMContextRef C);
+LLVMTypeRef LLVMGetReturnType(LLVMTypeRef FunctionTy);
 void *LLVMStructCreateNamed(void *C, const char *Name);
 LLVMTypeRef LLVMStructType(LLVMTypeRef *ElementTypes, unsigned ElementCount,
                            LLVMBool Packed);
@@ -975,7 +976,7 @@ struct InputStream;
 typedef struct {
   void (*dtor)(struct InputStream *);
   int (*read)(struct InputStream *);
-  int (*eof)(struct InputStream *);
+  bool (*eof)(struct InputStream *);
 } InputStreamVtable;
 
 struct InputStream {
@@ -989,11 +990,11 @@ void input_stream_construct(InputStream *is, const InputStreamVtable *vtable) {
 
 void input_stream_destroy(InputStream *is) { is->vtable->dtor(is); }
 int input_stream_read(InputStream *is) { return is->vtable->read(is); }
-int input_stream_eof(InputStream *is) { return is->vtable->eof(is); }
+bool input_stream_eof(InputStream *is) { return is->vtable->eof(is); }
 
 void file_input_stream_destroy(InputStream *);
 int file_input_stream_read(InputStream *);
-int file_input_stream_eof(InputStream *);
+bool file_input_stream_eof(InputStream *);
 
 const InputStreamVtable FileInputStreamVtable = {
     .dtor = file_input_stream_destroy,
@@ -1021,14 +1022,14 @@ int file_input_stream_read(InputStream *is) {
   return fgetc(fis->input_file);
 }
 
-int file_input_stream_eof(InputStream *is) {
+bool file_input_stream_eof(InputStream *is) {
   FileInputStream *fis = (FileInputStream *)is;
-  return feof(fis->input_file);
+  return (bool)feof(fis->input_file);
 }
 
 void string_input_stream_destroy(InputStream *);
 int string_input_stream_read(InputStream *);
-int string_input_stream_eof(InputStream *);
+bool string_input_stream_eof(InputStream *);
 
 const InputStreamVtable StringInputStreamVtable = {
     .dtor = string_input_stream_destroy,
@@ -1060,10 +1061,10 @@ int string_input_stream_read(InputStream *is) {
   StringInputStream *sis = (StringInputStream *)is;
   if (sis->pos_ >= sis->len_)
     return -1;
-  return sis->string[sis->pos_++];
+  return (int)sis->string[sis->pos_++];
 }
 
-int string_input_stream_eof(InputStream *is) {
+bool string_input_stream_eof(InputStream *is) {
   StringInputStream *sis = (StringInputStream *)is;
   return sis->pos_ >= sis->len_;
 }
@@ -6724,6 +6725,12 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
       LLVMBuildStore(builder, inc, ptr);
       return is_pre ? inc : val;
     }
+    case UOK_Negate: {
+      LLVMValueRef val = compile_expr(compiler, builder, expr->subexpr,
+                                      local_ctx, local_allocas);
+      LLVMValueRef zero = LLVMConstNull(LLVMTypeOf(val));
+      return LLVMBuildSub(builder, zero, val, "");
+    }
     case UOK_AddrOf:
       return compile_lvalue_ptr(compiler, builder, expr->subexpr, local_ctx,
                                 local_allocas);
@@ -6759,39 +6766,47 @@ LLVMValueRef compile_implicit_cast(Compiler *compiler, LLVMBuilderRef builder,
   if (sema_types_are_compatible(compiler->sema, from_ty, to))
     return llvm_from;
 
-  LLVMTypeRef llvm_to = get_llvm_type(compiler, to);
+  LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, to);
   LLVMTypeRef llvm_from_ty = LLVMTypeOf(llvm_from);
 
-  if (llvm_to == llvm_from_ty)
+  if (llvm_to_ty == llvm_from_ty)
     return llvm_from;  // TODO: Is this branch ever reached?
 
+  if (LLVMGetTypeKind(llvm_from_ty) == LLVMPointerTypeKind) {
+    if (LLVMGetTypeKind(llvm_to_ty) == LLVMIntegerTypeKind) {
+      // TODO: Check the size.
+      // unsigned int_width = LLVMGetIntTypeWidth(llvm_from_ty);
+      return LLVMBuildPtrToInt(builder, llvm_from, llvm_to_ty, "");
+    }
+  }
+
   if (LLVMGetTypeKind(llvm_from_ty) == LLVMIntegerTypeKind) {
-    if (LLVMGetTypeKind(llvm_to) == LLVMIntegerTypeKind) {
+    if (LLVMGetTypeKind(llvm_to_ty) == LLVMIntegerTypeKind) {
       unsigned from_size = LLVMGetIntTypeWidth(llvm_from_ty);
-      unsigned to_size = LLVMGetIntTypeWidth(llvm_to);
+      unsigned to_size = LLVMGetIntTypeWidth(llvm_to_ty);
       if (from_size == to_size)
         return llvm_from;
       else if (from_size > to_size)
-        return LLVMBuildTrunc(builder, llvm_from, llvm_to, "");
+        return LLVMBuildTrunc(builder, llvm_from, llvm_to_ty, "");
       else if (is_unsigned_integral_type(from_ty))
-        return LLVMBuildZExt(builder, llvm_from, llvm_to, "");
+        return LLVMBuildZExt(builder, llvm_from, llvm_to_ty, "");
       else
-        return LLVMBuildSExt(builder, llvm_from, llvm_to, "");
+        return LLVMBuildSExt(builder, llvm_from, llvm_to_ty, "");
     }
 
-    if (LLVMGetTypeKind(llvm_to) == LLVMPointerTypeKind) {
+    if (LLVMGetTypeKind(llvm_to_ty) == LLVMPointerTypeKind) {
       unsigned from_size = LLVMGetIntTypeWidth(llvm_from_ty);
       LLVMTargetDataRef data_layout = LLVMGetModuleDataLayout(compiler->mod);
       unsigned ptr_size = LLVMPointerSize(data_layout) * kCharBit;
       printf("%u %u\n", from_size, ptr_size);
       assert(from_size == ptr_size);
-      return LLVMBuildIntToPtr(builder, llvm_from, llvm_to, "");
+      return LLVMBuildIntToPtr(builder, llvm_from, llvm_to_ty, "");
     }
   }
 
   printf("TODO: Handle this implicit cast\n");
   LLVMDumpType(llvm_from_ty);
-  LLVMDumpType(llvm_to);
+  LLVMDumpType(llvm_to_ty);
   __builtin_trap();
 }
 
@@ -7156,28 +7171,8 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
     }
     case EK_Cast: {
       const Cast *cast = (const Cast *)expr;
-
-      LLVMValueRef from =
-          compile_expr(compiler, builder, cast->base, local_ctx, local_allocas);
-
-      LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, cast->to);
-      LLVMTypeRef llvm_from_ty = LLVMTypeOf(from);
-
-      if (llvm_to_ty == llvm_from_ty)
-        return from;
-
-      if (LLVMGetTypeKind(llvm_from_ty) == LLVMPointerTypeKind) {
-        if (LLVMGetTypeKind(llvm_to_ty) == LLVMIntegerTypeKind) {
-          // TODO: Check the size.
-          // unsigned int_width = LLVMGetIntTypeWidth(llvm_from_ty);
-          return LLVMBuildPtrToInt(builder, from, llvm_to_ty, "");
-        }
-      }
-
-      printf("TODO: Unhandled implicit cast conversion\n");
-      LLVMDumpType(llvm_from_ty);
-      LLVMDumpType(llvm_to_ty);
-      __builtin_trap();
+      return compile_implicit_cast(compiler, builder, cast->base, cast->to,
+                                   local_ctx, local_allocas);
     }
     case EK_Index: {
       LLVMValueRef ptr =
@@ -7359,6 +7354,10 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
       }
       LLVMValueRef val =
           compile_expr(compiler, builder, ret->expr, local_ctx, local_allocas);
+
+      // TODO: There should be an ImplicitCast AST node that we can parser over
+      // rather than doing this here.
+
       LLVMBuildRet(builder, val);
       return;
     }
@@ -7400,16 +7399,17 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
 void compile_function_definition(Compiler *compiler,
                                  const FunctionDefinition *f) {
   LLVMTypeRef llvm_func_ty = get_llvm_type(compiler, f->type);
-  LLVMValueRef func = LLVMAddFunction(compiler->mod, f->name, llvm_func_ty);
+
+  LLVMValueRef func = get_named_global(compiler, f->name);
+  if (!func)
+    func = LLVMAddFunction(compiler->mod, f->name, llvm_func_ty);
+  assert(LLVMGetTypeKind(LLVMTypeOf(func)) == LLVMPointerTypeKind);
+
   LLVMBasicBlockRef entry = LLVMAppendBasicBlock(func, "entry");
   LLVMBuilderRef builder = LLVMCreateBuilder();
   LLVMPositionBuilderAtEnd(builder, entry);
 
   FunctionType *func_ty = (FunctionType *)(f->type);
-
-  // Storage for local variables.
-  // vector local_storage;
-  // vector_construct(&local_storage, sizeof(Expr *), alignof(Expr *));
 
   TreeMap local_ctx, local_allocas;
   string_tree_map_construct(&local_ctx);
@@ -7422,13 +7422,9 @@ void compile_function_definition(Compiler *compiler,
 
     // Copy the parameter locally.
     LLVMValueRef llvm_arg = LLVMGetParam(func, (unsigned)i);
-    // LLVMSetValueName2(llvm_arg, arg->name, strlen(arg->name));
     LLVMValueRef alloca =
         LLVMBuildAlloca(builder, LLVMTypeOf(llvm_arg), arg->name);
     LLVMBuildStore(builder, llvm_arg, alloca);
-
-    // FunctionParam *param = malloc(sizeof(FunctionParam));
-    // function_param_construct(param, arg->name, arg->type);
 
     // tree_map_set(&local_ctx, arg->name, param);
     tree_map_set(&local_ctx, arg->name, arg->type);
@@ -7441,19 +7437,12 @@ void compile_function_definition(Compiler *compiler,
   if (is_void_type(func_ty->return_type))
     LLVMBuildRetVoid(builder);
 
-  // Cleanup locals.
-  // for (size_t i = 0; i < local_storage.size; ++i) {
-  //  Expr **storage = vector_at(&local_storage, i);
-  //  expr_destroy(*storage);
-  //}
-  // vector_destroy(&local_storage);
   tree_map_destroy(&local_ctx);
   tree_map_destroy(&local_allocas);
 
   if (LLVMVerifyFunction(func, LLVMPrintMessageAction)) {
     printf("Verify function '%s' failed\n", f->name);
     LLVMDumpValue(func);
-    // LLVMDumpModule(compiler->mod);
     __builtin_trap();
   }
 }
@@ -7553,9 +7542,11 @@ void compile_global_variable(Compiler *compiler, const GlobalVariable *gv) {
   LLVMTypeRef ty = get_llvm_type(compiler, gv->type);
 
   if (gv->type->vtable->kind == TK_FunctionType) {
-    LLVMAddFunction(compiler->mod, gv->name, ty);
-    assert(!gv->initializer &&
-           "If this had an initializer, it would be a function definition.");
+    if (!get_named_global(compiler, gv->name)) {
+      LLVMAddFunction(compiler->mod, gv->name, ty);
+      assert(!gv->initializer &&
+             "If this had an initializer, it would be a function definition.");
+    }
     return;
   }
 
