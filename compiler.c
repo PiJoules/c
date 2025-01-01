@@ -756,7 +756,8 @@ static void TestTreeMapClone() {
 }
 
 static void TestTreeMapCloneEmpty() {
-  TreeMap m, m2;
+  TreeMap m;
+  TreeMap m2;
   string_tree_map_construct(&m);
   string_tree_map_construct(&m2);
 
@@ -1164,6 +1165,7 @@ typedef enum {
   // Literals
   TK_IntLiteral,
   TK_StringLiteral,
+  TK_CharLiteral,
 
   // Single-char tokens
   TK_LPar,          // (
@@ -1514,6 +1516,21 @@ Token lex(Lexer *lexer) {
     return tok;
   }
 
+  if (c == '\'') {
+    tok.kind = TK_CharLiteral;
+    int c = lexer_get_char(lexer);
+    assert(!is_eof(c));
+    string_append_char(&tok.chars, (char)c);
+
+    if (!lexer_peek_then_consume_char(lexer, '\'')) {
+      printf("%llu:%llu: Expected `'` for ending char.", tok.line, tok.col);
+      __builtin_trap();
+    }
+
+    string_append_char(&tok.chars, '\'');
+    return tok;
+  }
+
   // Handle special single character tokens.
   switch (c) {
     case '(':
@@ -1854,6 +1871,12 @@ typedef struct {
   int bitfield;  // -1 indicates no bitfield. 0 or greater represents the
                  // bitfield size.
 } StructMember;
+
+void member_destroy(StructMember *member) {
+  if (member->name)
+    free(member->name);
+  free(member->type);
+}
 
 typedef struct {
   Type type;
@@ -2248,6 +2271,8 @@ typedef enum {
   EK_Int,
   EK_Bool,  // true/false
   EK_String,
+  EK_Char,
+  EK_InitializerList,
   EK_Index,         // [ ]
   EK_MemberAccess,  // . or ->
   EK_Call,
@@ -3583,6 +3608,23 @@ void bool_construct(Bool *b, bool val) {
   b->val = val;
 }
 
+void char_destroy(Expr *) {}
+
+const ExprVtable CharVtable = {
+    .kind = EK_Char,
+    .dtor = char_destroy,
+};
+
+typedef struct {
+  Expr expr;
+  char val;
+} Char;
+
+void char_construct(Char *c, char val) {
+  expr_construct(&c->expr, &CharVtable);
+  c->val = val;
+}
+
 void int_destroy(Expr *expr);
 
 const ExprVtable IntVtable = {
@@ -3629,6 +3671,42 @@ void string_literal_construct(StringLiteral *s, const char *val, size_t len) {
 void string_literal_destroy(Expr *expr) {
   StringLiteral *s = (StringLiteral *)expr;
   free(s->val);
+}
+
+void initializer_list_destroy(Expr *expr);
+
+const ExprVtable InitializerListVtable = {
+    .kind = EK_InitializerList,
+    .dtor = initializer_list_destroy,
+};
+
+typedef struct {
+  char *name;  // Optional.
+  Expr *expr;
+} InitializerListElem;
+
+typedef struct {
+  Expr expr;
+
+  // This is a vector of InitializerListElems.
+  vector elems;
+} InitializerList;
+
+void initializer_list_construct(InitializerList *init, vector elems) {
+  expr_construct(&init->expr, &InitializerListVtable);
+  init->elems = elems;
+}
+
+void initializer_list_destroy(Expr *expr) {
+  InitializerList *init = (InitializerList *)expr;
+  for (size_t i = 0; i < init->elems.size; ++i) {
+    InitializerListElem *elem = vector_at(&init->elems, i);
+    if (elem->name)
+      free(elem->name);
+    expr_destroy(elem->expr);
+    free(elem);
+  }
+  vector_destroy(&init->elems);
 }
 
 // For parsing "(" <expr> ")" but the initial opening LPar is consumed.
@@ -3687,6 +3765,60 @@ Expr *parse_primary_expr(Parser *parser) {
     return &b->expr;
   }
 
+  if (tok->kind == TK_CharLiteral) {
+    size_t size = tok->chars.size;
+    assert(size == 3 && tok->chars.data[0] == '\'' &&
+           tok->chars.data[2] == '\'' &&
+           "Char literals from the lexer should have the start and end "
+           "single quotes");
+
+    Char *c = malloc(sizeof(Char));
+    char_construct(c, tok->chars.data[1]);
+    parser_consume_token(parser, TK_CharLiteral);
+    return &c->expr;
+  }
+
+  vector elems;
+  vector_construct(&elems, sizeof(InitializerListElem),
+                   alignof(InitializerListElem));
+
+  if (tok->kind == TK_LCurlyBrace) {
+    parser_consume_token(parser, TK_LCurlyBrace);
+
+    while (!next_token_is(parser, TK_RCurlyBrace)) {
+      char *name = NULL;
+
+      if (next_token_is(parser, TK_Dot)) {
+        // Designated initializer.
+        parser_consume_token(parser, TK_Dot);
+
+        const Token *next = parser_peek_token(parser);
+        name = strdup(next->chars.data);
+
+        parser_consume_token(parser, TK_Identifier);
+        parser_consume_token(parser, TK_Assign);
+      }
+
+      // TODO: Should this be just `parse_expr`? Using `parse_expr` may consume
+      // the following comma in a comma expression.
+      Expr *expr = parse_assignment_expr(parser);
+      InitializerListElem *elem = vector_append_storage(&elems);
+      elem->name = name;
+      elem->expr = expr;
+
+      // Consume optional `,`.
+      if (next_token_is(parser, TK_Comma))
+        parser_consume_token(parser, TK_Comma);
+      else
+        break;
+    }
+    parser_consume_token(parser, TK_RCurlyBrace);
+
+    InitializerList *init = malloc(sizeof(InitializerList));
+    initializer_list_construct(init, elems);
+    return &init->expr;
+  }
+
   printf("%llu:%llu: parse_primary_expr: Unhandled token (%d): '%s'\n",
          tok->line, tok->col, tok->kind, tok->chars.data);
   __builtin_trap();
@@ -3696,7 +3828,7 @@ Expr *parse_primary_expr(Parser *parser) {
 void index_destroy(Expr *expr);
 
 const ExprVtable IndexVtable = {
-    .kind = EK_UnOp,
+    .kind = EK_Index,
     .dtor = index_destroy,
 };
 
@@ -5720,7 +5852,17 @@ const Type *sema_get_type_of_binop_expr(Sema *sema, const BinOp *expr,
     case BOK_BitwiseAnd:
       return sema_get_common_arithmetic_type(sema, lhs_ty, rhs_ty, local_ctx);
     case BOK_Assign:
-      return rhs_ty;
+    case BOK_MulAssign:
+    case BOK_DivAssign:
+    case BOK_ModAssign:
+    case BOK_AddAssign:
+    case BOK_SubAssign:
+    case BOK_LShiftAssign:
+    case BOK_RShiftAssign:
+    case BOK_AndAssign:
+    case BOK_OrAssign:
+    case BOK_XorAssign:
+      return lhs_ty;
     default:
       printf("TODO: Implement get type for binop kind %d on %llu:%llu\n",
              expr->op, expr->expr.line, expr->expr.col);
@@ -5776,6 +5918,8 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       return &((const Int *)expr)->type.type;
     case EK_Bool:
       return &sema->bt_Bool.type;
+    case EK_Char:
+      return &sema->bt_Char.type;
     case EK_DeclRef: {
       const DeclRef *decl = (const DeclRef *)expr;
       void *val;
@@ -5828,9 +5972,26 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       return sema_get_common_arithmetic_type_of_exprs(
           sema, conditional->true_expr, conditional->false_expr, local_ctx);
     }
+    case EK_Index: {
+      const Index *index = (const Index *)expr;
+      const Type *base_ty =
+          sema_get_type_of_expr_in_ctx(sema, index->base, local_ctx);
+      base_ty = sema_resolve_maybe_named_type(sema, base_ty);
+      if (base_ty->vtable->kind == TK_PointerType)
+        return sema_get_pointee(sema, base_ty, local_ctx);
+
+      if (base_ty->vtable->kind == TK_ArrayType)
+        return sema_get_array_type(sema, base_ty, local_ctx)->elem_type;
+
+      printf("Attempting to index a type that isn't a pointer or array: %d\n",
+             base_ty->vtable->kind);
+      __builtin_trap();
+    }
     default:
-      printf("TODO: Implement sema_get_type_of_expr for this expression %d\n",
-             expr->vtable->kind);
+      printf(
+          "TODO: Implement sema_get_type_of_expr_in_ctx for this expression "
+          "%d\n",
+          expr->vtable->kind);
       __builtin_trap();
   }
 }
@@ -6734,6 +6895,13 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
       LLVMBuildStore(builder, rhs, lhs);
       res = rhs;
       break;
+    case BOK_AddAssign: {
+      LLVMTypeRef llvm_lhs_ty = get_llvm_type(compiler, lhs_ty);
+      LLVMValueRef lhs_val = LLVMBuildLoad2(builder, llvm_lhs_ty, lhs, "");
+      res = LLVMBuildAdd(builder, lhs_val, rhs, "");
+      LLVMBuildStore(builder, res, lhs);
+      break;
+    }
     default:
       printf("TODO: Implement compile_binop for this op %d\n", expr->op);
       __builtin_trap();
@@ -6802,6 +6970,11 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
     case EK_Bool: {
       const Bool *b = (const Bool *)expr;
       return LLVMConstInt(type, b->val, /*UsSugbed=*/false);
+    }
+    case EK_Char: {
+      const Char *c = (const Char *)expr;
+      assert(c->val >= 0);
+      return LLVMConstInt(type, (unsigned long long)c->val, /*UsSugbed=*/false);
     }
     case EK_SizeOf: {
       ConstExprResult res =
@@ -6913,6 +7086,13 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
       LLVMDumpType(llvm_from_ty);
       LLVMDumpType(llvm_to_ty);
       __builtin_trap();
+    }
+    case EK_Index: {
+      LLVMValueRef ptr =
+          compile_lvalue_ptr(compiler, builder, expr, local_ctx, local_allocas);
+      const Type *ty =
+          sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
+      return LLVMBuildLoad2(builder, get_llvm_type(compiler, ty), ptr, "");
     }
     default:
       printf("TODO: Implement compile_expr for this expr %d\n",
@@ -7250,6 +7430,34 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
 
       printf("Unhandled lvalue ptr cast from %d to %d\n",
              LLVMGetTypeKind(llvm_src_ty), LLVMGetTypeKind(llvm_dst_ty));
+      __builtin_trap();
+    }
+    case EK_Index: {
+      const Index *index = (const Index *)expr;
+      const Expr *base = index->base;
+      const Type *base_ty =
+          sema_get_type_of_expr_in_ctx(compiler->sema, base, local_ctx);
+      LLVMValueRef base_ptr =
+          compile_lvalue_ptr(compiler, builder, base, local_ctx, local_allocas);
+      assert(LLVMGetTypeKind(LLVMTypeOf(base_ptr)) == LLVMPointerTypeKind);
+
+      LLVMValueRef idx =
+          compile_expr(compiler, builder, index->idx, local_ctx, local_allocas);
+      LLVMValueRef offsets[] = {idx};
+
+      if (sema_is_pointer_type(compiler->sema, base_ty, local_ctx)) {
+        const Type *pointee_ty =
+            sema_get_pointee(compiler->sema, base_ty, local_ctx);
+        LLVMTypeRef llvm_pointee_ty = get_llvm_type(compiler, pointee_ty);
+        return LLVMBuildGEP2(builder, llvm_pointee_ty, base_ptr, offsets, 1,
+                             "");
+      } else if (sema_is_array_type(compiler->sema, base_ty, local_ctx)) {
+        LLVMTypeRef llvm_arr_ty = get_llvm_type(compiler, base_ty);
+        assert(LLVMGetTypeKind(llvm_arr_ty) == LLVMArrayTypeKind);
+        return LLVMBuildGEP2(builder, llvm_arr_ty, base_ptr, offsets, 1, "");
+      }
+
+      printf("Indexing non-ptr or arr type\n");
       __builtin_trap();
     }
     default:
