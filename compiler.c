@@ -196,6 +196,8 @@ LLVMValueRef LLVMBuildURem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
 LLVMValueRef LLVMBuildSRem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                            const char *Name);
 LLVMValueRef LLVMGetLastInstruction(LLVMBasicBlockRef BB);
+LLVMValueRef LLVMConstStruct(LLVMValueRef *ConstantVals, unsigned Count,
+                             LLVMBool Packed);
 
 typedef enum {
   LLVMArgumentValueKind,
@@ -5435,14 +5437,41 @@ bool sema_types_are_compatible_impl(Sema *sema, const Type *lhs,
       StructType *lhs_struct = (StructType *)lhs;
       StructType *rhs_struct = (StructType *)rhs;
 
-      // No anonymous structs are compatible.
-      if (lhs_struct->name == NULL || lhs_struct->name == NULL)
+      // If one is declared with a tag, the other must also be declared with the
+      // same tag.
+      if ((lhs_struct->name && !rhs_struct->name) ||
+          (!lhs_struct->name && rhs_struct->name))
         return false;
 
       // This should be enough since we wouldn't be able to define different
       // structs with the same name.
-      if (strcmp(lhs_struct->name, rhs_struct->name) != 0)
+      if (lhs_struct->name && rhs_struct->name &&
+          strcmp(lhs_struct->name, rhs_struct->name) != 0)
         return false;
+
+      if (lhs_struct->members && rhs_struct->members) {
+        if (lhs_struct->members->size != rhs_struct->members->size)
+          return false;
+
+        for (size_t i = 0; i < lhs_struct->members->size; ++i) {
+          StructMember *lhs_member = vector_at(lhs_struct->members, i);
+          StructMember *rhs_member = vector_at(rhs_struct->members, i);
+          if ((lhs_member->name && !rhs_member->name) ||
+              (!lhs_member->name && rhs_member->name))
+            return false;
+
+          if (lhs_member->name && rhs_member->name &&
+              strcmp(lhs_member->name, rhs_member->name) != 0)
+            return false;
+
+          if (lhs_member->bitfield != rhs_member->bitfield)
+            return false;
+
+          if (!sema_types_are_compatible_impl(sema, lhs_member->type,
+                                              rhs_member->type, ignore_quals))
+            return false;
+        }
+      }
 
       break;
     }
@@ -6469,8 +6498,33 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
 LLVMTypeRef get_llvm_type_of_expr_global_ctx(Compiler *compiler,
                                              const Expr *expr);
 
-LLVMValueRef compile_constant_expr(Compiler *compiler, const Expr *expr) {
+LLVMValueRef maybe_compile_constant_implicit_cast(Compiler *compiler,
+                                                  const Expr *expr,
+                                                  const Type *to_ty);
+
+LLVMValueRef get_named_global(Compiler *compiler, const char *name) {
+  // If not in the local scope, check the global scope.
+  //
+  // TODO: How come there's no wrapper for Module::getNamedValue?
+  // Without it, I need to explicitly call the individual getters for
+  // functions, global variables, adn aliases.
+  LLVMValueRef val = LLVMGetNamedGlobal(compiler->mod, name);
+
+  if (!val)
+    val = LLVMGetNamedFunction(compiler->mod, name);
+
+  return val;
+}
+
+LLVMValueRef compile_constant_expr(Compiler *compiler, const Expr *expr,
+                                   const Type *to_ty) {
   switch (expr->vtable->kind) {
+    case EK_DeclRef: {
+      const DeclRef *decl = (const DeclRef *)expr;
+      LLVMValueRef glob = get_named_global(compiler, decl->name);
+      assert(glob);
+      return glob;
+    }
     case EK_SizeOf: {
       ConstExprResult res =
           sema_eval_sizeof(compiler->sema, (const SizeOf *)expr);
@@ -6490,7 +6544,7 @@ LLVMValueRef compile_constant_expr(Compiler *compiler, const Expr *expr) {
       const Type *from_ty = sema_get_type_of_expr(compiler->sema, cast->base);
       const Type *to_ty = cast->to;
 
-      LLVMValueRef from = compile_constant_expr(compiler, cast->base);
+      LLVMValueRef from = compile_constant_expr(compiler, cast->base, to_ty);
 
       if (sema_types_are_compatible(compiler->sema, from_ty, to_ty))
         return from;
@@ -6500,6 +6554,31 @@ LLVMValueRef compile_constant_expr(Compiler *compiler, const Expr *expr) {
 
       printf("TODO: Unhandled constant cast conversion\n");
       __builtin_trap();
+    }
+    case EK_InitializerList: {
+      const InitializerList *init = (const InitializerList *)expr;
+      LLVMValueRef *constants = malloc(sizeof(LLVMValueRef) * init->elems.size);
+      for (size_t i = 0; i < init->elems.size; ++i) {
+        const InitializerListElem *elem = vector_at(&init->elems, i);
+        const Type *elem_ty = sema_get_type_of_expr(compiler->sema, elem->expr);
+        constants[i] =
+            maybe_compile_constant_implicit_cast(compiler, elem->expr, elem_ty);
+      }
+
+      LLVMValueRef res;
+      TreeMap dummy_ctx;  // TODO: Have global version of sema_is_array_type.
+      string_tree_map_construct(&dummy_ctx);
+      if (sema_is_array_type(compiler->sema, to_ty, &dummy_ctx)) {
+        printf("TODO: Handle this\n");
+        __builtin_trap();
+      } else {
+        assert(sema_is_struct_type(compiler->sema, to_ty, &dummy_ctx));
+        res = LLVMConstStruct(constants, (unsigned)init->elems.size,
+                              /*Packed=*/0);
+      }
+      free(constants);
+
+      return res;
     }
     default:
       printf("TODO: Implement IR constant expr evaluation for expr kind %d\n",
@@ -6511,14 +6590,20 @@ LLVMValueRef compile_constant_expr(Compiler *compiler, const Expr *expr) {
 LLVMValueRef maybe_compile_constant_implicit_cast(Compiler *compiler,
                                                   const Expr *expr,
                                                   const Type *to_ty) {
-  LLVMValueRef from = compile_constant_expr(compiler, expr);
-  const Type *from_ty = sema_get_type_of_expr(compiler->sema, expr);
+  LLVMValueRef from = compile_constant_expr(compiler, expr, to_ty);
 
-  if (sema_types_are_compatible_ignore_quals(compiler->sema, from_ty, to_ty))
-    return from;
+  // We cannot disambiguate if an initializer list is for an array or struct.
+  // They should not be treated like normal expressions, so just use the
+  // destination type in this case.
+  const Type *from_ty = expr->vtable->kind == EK_InitializerList
+                            ? to_ty
+                            : sema_get_type_of_expr(compiler->sema, expr);
 
   from_ty = sema_resolve_maybe_named_type(compiler->sema, from_ty);
   to_ty = sema_resolve_maybe_named_type(compiler->sema, to_ty);
+
+  if (sema_types_are_compatible_ignore_quals(compiler->sema, from_ty, to_ty))
+    return from;
 
   if (is_integral_type(from_ty) && is_integral_type(to_ty)) {
     unsigned long long from_val = LLVMConstIntGetZExtValue(from);
@@ -6531,7 +6616,14 @@ LLVMValueRef maybe_compile_constant_implicit_cast(Compiler *compiler,
     }
   }
 
-  printf("TODO: Unhandled implicit constant cast conversion\n");
+  printf(
+      "TODO: Unhandled implicit constant cast conversion:\n"
+      "lhs: %d %d (%s)\n"
+      "rhs: %d %d\n",
+      from_ty->vtable->kind, from_ty->qualifiers,
+      (from_ty->vtable->kind == TK_StructType ? ((StructType *)from_ty)->name
+                                              : ""),
+      to_ty->vtable->kind, to_ty->qualifiers);
   __builtin_trap();
 }
 
@@ -7376,16 +7468,7 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
       LLVMValueRef val = NULL;
       tree_map_get(local_allocas, decl->name, (void *)&val);
       if (!val) {
-        // If not in the local scope, check the global scope.
-        //
-        // TODO: How come there's no wrapper for Module::getNamedValue?
-        // Without it, I need to explicitly call the individual getters for
-        // functions, global variables, adn aliases.
-        val = LLVMGetNamedGlobal(compiler->mod, decl->name);
-
-        if (!val)
-          val = LLVMGetNamedFunction(compiler->mod, decl->name);
-
+        val = get_named_global(compiler, decl->name);
         if (!val) {
           printf("Couldn't find alloca or global for '%s'\n", decl->name);
           LLVMValueRef fn =
