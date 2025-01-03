@@ -8,6 +8,9 @@ static_assert(sizeof(size_t) == 8);
 typedef unsigned long long uintptr_t;
 static_assert(sizeof(uintptr_t) == sizeof(void *));
 
+typedef long long intptr_t;
+static_assert(sizeof(intptr_t) == sizeof(void *));
+
 typedef unsigned char uint8_t;
 static_assert(sizeof(uint8_t) == 1);
 
@@ -1160,6 +1163,10 @@ typedef enum {
   TK_Else,
   TK_While,
   TK_For,
+  TK_Switch,
+  TK_Break,
+  TK_Case,
+  TK_Default,
   TK_True,
   TK_False,
 
@@ -1205,7 +1212,8 @@ static bool is_storage_class_specifier_token(TokenKind kind) {
 typedef struct {
   string chars;
   TokenKind kind;
-  size_t line, col;
+  size_t line;
+  size_t col;
 } Token;
 
 typedef struct {
@@ -1216,10 +1224,11 @@ typedef struct {
 
   // Lexer users should never access these directly. Instead refer to the line
   // and col returned in the Token.
-  size_t line_, col_;
+  size_t line_;
+  size_t col_;
 } Lexer;
 
-static inline bool is_eof(int c) { return c < 0; }
+static bool is_eof(int c) { return c < 0; }
 
 void lexer_construct(Lexer *lexer, InputStream *input) {
   lexer->input = input;
@@ -1316,7 +1325,7 @@ static bool is_kw_char(int c) { return c == '_' || isalnum(c); }
 // unless it's EOF.
 void skip_ws(Lexer *lexer) {
   int c;
-  while (1) {
+  for (;;) {
     c = lexer_peek_char(lexer);
     if (is_eof(c))
       return;
@@ -1346,7 +1355,7 @@ Token lex(Lexer *lexer) {
   tok.kind = TK_Eof;  // Default value
 
   int c;
-  while (1) {
+  for (;;) {
     skip_ws(lexer);
 
     if (is_eof(lexer_peek_char(lexer))) {
@@ -1367,7 +1376,7 @@ Token lex(Lexer *lexer) {
 
       if (lexer_peek_char(lexer) == '/') {
         // This is a comment. Consume all characters until the newline.
-        while (lexer_get_char(lexer) != '\n')
+        for (; lexer_get_char(lexer) != '\n';)
           ;
         string_clear(&tok.chars);
         continue;
@@ -1375,7 +1384,7 @@ Token lex(Lexer *lexer) {
 
       if (lexer_peek_char(lexer) == '*') {
         // This is a comment. Consume all characters until the final `*/`.
-        while (1) {
+        for (;;) {
           if (lexer_get_char(lexer) == '*') {
             if (lexer_peek_then_consume_char(lexer, '/'))
               break;
@@ -1473,6 +1482,17 @@ Token lex(Lexer *lexer) {
     return tok;
   }
 
+  if (c == '|') {
+    // Disambiguate between bitwise-or and logical-or.
+    if (lexer_peek_then_consume_char(lexer, '|')) {
+      string_append_char(&tok.chars, '|');
+      tok.kind = TK_LogicalOr;
+    } else {
+      tok.kind = TK_Or;
+    }
+    return tok;
+  }
+
   if (c == '%') {
     if (lexer_peek_then_consume_char(lexer, '=')) {
       string_append_char(&tok.chars, '=');
@@ -1505,7 +1525,7 @@ Token lex(Lexer *lexer) {
 
   if (c == '"') {
     // TODO: Handle escape chars.
-    while (!lexer_peek_then_consume_char(lexer, '"')) {
+    for (; !lexer_peek_then_consume_char(lexer, '"');) {
       int c = lexer_get_char(lexer);
       if (is_eof(c)) {
         printf("Got EOF before finishing string parsing\n");
@@ -1523,10 +1543,32 @@ Token lex(Lexer *lexer) {
     tok.kind = TK_CharLiteral;
     int c = lexer_get_char(lexer);
     assert(!is_eof(c));
+
+    if (c == '\\') {
+      switch (lexer_get_char(lexer)) {
+        case 'n':
+          c = '\n';
+          break;
+        case 't':
+          c = '\t';
+          break;
+        case '\'':
+          c = '\'';
+          break;
+        case '\\':
+          c = '\\';
+          break;
+        default:
+          printf("%llu:%llu: Unhandled escape character '%c'\n", tok.line,
+                 tok.col, c);
+          __builtin_trap();
+      }
+    }
+
     string_append_char(&tok.chars, (char)c);
 
     if (!lexer_peek_then_consume_char(lexer, '\'')) {
-      printf("%llu:%llu: Expected `'` for ending char.", tok.line, tok.col);
+      printf("%llu:%llu: Expected `'` for ending char.\n", tok.line, tok.col);
       __builtin_trap();
     }
 
@@ -1632,6 +1674,14 @@ Token lex(Lexer *lexer) {
     tok.kind = TK_While;
   } else if (string_equals(&tok.chars, "for")) {
     tok.kind = TK_For;
+  } else if (string_equals(&tok.chars, "switch")) {
+    tok.kind = TK_Switch;
+  } else if (string_equals(&tok.chars, "break")) {
+    tok.kind = TK_Break;
+  } else if (string_equals(&tok.chars, "case")) {
+    tok.kind = TK_Case;
+  } else if (string_equals(&tok.chars, "default")) {
+    tok.kind = TK_Default;
   } else if (string_equals(&tok.chars, "extern")) {
     tok.kind = TK_Extern;
   } else if (string_equals(&tok.chars, "static")) {
@@ -2467,6 +2517,7 @@ typedef enum {
   SK_Declaration,
   SK_ForStmt,
   SK_WhileStmt,
+  SK_SwitchStmt,
 } StatementKind;
 
 struct Statement;
@@ -2558,6 +2609,77 @@ void if_stmt_destroy(Statement *stmt) {
   if (ifstmt->else_stmt) {
     statement_destroy(ifstmt->else_stmt);
     free(ifstmt->else_stmt);
+  }
+}
+
+void switch_stmt_destroy(Statement *);
+
+const StatementVtable SwitchStmtVtable = {
+    .kind = SK_SwitchStmt,
+    .dtor = switch_stmt_destroy,
+};
+
+typedef struct {
+  Expr *cond;
+
+  // Vector of Statement pointers.
+  vector stmts;
+} SwitchCase;
+
+void switch_case_destroy(SwitchCase *switch_case) {
+  expr_destroy(switch_case->cond);
+  free(switch_case->cond);
+
+  for (size_t i = 0; i < switch_case->stmts.size; ++i) {
+    Statement **stmt = vector_at(&switch_case->stmts, i);
+    statement_destroy(*stmt);
+    free(*stmt);
+  }
+
+  vector_destroy(&switch_case->stmts);
+}
+
+typedef struct {
+  Statement base;
+  Expr *cond;
+
+  // Vector of SwitchCases.
+  vector cases;
+
+  // Vector of Statement pointers.
+  //
+  // Optional. If not provided, then this switch has no default branch.
+  vector *default_stmts;
+} SwitchStmt;
+
+void switch_stmt_construct(SwitchStmt *stmt, Expr *cond, vector cases,
+                           vector *default_stmts) {
+  statement_construct(&stmt->base, &SwitchStmtVtable);
+  stmt->cond = cond;
+  stmt->cases = cases;
+  stmt->default_stmts = default_stmts;
+}
+
+void switch_stmt_destroy(Statement *stmt) {
+  SwitchStmt *switch_stmt = (SwitchStmt *)stmt;
+
+  expr_destroy(switch_stmt->cond);
+  free(switch_stmt->cond);
+
+  for (size_t i = 0; i < switch_stmt->cases.size; ++i) {
+    SwitchCase *switch_case = vector_at(&switch_stmt->cases, i);
+    switch_case_destroy(switch_case);
+  }
+  vector_destroy(&switch_stmt->cases);
+
+  if (switch_stmt->default_stmts) {
+    for (size_t i = 0; i < switch_stmt->default_stmts->size; ++i) {
+      Statement **stmt = vector_at(switch_stmt->default_stmts, i);
+      statement_destroy(*stmt);
+      free(*stmt);
+    }
+    vector_destroy(switch_stmt->default_stmts);
+    free(switch_stmt->default_stmts);
   }
 }
 
@@ -4737,6 +4859,40 @@ Statement *parse_statement(Parser *parser) {
     return &ret->base;
   }
 
+  if (peek->kind == TK_Switch) {
+    parser_consume_token(parser, TK_Switch);
+
+    parser_consume_token(parser, TK_LPar);
+    Expr *cond = parse_expr(parser);
+    parser_consume_token(parser, TK_RPar);
+
+    parser_consume_token(parser, TK_LCurlyBrace);
+
+    // Vector of SwitchCases - same as SwitchStmt::cases.
+    vector cases;
+    vector_construct(&cases, sizeof(SwitchCase), alignof(SwitchCase));
+    while (1) {
+      if (next_token_is(parser, TK_RCurlyBrace))
+        break;
+
+      if (next_token_is(parser, TK_Case)) {
+        parser_consume_token(parser, TK_Case);
+
+        Expr *case_expr = parse_expr(parser);
+
+        parser_consume_token(parser, TK_Colon);
+
+      } else if (next_token_is(parser, TK_Default)) {
+        parser_consume_token(parser, TK_Default);
+      } else {
+        const Token *peek = parser_peek_token(parser);
+        printf("Neither case nor default: '%s'\n", peek->chars.data);
+        __builtin_trap();
+      }
+    }
+    parser_consume_token(parser, TK_RCurlyBrace);
+  }
+
   if (peek->kind == TK_For) {
     parser_consume_token(parser, TK_For);
     parser_consume_token(parser, TK_LPar);
@@ -4763,7 +4919,7 @@ Statement *parse_statement(Parser *parser) {
     parser_consume_token(parser, TK_Semicolon);
 
     // Parse optional iterating expr.
-    if (!next_token_is(parser, TK_LPar))
+    if (!next_token_is(parser, TK_RPar))
       iter = parse_expr(parser);
 
     parser_consume_token(parser, TK_RPar);
@@ -5151,6 +5307,7 @@ static void RunParserTests() {
 typedef struct {
   TreeMap typedef_types;
   TreeMap struct_types;
+  TreeMap enum_types;
 
   // This is a map of all globals seen in this TU. If any of them are
   // definitions, those globals will be stored here over the ones without
@@ -5158,6 +5315,17 @@ typedef struct {
   //
   // The values are either GlobalVariable or FunctionDefinition pointers.
   TreeMap globals;
+
+  // This is a map of all enum names values declared in this TU to their values.
+  //
+  // The values are ints.
+  TreeMap enum_values;
+
+  // This is a map of all enum names to pointers to their corresponding
+  // EnumTypes.
+  //
+  // The keys here must be kept in sync with the kets of enum_values.
+  TreeMap enum_names;
 
   BuiltinType bt_Char;
   BuiltinType bt_SignedChar;
@@ -5190,7 +5358,10 @@ void sema_handle_global_variable(Sema *sema, GlobalVariable *gv);
 void sema_construct(Sema *sema) {
   string_tree_map_construct(&sema->typedef_types);
   string_tree_map_construct(&sema->struct_types);
+  string_tree_map_construct(&sema->enum_types);
   string_tree_map_construct(&sema->globals);
+  string_tree_map_construct(&sema->enum_values);
+  string_tree_map_construct(&sema->enum_names);
 
   builtin_type_construct(&sema->bt_Char, BTK_Char);
   builtin_type_construct(&sema->bt_SignedChar, BTK_SignedChar);
@@ -5237,7 +5408,10 @@ void sema_construct(Sema *sema) {
 void sema_destroy(Sema *sema) {
   tree_map_destroy(&sema->typedef_types);
   tree_map_destroy(&sema->struct_types);
+  tree_map_destroy(&sema->enum_types);
   tree_map_destroy(&sema->globals);
+  tree_map_destroy(&sema->enum_values);
+  tree_map_destroy(&sema->enum_names);
 
   // NOTE: We don't need to destroy the builtin types since they don't have
   // any members that need cleanup.
@@ -5260,11 +5434,13 @@ typedef struct {
   enum {
     // TODO: Add the other expression result kinds.
     RK_Boolean,
+    RK_Int,
     RK_UnsignedLongLong,
   } result_kind;
 
   union {
     bool b;
+    int i;
     unsigned long long ull;
   } result;
 } ConstExprResult;
@@ -5564,6 +5740,8 @@ void sema_handle_function_definition(Sema *sema, FunctionDefinition *f) {
   assert(f->type->vtable->kind == TK_FunctionType);
   verify_function_type(sema, (const FunctionType *)f->type);
 
+  assert(!tree_map_get(&sema->enum_values, f->name, NULL));
+
   void *val;
   if (!tree_map_get(&sema->globals, f->name, &val)) {
     // This func was not declared prior. Unconditionally save this one.
@@ -5591,6 +5769,8 @@ void sema_handle_function_definition(Sema *sema, FunctionDefinition *f) {
 }
 
 void sema_handle_global_variable(Sema *sema, GlobalVariable *gv) {
+  assert(!tree_map_get(&sema->enum_values, gv->name, NULL));
+
   void *val;
   if (!tree_map_get(&sema->globals, gv->name, &val)) {
     // This global was not declared prior. Unconditionally save this one.
@@ -5662,18 +5842,58 @@ void sema_handle_struct_declaration(Sema *sema, StructDeclaration *decl) {
   sema_handle_struct_declaration_impl(sema, &decl->type);
 }
 
+void sema_handle_enum_declaration(Sema *sema, EnumType *enum_ty) {
+  if (!enum_ty->members)
+    return;
+
+  if (enum_ty->name) {
+    void *found;
+    if (tree_map_get(&sema->enum_types, enum_ty->name, &found)) {
+      EnumType *found_enum = found;
+      if (found_enum->members) {
+        printf("Duplicate enum definition '%s'\n", enum_ty->name);
+        __builtin_trap();
+      }
+    }
+
+    tree_map_set(&sema->enum_types, enum_ty->name, enum_ty);
+  }
+
+  // Register the individual members.
+  int val = 0;
+  for (size_t i = 0; i < enum_ty->members->size; ++i) {
+    EnumMember *member = vector_at(enum_ty->members, i);
+    assert(!tree_map_get(&sema->enum_values, member->name, NULL));
+
+    if (member->value) {
+      ConstExprResult res = sema_eval_expr(sema, member->value);
+      assert(res.result_kind == RK_UnsignedLongLong);
+      val = (int)res.result.ull;
+    }
+
+    tree_map_set(&sema->enum_values, member->name, (void *)(intptr_t)val);
+    tree_map_set(&sema->enum_names, member->name, enum_ty);
+
+    val++;
+  }
+}
+
 void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
   if (tree_map_get(&sema->typedef_types, name, NULL)) {
     printf("sema_add_typedef_type: typedef for '%s' already exists\n", name);
     __builtin_trap();
   }
 
+  if (type->vtable->kind == TK_StructType) {
+    StructType *struct_ty = (StructType *)type;
+    sema_handle_struct_declaration_impl(sema, struct_ty);
+  } else if (type->vtable->kind == TK_EnumType) {
+    EnumType *enum_ty = (EnumType *)type;
+    sema_handle_enum_declaration(sema, enum_ty);
+  }
+
   switch (type->vtable->kind) {
-    case TK_StructType: {
-      StructType *struct_ty = (StructType *)type;
-      sema_handle_struct_declaration_impl(sema, struct_ty);
-      [[fallthrough]];
-    }
+    case TK_StructType:
     case TK_FunctionType:
     case TK_BuiltinType:
     case TK_EnumType:  // TODO: Handle enum values.
@@ -5968,6 +6188,10 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       if (tree_map_get(local_ctx, decl->name, &val))
         return (const Type *)val;
 
+      // Maybe an enum?
+      if (tree_map_get(&sema->enum_names, decl->name, &val))
+        return (const Type *)val;
+
       printf("Unknown symbol '%s'\n", decl->name);
       __builtin_trap();
     }
@@ -6217,6 +6441,12 @@ int compare_constexpr_result_types(const ConstExprResult *lhs,
   switch (lhs->result_kind) {
     case RK_Boolean:
       return !(lhs->result.b == rhs->result.b);
+    case RK_Int:
+      if (lhs->result.i < rhs->result.i)
+        return -1;
+      if (lhs->result.i > rhs->result.i)
+        return 1;
+      return 0;
     case RK_UnsignedLongLong:
       if (lhs->result.ull < rhs->result.ull)
         return -1;
@@ -6315,6 +6545,43 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
       };
       return res;
     }
+    case EK_UnOp: {
+      const UnOp *unop = (const UnOp *)expr;
+      ConstExprResult sub_res = sema_eval_expr(sema, unop->subexpr);
+      switch (unop->op) {
+        case UOK_Negate:
+          switch (sub_res.result_kind) {
+            case RK_Boolean:
+              printf("Cannot negate boolean\n");
+              __builtin_trap();
+            case RK_Int:
+              sub_res.result.i = -sub_res.result.i;
+              return sub_res;
+            case RK_UnsignedLongLong:
+              sub_res.result.ull = -sub_res.result.ull;
+              return sub_res;
+          }
+          break;
+        default:
+          printf("TODO: Handle constexpr eval for other unop kinds %d\n",
+                 unop->op);
+          __builtin_trap();
+      }
+    }
+    case EK_DeclRef: {
+      const DeclRef *decl = (const DeclRef *)expr;
+      void *val;
+      if (tree_map_get(&sema->enum_values, decl->name, &val)) {
+        ConstExprResult res = {
+            .result_kind = RK_UnsignedLongLong,
+            .result.i = (int)(uintptr_t)val,
+        };
+        return res;
+      }
+
+      // TODO: Check globals also.
+      [[fallthrough]];
+    }
     default:
       printf(
           "TODO: Implement constant evaluation for the remaining "
@@ -6329,18 +6596,20 @@ void sema_verify_static_assert_condition(Sema *sema, const Expr *cond) {
   ConstExprResult res = sema_eval_expr(sema, cond);
   switch (res.result_kind) {
     case RK_Boolean:
-      if (!res.result.b) {
-        printf("static_assert failed\n");
-        __builtin_trap();
-      }
+      if (res.result.b)
+        return;
+      break;
+    case RK_Int:
+      if (res.result.i)
+        return;
       break;
     case RK_UnsignedLongLong:
-      if (res.result.ull == 0) {
-        printf("static_assert failed\n");
-        __builtin_trap();
-      }
+      if (res.result.ull)
+        return;
       break;
   }
+  printf("static_assert failed\n");
+  __builtin_trap();
 }
 
 ///
@@ -7110,6 +7379,20 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
         return val;
       }
 
+      const Type *decl_ty =
+          sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
+      if (decl_ty->vtable->kind == TK_EnumType) {
+        void *enum_val;
+        if (tree_map_get(&compiler->sema->enum_values, decl->name, &enum_val)) {
+          LLVMTypeRef enum_ty =
+              get_llvm_type_of_expr(compiler, expr, local_ctx);
+          return LLVMConstInt(enum_ty, (uintptr_t)enum_val, /*signed=*/1);
+        }
+
+        printf("Couldn't find value for enum member '%s'\n", decl->name);
+        __builtin_trap();
+      }
+
       LLVMValueRef val =
           compile_lvalue_ptr(compiler, builder, expr, local_ctx, local_allocas);
       return LLVMBuildLoad2(builder, type, val, "");
@@ -7456,15 +7739,15 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
 
       LLVMValueRef val = NULL;
       tree_map_get(local_allocas, decl->name, (void *)&val);
-      if (!val) {
+
+      if (!val)
         val = get_named_global(compiler, decl->name);
-        if (!val) {
-          printf("Couldn't find alloca or global for '%s'\n", decl->name);
-          LLVMValueRef fn =
-              LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
-          LLVMDumpValue(fn);
-          __builtin_trap();
-        }
+
+      if (!val) {
+        printf("Couldn't find alloca or global for '%s'\n", decl->name);
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+        LLVMDumpValue(fn);
+        __builtin_trap();
       }
 
       assert(LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind);
