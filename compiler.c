@@ -1377,8 +1377,7 @@ Token lex(Lexer *lexer) {
 
       if (lexer_peek_char(lexer) == '/') {
         // This is a comment. Consume all characters until the newline.
-        for (; lexer_get_char(lexer) != '\n';)
-          ;
+        for (; lexer_get_char(lexer) != '\n';);
         string_clear(&tok.chars);
         continue;
       }
@@ -1508,6 +1507,9 @@ Token lex(Lexer *lexer) {
     if (lexer_peek_then_consume_char(lexer, '=')) {
       string_append_char(&tok.chars, '=');
       tok.kind = TK_Le;
+    } else if (lexer_peek_then_consume_char(lexer, '<')) {
+      string_append_char(&tok.chars, '<');
+      tok.kind = TK_LShift;
     } else {
       tok.kind = TK_Lt;
     }
@@ -2485,7 +2487,7 @@ typedef struct {
   Node node;
   char *name;
   Type *type;
-  Expr *initializer;
+  Expr *initializer;  // Optional.
 
   bool is_extern;  // false implies `static`.
   bool is_thread_local;
@@ -5534,6 +5536,18 @@ ConstExprResult sema_eval_expr(Sema *, const Expr *);
 int compare_constexpr_result_types(const ConstExprResult *,
                                    const ConstExprResult *);
 
+uint64_t result_to_u64(const ConstExprResult *res) {
+  switch (res->result_kind) {
+    case RK_Boolean:
+      return res->result.b;
+    case RK_Int:
+      assert(res->result.i >= 0);
+      return (uint64_t)res->result.i;
+    case RK_UnsignedLongLong:
+      return res->result.ull;
+  }
+}
+
 // FIXME: This should also have a typedef context.
 const Type *sema_resolve_named_type_from_name(const Sema *sema,
                                               const char *name) {
@@ -6197,6 +6211,9 @@ const Type *sema_get_type_of_binop_expr(Sema *sema, const BinOp *expr,
     case BOK_AndAssign:
     case BOK_OrAssign:
     case BOK_XorAssign:
+    case BOK_LShift:  // FIXME: The type for these 2 should be the lhs after
+                      // promotion.
+    case BOK_RShift:
       return lhs_ty;
     default:
       printf("TODO: Implement get type for binop kind %d on %llu:%llu\n",
@@ -6578,6 +6595,21 @@ ConstExprResult sema_eval_binop(Sema *sema, const BinOp *expr) {
           "ConstExprResults\n");
       __builtin_trap();
       break;
+    case BOK_LShift:
+      switch (lhs.result_kind) {
+        case RK_Boolean:
+          printf("Cannot shift boolean\n");
+          __builtin_trap();
+        case RK_Int:
+          assert(sizeof(int) > result_to_u64(&rhs));
+          lhs.result.i <<= result_to_u64(&rhs);
+          return lhs;
+        case RK_UnsignedLongLong:
+          assert(sizeof(unsigned long long) > result_to_u64(&rhs));
+          lhs.result.ull <<= result_to_u64(&rhs);
+          return lhs;
+      }
+      break;
     default:
       printf("TODO: Implement constant evaluation for the remaining binops\n");
       __builtin_trap();
@@ -6664,8 +6696,31 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
         return res;
       }
 
-      // TODO: Check globals also.
-      [[fallthrough]];
+      if (tree_map_get(&sema->globals, decl->name, &val)) {
+        assert(((Node *)val)->vtable->kind == NK_GlobalVariable);
+        const GlobalVariable *gv = val;
+        assert(gv->initializer);
+        return sema_eval_expr(sema, gv->initializer);
+        // if (gv->type->vtable->kind == TK_BuiltinType) {
+        //   const BuiltinType *bt = (const BuiltinType *)gv->type;
+        //   switch (bt->kind) {
+        //     case BTK_Bool:
+        //       ConstExprResult res = {
+        //         .result_kind = RK_Bool,
+        //         .result.b =
+        //       };
+        //     default:
+        //       printf("Unhandled builtin type for global %d\n", bt->kind);
+        //       __builtin_trap();
+        //   }
+        // }
+
+        // printf("Unhandled type for global %d\n", gv->type->vtable->kind);
+        //__builtin_trap();
+      }
+
+      printf("Unknown global '%s'\n", decl->name);
+      __builtin_trap();
     }
     default:
       printf(
@@ -6893,6 +6948,19 @@ LLVMValueRef compile_constant_expr(Compiler *compiler, const Expr *expr,
       bool is_signed = !is_unsigned_integral_type(type);
       LLVMTypeRef llvm_type = get_llvm_type_of_expr_global_ctx(compiler, expr);
       return LLVMConstInt(llvm_type, ((const Int *)expr)->val, is_signed);
+    }
+    case EK_BinOp: {
+      LLVMTypeRef llvm_type = get_llvm_type_of_expr_global_ctx(compiler, expr);
+      ConstExprResult res = sema_eval_expr(compiler->sema, expr);
+      switch (res.result_kind) {
+        case RK_Boolean:
+          return LLVMConstInt(llvm_type, res.result.b, /*IsSigned=*/0);
+        case RK_Int:
+          return LLVMConstInt(llvm_type, (unsigned long long)res.result.i,
+                              /*IsSigned=*/1);
+        case RK_UnsignedLongLong:
+          return LLVMConstInt(llvm_type, res.result.ull, /*IsSigned=*/0);
+      }
     }
     case EK_Cast: {
       const Cast *cast = (const Cast *)expr;
@@ -7650,6 +7718,12 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
   }
 }
 
+bool last_instruction_is_terminator(LLVMBuilderRef builder) {
+  LLVMBasicBlockRef last_bb = LLVMGetInsertBlock(builder);
+  LLVMValueRef last = LLVMGetLastInstruction(last_bb);
+  return last && LLVMIsATerminatorInst(last);
+}
+
 void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
                            const ForStmt *stmt, TreeMap *local_ctx,
                            TreeMap *local_allocas, LLVMBasicBlockRef break_bb,
@@ -7701,7 +7775,8 @@ void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
   }
 
   // And branch back to the start.
-  LLVMBuildBr(builder, for_start);
+  if (!last_instruction_is_terminator(builder))
+    LLVMBuildBr(builder, for_start);
 
   // End of for loop.
   LLVMAppendExistingBasicBlock(fn, for_end);
@@ -7709,6 +7784,77 @@ void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
 
   tree_map_destroy(&local_ctx_cpy);
   tree_map_destroy(&local_allocas_cpy);
+}
+
+// TODO: This should just be a switch instruction!!!
+void compile_switch_statement(Compiler *compiler, LLVMBuilderRef builder,
+                              const SwitchStmt *stmt, TreeMap *local_ctx,
+                              TreeMap *local_allocas,
+                              LLVMBasicBlockRef break_bb,
+                              LLVMBasicBlockRef cont_bb) {
+  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+  LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
+
+  LLVMValueRef check =
+      compile_expr(compiler, builder, stmt->cond, local_ctx, local_allocas);
+
+  LLVMBasicBlockRef end_bb = LLVMCreateBasicBlockInContext(ctx, "switch_end");
+
+  for (size_t i = 0; i < stmt->cases.size; ++i) {
+    const SwitchCase *switch_case = vector_at(&stmt->cases, i);
+
+    LLVMBasicBlockRef case_bb = LLVMAppendBasicBlockInContext(ctx, fn, "case");
+    LLVMBasicBlockRef next_bb = LLVMCreateBasicBlockInContext(ctx, "next");
+
+    const Type *common_ty = sema_get_common_arithmetic_type_of_exprs(
+        compiler->sema, stmt->cond, switch_case->cond, local_ctx);
+
+    LLVMValueRef case_val =
+        compile_implicit_cast(compiler, builder, switch_case->cond, common_ty,
+                              local_ctx, local_allocas);
+    LLVMValueRef cond = LLVMBuildICmp(builder, LLVMIntEQ, check, case_val, "");
+    LLVMBuildCondBr(builder, cond, case_bb, next_bb);
+
+    LLVMPositionBuilderAtEnd(builder, case_bb);
+
+    bool last_stmt_terminates = false;
+    for (size_t j = 0; j < switch_case->stmts.size; ++j) {
+      Statement **case_stmt = vector_at(&switch_case->stmts, j);
+      compile_statement(compiler, builder, *case_stmt, local_ctx, local_allocas,
+                        end_bb, cont_bb);
+
+      LLVMBasicBlockRef last_bb = LLVMGetInsertBlock(builder);
+      LLVMValueRef last = LLVMGetLastInstruction(last_bb);
+      if (last && LLVMIsATerminatorInst(last)) {
+        last_stmt_terminates = true;
+        break;
+      }
+    }
+
+    if (!last_stmt_terminates)
+      LLVMBuildBr(builder, next_bb);
+
+    LLVMAppendExistingBasicBlock(fn, next_bb);
+    LLVMPositionBuilderAtEnd(builder, next_bb);
+  }
+
+  // FIXME: This will not work if the default is *not* the last block.
+  if (stmt->default_stmts) {
+    for (size_t i = 0; i < stmt->default_stmts->size; ++i) {
+      Statement **default_stmt = vector_at(stmt->default_stmts, i);
+      compile_statement(compiler, builder, *default_stmt, local_ctx,
+                        local_allocas, end_bb, cont_bb);
+
+      if (last_instruction_is_terminator(builder))
+        break;
+    }
+  }
+
+  if (!last_instruction_is_terminator(builder))
+    LLVMBuildBr(builder, end_bb);
+
+  LLVMAppendExistingBasicBlock(fn, end_bb);
+  LLVMPositionBuilderAtEnd(builder, end_bb);
 }
 
 void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
@@ -7761,6 +7907,8 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
         Statement *stmt = *(Statement **)vector_at(&compound->body, i);
         compile_statement(compiler, builder, stmt, &local_ctx_cpy,
                           &local_allocas_cpy, break_bb, cont_bb);
+        if (last_instruction_is_terminator(builder))
+          break;
       }
 
       tree_map_destroy(&local_ctx_cpy);
@@ -7779,8 +7927,14 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
       tree_map_set(local_ctx, decl->name, decl->type);
       return;
     }
+    case SK_SwitchStmt: {
+      const SwitchStmt *switch_stmt = (const SwitchStmt *)stmt;
+      compile_switch_statement(compiler, builder, switch_stmt, local_ctx,
+                               local_allocas, break_bb, cont_bb);
+      return;
+    }
     default:
-      printf("TODO: implement compile_statement for this stmt %d\n",
+      printf("TODO: Implement compile_statement for this stmt %d\n",
              stmt->vtable->kind);
       __builtin_trap();
   }
