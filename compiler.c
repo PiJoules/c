@@ -1487,6 +1487,9 @@ Token lex(Lexer *lexer) {
     if (lexer_peek_then_consume_char(lexer, '|')) {
       string_append_char(&tok.chars, '|');
       tok.kind = TK_LogicalOr;
+    } else if (lexer_peek_then_consume_char(lexer, '=')) {
+      string_append_char(&tok.chars, '=');
+      tok.kind = TK_OrAssign;
     } else {
       tok.kind = TK_Or;
     }
@@ -1770,9 +1773,13 @@ void type_set_const(Type *type) { type->qualifiers |= kConstMask; }
 void type_set_volatile(Type *type) { type->qualifiers |= kVolatileMask; }
 void type_set_restrict(Type *type) { type->qualifiers |= kRestrictMask; }
 
-bool type_is_const(Type *type) { return type->qualifiers & kConstMask; }
-bool type_is_volatile(Type *type) { return type->qualifiers & kVolatileMask; }
-bool type_is_restrict(Type *type) { return type->qualifiers & kRestrictMask; }
+bool type_is_const(Type *type) { return (bool)(type->qualifiers & kConstMask); }
+bool type_is_volatile(Type *type) {
+  return (bool)(type->qualifiers & kVolatileMask);
+}
+bool type_is_restrict(Type *type) {
+  return (bool)(type->qualifiers & kRestrictMask);
+}
 
 typedef struct {
   Type type;
@@ -1782,7 +1789,7 @@ void replacement_sentinel_type_destroy(Type *) {}
 
 const TypeVtable ReplacementSentinelTypeVtable = {
     .kind = TK_ReplacementSentinelType,
-    .dtor = replacement_sentinel_type_destroy,
+    .dtor = &replacement_sentinel_type_destroy,
 };
 
 ReplacementSentinelType GetSentinel() {
@@ -5599,6 +5606,12 @@ const Type *sema_resolve_maybe_struct_type(const Sema *sema, const Type *type) {
   return type;
 }
 
+bool sema_is_enum_type(const Sema *sema, const Type *type,
+                       const TreeMap *local_ctx) {
+  type = sema_resolve_maybe_named_type(sema, type);
+  return type->vtable->kind == TK_EnumType;
+}
+
 bool sema_is_pointer_type(const Sema *sema, const Type *type,
                           const TreeMap *local_ctx) {
   type = sema_resolve_maybe_named_type(sema, type);
@@ -6013,7 +6026,7 @@ void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
       assert(((Type *)found)->vtable->kind != TK_NamedType &&
              "All typedef types should be flattened to an unnamed type when "
              "being added.");
-      tree_map_set(&sema->typedef_types, nt->name, found);
+      tree_map_set(&sema->typedef_types, name, found);
       break;
     }
     case TK_ReplacementSentinelType:
@@ -6923,6 +6936,19 @@ LLVMValueRef get_named_global(Compiler *compiler, const char *name) {
   if (!val)
     val = LLVMGetNamedFunction(compiler->mod, name);
 
+  if (!val) {
+    // Maybe an enum?
+    void *res;
+    if (tree_map_get(&compiler->sema->enum_values, name, &res)) {
+      EnumType *enum_ty = NULL;
+      tree_map_get(&compiler->sema->enum_names, name, (void *)&enum_ty);
+      assert(enum_ty);
+      LLVMTypeRef llvm_ty = get_llvm_type(compiler, &enum_ty->type);
+      return LLVMConstInt(llvm_ty, (unsigned long long)res,
+                          /*IsSigned=*/1);
+    }
+  }
+
   return val;
 }
 
@@ -7028,25 +7054,36 @@ LLVMValueRef maybe_compile_constant_implicit_cast(Compiler *compiler,
   if (sema_types_are_compatible_ignore_quals(compiler->sema, from_ty, to_ty))
     return from;
 
+  if (from_ty->vtable->kind == TK_EnumType) {
+    from_ty = &sema_get_integral_type_for_enum(compiler->sema,
+                                               (const EnumType *)from_ty)
+                   ->type;
+  }
+  if (to_ty->vtable->kind == TK_EnumType) {
+    to_ty = &sema_get_integral_type_for_enum(compiler->sema,
+                                             (const EnumType *)to_ty)
+                 ->type;
+  }
+
   if (is_integral_type(from_ty) && is_integral_type(to_ty)) {
     unsigned long long from_val = LLVMConstIntGetZExtValue(from);
-    size_t from_size = builtin_type_get_size((const BuiltinType *)from_ty);
-    size_t to_size = builtin_type_get_size((const BuiltinType *)to_ty);
-    if (from_size != to_size) {
-      LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, to_ty);
-      bool is_signed = !is_unsigned_integral_type(to_ty);
-      return LLVMConstInt(llvm_to_ty, from_val, is_signed);
-    }
+    // size_t from_size = builtin_type_get_size((const BuiltinType *)from_ty);
+    // size_t to_size = builtin_type_get_size((const BuiltinType *)to_ty);
+    LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, to_ty);
+    bool is_signed = !is_unsigned_integral_type(to_ty);
+    return LLVMConstInt(llvm_to_ty, from_val, is_signed);
   }
 
   printf(
       "TODO: Unhandled implicit constant cast conversion:\n"
       "lhs: %d %d (%s)\n"
-      "rhs: %d %d\n",
+      "rhs: %d %d (%s)\n",
       from_ty->vtable->kind, from_ty->qualifiers,
       (from_ty->vtable->kind == TK_StructType ? ((StructType *)from_ty)->name
                                               : ""),
-      to_ty->vtable->kind, to_ty->qualifiers);
+      to_ty->vtable->kind, to_ty->qualifiers,
+      (to_ty->vtable->kind == TK_StructType ? ((StructType *)to_ty)->name
+                                            : ""));
   __builtin_trap();
 }
 
@@ -7428,6 +7465,13 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
       LLVMTypeRef llvm_lhs_ty = get_llvm_type(compiler, lhs_ty);
       LLVMValueRef lhs_val = LLVMBuildLoad2(builder, llvm_lhs_ty, lhs, "");
       res = LLVMBuildAdd(builder, lhs_val, rhs, "");
+      LLVMBuildStore(builder, res, lhs);
+      break;
+    }
+    case BOK_OrAssign: {
+      LLVMTypeRef llvm_lhs_ty = get_llvm_type(compiler, lhs_ty);
+      LLVMValueRef lhs_val = LLVMBuildLoad2(builder, llvm_lhs_ty, lhs, "");
+      res = LLVMBuildOr(builder, lhs_val, rhs, "");
       LLVMBuildStore(builder, res, lhs);
       break;
     }
