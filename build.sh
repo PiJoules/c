@@ -19,7 +19,8 @@ ${CC} -o ${BUILD_DIR}/${OUTPUT_BIN} ${SRC_DIR}/compiler.c ${COMPILE_FLAGS} \
   ${LLVM_CONFIG_LD_FLAGS} ${LLVM_CONFIG_SYSTEM_LIBS} ${LLVM_CONFIG_CORE_LIBS}
 
 if [ "$1" = "stage2" ]; then
-  echo "Stage 2"
+  echo "Building Stage 2 compiler"
+  ${BUILD_DIR}/${OUTPUT_BIN} ${SRC_DIR}/compiler.c
   ${CC} -o ${BUILD_DIR}/${OUTPUT_BIN}.stage2 "out.obj" \
     ${LLVM_CONFIG_LD_FLAGS} ${LLVM_CONFIG_SYSTEM_LIBS} ${LLVM_CONFIG_CORE_LIBS}
 fi
