@@ -155,6 +155,7 @@ LLVMValueRef LLVMBuildLoad2(LLVMBuilderRef, LLVMTypeRef Ty,
 LLVMValueRef LLVMBuildCall2(LLVMBuilderRef, LLVMTypeRef, LLVMValueRef Fn,
                             LLVMValueRef *Args, unsigned NumArgs,
                             const char *Name);
+LLVMValueRef LLVMBuildUnreachable(LLVMBuilderRef);
 unsigned LLVMLookupIntrinsicID(const char *Name, size_t NameLen);
 LLVMValueRef LLVMGetIntrinsicDeclaration(LLVMModuleRef Mod, unsigned ID,
                                          LLVMTypeRef *ParamTypes,
@@ -199,6 +200,8 @@ LLVMValueRef LLVMBuildURem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                            const char *Name);
 LLVMValueRef LLVMBuildSRem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                            const char *Name);
+LLVMValueRef LLVMBuildShl(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
+                          const char *Name);
 LLVMValueRef LLVMGetLastInstruction(LLVMBasicBlockRef BB);
 LLVMValueRef LLVMConstStruct(LLVMValueRef *ConstantVals, unsigned Count,
                              LLVMBool Packed);
@@ -831,6 +834,13 @@ void string_append(string *s, const char *suffix) {
   size_t len = strlen(suffix);
   string_reserve(s, s->size + len + 1);  // +1 for null terminator
   memcpy(s->data + s->size, suffix, len);
+  s->size += len;
+  s->data[s->size] = 0;
+}
+
+void string_append_range(string *s, const char *s2, size_t len) {
+  string_reserve(s, s->size + len + 1);  // +1 for null terminator
+  memcpy(s->data + s->size, s2, len);
   s->size += len;
   s->data[s->size] = 0;
 }
@@ -1512,7 +1522,12 @@ Token lex(Lexer *lexer) {
       tok.kind = TK_Le;
     } else if (lexer_peek_then_consume_char(lexer, '<')) {
       string_append_char(&tok.chars, '<');
-      tok.kind = TK_LShift;
+      if (lexer_peek_then_consume_char(lexer, '=')) {
+        string_append_char(&tok.chars, '=');
+        tok.kind = TK_LShiftAssign;
+      } else {
+        tok.kind = TK_LShift;
+      }
     } else {
       tok.kind = TK_Lt;
     }
@@ -1596,7 +1611,6 @@ Token lex(Lexer *lexer) {
     case '}':
       tok.kind = TK_RCurlyBrace;
       return tok;
-    // TODO: This will not work with C23 attributes which follow [[...]] syntax
     case '[':
       tok.kind = TK_LSquareBrace;
       return tok;
@@ -1642,12 +1656,20 @@ Token lex(Lexer *lexer) {
     tok.kind = TK_Char;
   } else if (string_equals(&tok.chars, "bool")) {
     tok.kind = TK_Bool;
+  } else if (string_equals(&tok.chars, "short")) {
+    tok.kind = TK_Short;
   } else if (string_equals(&tok.chars, "int")) {
     tok.kind = TK_Int;
   } else if (string_equals(&tok.chars, "unsigned")) {
     tok.kind = TK_Unsigned;
+  } else if (string_equals(&tok.chars, "signed")) {
+    tok.kind = TK_Signed;
   } else if (string_equals(&tok.chars, "long")) {
     tok.kind = TK_Long;
+  } else if (string_equals(&tok.chars, "float")) {
+    tok.kind = TK_Float;
+  } else if (string_equals(&tok.chars, "double")) {
+    tok.kind = TK_Double;
   } else if (string_equals(&tok.chars, "void")) {
     tok.kind = TK_Void;
   } else if (string_equals(&tok.chars, "const")) {
@@ -1930,17 +1952,26 @@ const TypeVtable StructTypeVtable = {
     .dtor = struct_type_destroy,
 };
 
+struct Expr;
+
 typedef struct {
   Type *type;
-  char *name;    // Optional. Allocated by the creator of this StructMember.
-  int bitfield;  // -1 indicates no bitfield. 0 or greater represents the
-                 // bitfield size.
+  char *name;  // Optional. Allocated by the creator of this StructMember.
+  struct Expr *bitfield;  // Optional.
 } StructMember;
+
+void expr_destroy(struct Expr *);
 
 void member_destroy(StructMember *member) {
   if (member->name)
     free(member->name);
+
   free(member->type);
+
+  if (member->bitfield) {
+    expr_destroy(member->bitfield);
+    free(member->bitfield);
+  }
 }
 
 typedef struct {
@@ -1958,6 +1989,11 @@ void struct_type_construct(StructType *st, char *name, vector *members) {
   type_construct(&st->type, &StructTypeVtable);
   st->name = name;
   st->members = members;
+
+  // Empty structs are not allowed in C.
+  if (members)
+    assert(members->size > 0);
+
   st->packed = false;
 }
 
@@ -2005,8 +2041,6 @@ const TypeVtable EnumTypeVtable = {
     .kind = TK_EnumType,
     .dtor = enum_type_destroy,
 };
-
-struct Expr;
 
 void expr_destroy(struct Expr *);
 
@@ -2354,7 +2388,8 @@ typedef struct {
 
 struct Expr {
   const ExprVtable *vtable;
-  size_t line, col;
+  size_t line;
+  size_t col;
 };
 typedef struct Expr Expr;
 
@@ -2911,7 +2946,7 @@ Qualifiers parse_maybe_qualifiers(Parser *parser, bool *found) {
   Qualifiers quals = 0;
   if (found)
     *found = true;
-  while (1) {
+  for (;;) {
     switch (parser_peek_token(parser)->kind) {
       case TK_Const:
         quals |= kConstMask;
@@ -2936,7 +2971,7 @@ Qualifiers parse_maybe_qualifiers(Parser *parser, bool *found) {
 
 Type *maybe_parse_pointers_and_qualifiers(Parser *parser, Type *base,
                                           Type ***type_usage_addr) {
-  while (next_token_is(parser, TK_Star)) {
+  for (; next_token_is(parser, TK_Star);) {
     parser_consume_token(parser, TK_Star);
 
     PointerType *ptr = create_pointer_to(base);
@@ -2988,17 +3023,22 @@ void parse_struct_name_and_members(Parser *parser, char **name,
 
   *members = malloc(sizeof(vector));
   vector_construct(*members, sizeof(StructMember), alignof(StructMember));
-  while (!next_token_is(parser, TK_RCurlyBrace)) {
+  for (; !next_token_is(parser, TK_RCurlyBrace);) {
     char *member_name = NULL;
     Type *member_ty =
         parse_type_for_declaration(parser, &member_name, /*storage=*/NULL);
     assert(member_name);
 
+    Expr *bitfield = NULL;
+    if (next_token_is(parser, TK_Colon)) {
+      parser_consume_token(parser, TK_Colon);
+      bitfield = parse_expr(parser);
+    }
+
     StructMember *member = vector_append_storage(*members);
     member->type = member_ty;
     member->name = member_name;
-    // TODO: Handle bitfields.
-    member->bitfield = -1;
+    member->bitfield = bitfield;
 
     parser_consume_token(parser, TK_Semicolon);
   }
@@ -3039,7 +3079,7 @@ EnumType *parse_enum_type(Parser *parser) {
 
   vector *members = malloc(sizeof(vector));
   vector_construct(members, sizeof(EnumMember), alignof(EnumMember));
-  while (!next_token_is(parser, TK_RCurlyBrace)) {
+  for (; !next_token_is(parser, TK_RCurlyBrace);) {
     Token next = parser_pop_token(parser);
     assert(next.kind == TK_Identifier);
     char *member_name = strdup(next.chars.data);
@@ -3069,25 +3109,25 @@ EnumType *parse_enum_type(Parser *parser) {
   return enum_ty;
 }
 
+struct TypeSpecifier {
+  unsigned int char_ : 1;
+  unsigned int short_ : 1;
+  unsigned int int_ : 1;
+  unsigned int signed_ : 1;
+  unsigned int unsigned_ : 1;
+  unsigned int long_ : 2;  // long can be specified up to 2 times
+  unsigned int float_ : 1;
+  unsigned int double_ : 1;
+  unsigned int void_ : 1;
+  unsigned int bool_ : 1;
+  unsigned int named_ : 1;
+  unsigned int struct_ : 1;
+  unsigned int enum_ : 1;
+};
+
 Type *parse_specifiers_and_qualifiers_and_storage(
     Parser *parser, FoundStorageClasses *storage) {
   Qualifiers quals = 0;
-
-  struct TypeSpecifier {
-    unsigned int char_ : 1;
-    unsigned int short_ : 1;
-    unsigned int int_ : 1;
-    unsigned int signed_ : 1;
-    unsigned int unsigned_ : 1;
-    unsigned int long_ : 2;  // long can be specified up to 2 times
-    unsigned int float_ : 1;
-    unsigned int double_ : 1;
-    unsigned int void_ : 1;
-    unsigned int bool_ : 1;
-    unsigned int named_ : 1;
-    unsigned int struct_ : 1;
-    unsigned int enum_ : 1;
-  };
 
   struct TypeSpecifier spec = {};
 
@@ -3095,7 +3135,7 @@ Type *parse_specifiers_and_qualifiers_and_storage(
   EnumType *enum_ty;
   bool should_stop = false;
   char *name;
-  while (!should_stop) {
+  for (; !should_stop;) {
     bool consume_next_token = true;
     const Token *peek = parser_peek_token(parser);
     switch (peek->kind) {
@@ -3126,6 +3166,9 @@ Type *parse_specifiers_and_qualifiers_and_storage(
         break;
       case TK_Unsigned:
         spec.unsigned_ = 1;
+        break;
+      case TK_Signed:
+        spec.unsigned_ = 0;
         break;
       case TK_Long:
         spec.long_++;
@@ -3251,6 +3294,8 @@ Type *parse_specifiers_and_qualifiers_and_storage(
     kind = BTK_UnsignedInt;
   } else if (spec.float_) {
     kind = BTK_Float;
+  } else if (spec.double_) {
+    kind = BTK_Double;
   } else if (spec.bool_) {
     kind = BTK_Bool;
   } else if (spec.void_) {
@@ -3329,7 +3374,7 @@ Type *parse_function_suffix(Parser *parser, Type *outer_ty,
   vector_construct(&param_tys, sizeof(FunctionArg), alignof(FunctionArg));
 
   bool has_var_args = false;
-  while (!next_token_is(parser, TK_RPar)) {
+  for (; !next_token_is(parser, TK_RPar);) {
     // Handle varags.
     if (next_token_is(parser, TK_Ellipsis)) {
       parser_consume_token(parser, TK_Ellipsis);
@@ -3921,9 +3966,26 @@ Expr *parse_primary_expr(Parser *parser) {
            "String literals from the lexer should have the start and end "
            "double quotes");
 
-    StringLiteral *s = malloc(sizeof(StringLiteral));
-    string_literal_construct(s, tok->chars.data + 1, size - 2);
+    string str;
+    string_construct(&str);
+    string_append_range(&str, tok->chars.data + 1, size - 2);
     parser_consume_token(parser, TK_StringLiteral);
+
+    for (; next_token_is(parser, TK_StringLiteral);) {
+      // Merge all adjacent string literals.
+      const Token *tok = parser_peek_token(parser);
+      assert(tok->chars.size >= 2 &&
+             "String literals from the lexer should have the start and end "
+             "double quotes");
+      string_append_range(&str, tok->chars.data + 1, tok->chars.size - 2);
+      parser_consume_token(parser, TK_StringLiteral);
+    }
+
+    StringLiteral *s = malloc(sizeof(StringLiteral));
+    string_literal_construct(s, str.data, str.size);
+
+    string_destroy(&str);
+
     return &s->expr;
   }
 
@@ -3954,7 +4016,7 @@ Expr *parse_primary_expr(Parser *parser) {
   if (tok->kind == TK_LCurlyBrace) {
     parser_consume_token(parser, TK_LCurlyBrace);
 
-    while (!next_token_is(parser, TK_RCurlyBrace)) {
+    for (; !next_token_is(parser, TK_RCurlyBrace);) {
       char *name = NULL;
 
       if (next_token_is(parser, TK_Dot)) {
@@ -4090,7 +4152,7 @@ vector parse_argument_list(Parser *parser) {
   vector_construct(&v, sizeof(Expr *), alignof(Expr *));
 
   bool should_continue;
-  do {
+  for (;;) {
     should_continue = false;
 
     Expr *expr = parse_assignment_expr(parser);
@@ -4100,7 +4162,9 @@ vector parse_argument_list(Parser *parser) {
     if ((should_continue = (next_token_is(parser, TK_Comma))))
       parser_consume_token(parser, TK_Comma);
 
-  } while (should_continue);
+    if (!should_continue)
+      break;
+  }
 
   return v;
 }
@@ -4114,11 +4178,9 @@ vector parse_argument_list(Parser *parser) {
 //                | <postfix_expr> "++"
 //                | <postfix_expr> "--"
 //
-Expr *parse_postfix_expr(Parser *parser) {
-  Expr *expr = parse_primary_expr(parser);
-
+Expr *parse_postfix_expr_with_primary(Parser *parser, Expr *expr) {
   bool should_continue = true;
-  while (should_continue) {
+  for (; should_continue;) {
     const Token *tok = parser_peek_token(parser);
 
     switch (tok->kind) {
@@ -4192,6 +4254,11 @@ Expr *parse_postfix_expr(Parser *parser) {
     }
   }
   return expr;
+}
+
+Expr *parse_postfix_expr(Parser *parser) {
+  Expr *expr = parse_primary_expr(parser);
+  return parse_postfix_expr_with_primary(parser, expr);
 }
 
 //
@@ -4321,8 +4388,10 @@ bool is_next_token_type_token(Parser *parser) {
 Expr *parse_cast_or_paren_expr(Parser *parser) {
   parser_consume_token(parser, TK_LPar);
 
-  if (!is_next_token_type_token(parser))
-    return parse_parentheses_expr_tail(parser);
+  if (!is_next_token_type_token(parser)) {
+    Expr *expr = parse_parentheses_expr_tail(parser);
+    return parse_postfix_expr_with_primary(parser, expr);
+  }
 
   // Definitely a type case.
   // "(" <type> ")" <cast_expr>
@@ -4858,7 +4927,7 @@ Statement *parse_declaration(Parser *parser) {
 
 // This consumes any trailing semicolons when needed.
 Statement *parse_statement(Parser *parser) {
-  while (next_token_is(parser, TK_Semicolon))
+  for (; next_token_is(parser, TK_Semicolon);)
     parser_consume_token(parser, TK_Semicolon);
 
   const Token *peek = parser_peek_token(parser);
@@ -4918,9 +4987,31 @@ Statement *parse_statement(Parser *parser) {
 
     vector *default_stmts = NULL;
 
-    while (1) {
+    for (;;) {
       if (next_token_is(parser, TK_RCurlyBrace))
         break;
+
+      if (next_token_is(parser, TK_LSquareBrace)) {
+        // Expect a C23 attribute like [[fallthrough]].
+        parser_consume_token(parser, TK_LSquareBrace);
+        parser_consume_token(parser, TK_LSquareBrace);
+
+        const Token *attr = parser_peek_token(parser);
+        assert(attr->kind == TK_Identifier);
+        if (string_equals(&attr->chars, "fallthrough")) {
+          // TODO: If this project is ever working, come back and potentially
+          // warn on missing fallthroughs.
+          parser_consume_token(parser, TK_Identifier);
+        } else {
+          printf("%llu:%llu: Unknown attribute '%s'\n", attr->line, attr->col,
+                 attr->chars.data);
+          __builtin_trap();
+        }
+
+        parser_consume_token(parser, TK_RSquareBrace);
+        parser_consume_token(parser, TK_RSquareBrace);
+        parser_consume_token(parser, TK_Semicolon);
+      }
 
       if (next_token_is(parser, TK_Case)) {
         parser_consume_token(parser, TK_Case);
@@ -4932,9 +5023,10 @@ Statement *parse_statement(Parser *parser) {
         vector case_stmts;
         vector_construct(&case_stmts, sizeof(Statement *),
                          alignof(Statement *));
-        while (!(next_token_is(parser, TK_Case) ||
+        for (; !(next_token_is(parser, TK_Case) ||
                  next_token_is(parser, TK_Default) ||
-                 next_token_is(parser, TK_RCurlyBrace))) {
+                 next_token_is(parser, TK_RCurlyBrace) ||
+                 next_token_is(parser, TK_LSquareBrace));) {
           Statement *stmt = parse_statement(parser);
           *(Statement **)vector_append_storage(&case_stmts) = stmt;
         }
@@ -4950,9 +5042,10 @@ Statement *parse_statement(Parser *parser) {
         default_stmts = malloc(sizeof(vector));
         vector_construct(default_stmts, sizeof(Statement *),
                          alignof(Statement *));
-        while (!(next_token_is(parser, TK_Case) ||
+        for (; !(next_token_is(parser, TK_Case) ||
                  next_token_is(parser, TK_Default) ||
-                 next_token_is(parser, TK_RCurlyBrace))) {
+                 next_token_is(parser, TK_RCurlyBrace) ||
+                 next_token_is(parser, TK_LSquareBrace));) {
           Statement *stmt = parse_statement(parser);
           *(Statement **)vector_append_storage(default_stmts) = stmt;
         }
@@ -5046,7 +5139,7 @@ Statement *parse_compound_stmt(Parser *parser) {
   vector_construct(&body, sizeof(Statement *), alignof(Statement *));
 
   const Token *peek;
-  while ((peek = parser_peek_token(parser))->kind != TK_RCurlyBrace) {
+  for (; (peek = parser_peek_token(parser))->kind != TK_RCurlyBrace;) {
     Statement **storage = vector_append_storage(&body);
     *storage = parse_statement(parser);
   }
@@ -5524,15 +5617,18 @@ const BuiltinType *sema_get_integral_type_for_enum(const Sema *sema,
   return &sema->bt_Int;
 }
 
-typedef struct {
-  enum {
-    // TODO: Add the other expression result kinds.
-    RK_Boolean,
-    RK_Int,
-    RK_UnsignedLongLong,
-  } result_kind;
+typedef enum {
+  // TODO: Add the other expression result kinds.
+  RK_Boolean,
+  RK_Int,
+  RK_UnsignedLongLong,
+} ConstExprResultKind;
 
-  union {
+typedef struct {
+  ConstExprResultKind result_kind;
+
+  // TODO: This should be a union.
+  struct {
     bool b;
     int i;
     unsigned long long ull;
@@ -5546,7 +5642,7 @@ int compare_constexpr_result_types(const ConstExprResult *,
 uint64_t result_to_u64(const ConstExprResult *res) {
   switch (res->result_kind) {
     case RK_Boolean:
-      return res->result.b;
+      return (uint64_t)res->result.b;
     case RK_Int:
       assert(res->result.i >= 0);
       return (uint64_t)res->result.i;
@@ -5698,8 +5794,9 @@ bool sema_types_are_compatible_impl(Sema *sema, const Type *lhs,
       break;
     }
     case TK_PointerType: {
-      if (!sema_types_are_compatible_impl(sema, ((PointerType *)lhs)->pointee,
-                                          ((PointerType *)rhs)->pointee,
+      const Type *lhs_pointee = ((PointerType *)lhs)->pointee;
+      const Type *rhs_pointee = ((PointerType *)rhs)->pointee;
+      if (!sema_types_are_compatible_impl(sema, lhs_pointee, rhs_pointee,
                                           ignore_quals))
         return false;
       break;
@@ -5753,8 +5850,18 @@ bool sema_types_are_compatible_impl(Sema *sema, const Type *lhs,
               strcmp(lhs_member->name, rhs_member->name) != 0)
             return false;
 
-          if (lhs_member->bitfield != rhs_member->bitfield)
+          if ((lhs_member->bitfield && !rhs_member->bitfield) ||
+              (!lhs_member->bitfield && rhs_member->bitfield))
             return false;
+
+          if (lhs_member->bitfield && rhs_member->bitfield) {
+            ConstExprResult lhs_bitfield =
+                sema_eval_expr(sema, lhs_member->bitfield);
+            ConstExprResult rhs_bitfield =
+                sema_eval_expr(sema, rhs_member->bitfield);
+            if (compare_constexpr_result_types(&lhs_bitfield, &rhs_bitfield))
+              return false;
+          }
 
           if (!sema_types_are_compatible_impl(sema, lhs_member->type,
                                               rhs_member->type, ignore_quals))
@@ -5765,18 +5872,9 @@ bool sema_types_are_compatible_impl(Sema *sema, const Type *lhs,
       break;
     }
     case TK_EnumType: {
-      EnumType *lhs_enum = (EnumType *)lhs;
-      EnumType *rhs_enum = (EnumType *)rhs;
-
-      // No anonymous enums are compatible.
-      if (lhs_enum->name == NULL || lhs_enum->name == NULL)
-        return false;
-
-      // This should be enough since we wouldn't be able to define different
-      // structs with the same name.
-      if (strcmp(lhs_enum->name, rhs_enum->name) != 0)
-        return false;
-
+      // If a fixed underlying type is not specified, the enum is compatible
+      // with one of: char, a signed int type, or an unsigned int type. This is
+      // implementation defined.
       break;
     }
     case TK_FunctionType: {
@@ -6118,7 +6216,7 @@ const Type *sema_get_common_arithmetic_type(Sema *sema, const Type *lhs_ty,
     rhs_ty = sema_resolve_named_type(sema, (const NamedType *)rhs_ty);
 
   // If the types are the same, that type is the common type.
-  if (sema_types_are_compatible(sema, lhs_ty, rhs_ty))
+  if (sema_types_are_compatible_ignore_quals(sema, lhs_ty, rhs_ty))
     return lhs_ty;
 
   // TODO: Handle non-integral types also.
@@ -6136,8 +6234,10 @@ const Type *sema_get_common_arithmetic_type(Sema *sema, const Type *lhs_ty,
     return lhs_rank > rhs_rank ? lhs_ty : rhs_ty;
   }
 
-  const Type *unsigned_ty, *signed_ty;
-  unsigned unsigned_rank, signed_rank;
+  const Type *unsigned_ty;
+  const Type *signed_ty;
+  unsigned unsigned_rank;
+  unsigned signed_rank;
   if (is_unsigned_integral_type(lhs_ty)) {
     unsigned_ty = lhs_ty;
     signed_ty = rhs_ty;
@@ -6481,9 +6581,19 @@ size_t sema_eval_alignof_type(Sema *sema, const Type *type) {
     case TK_FunctionType:
       printf("Cannot take alignof function type!\n");
       __builtin_trap();
-    case TK_StructType:
-      printf("TODO: sema_eval_alignof_type for StructType\n");
-      __builtin_trap();
+    case TK_StructType: {
+      const StructType *struct_ty =
+          sema_resolve_struct_type(sema, (const StructType *)type);
+      assert(struct_ty->members);
+      size_t max_align = 0;
+      for (size_t i = 0; i < struct_ty->members->size; ++i) {
+        const StructMember *member = vector_at(struct_ty->members, i);
+        size_t member_align = sema_eval_alignof_type(sema, member->type);
+        if (member_align > max_align)
+          max_align = member_align;
+      }
+      return max_align;
+    }
     case TK_ReplacementSentinelType:
       printf("Replacement sentinel type should not be used\n");
       __builtin_trap();
@@ -6555,7 +6665,7 @@ int compare_constexpr_result_types(const ConstExprResult *lhs,
   // instruction.
   switch (lhs->result_kind) {
     case RK_Boolean:
-      return !(lhs->result.b == rhs->result.b);
+      return (int)(!(lhs->result.b == rhs->result.b));
     case RK_Int:
       if (lhs->result.i < rhs->result.i)
         return -1;
@@ -6570,16 +6680,6 @@ int compare_constexpr_result_types(const ConstExprResult *lhs,
       return 0;
   }
 }
-
-const ConstExprResult TrueResult = {
-    .result_kind = RK_Boolean,
-    .result.b = true,
-};
-
-const ConstExprResult FalseResult = {
-    .result_kind = RK_Boolean,
-    .result.b = false,
-};
 
 size_t sema_eval_sizeof_array(Sema *sema, const ArrayType *arr) {
   size_t elem_size = sema_eval_sizeof_type(sema, arr->elem_type);
@@ -6599,9 +6699,12 @@ ConstExprResult sema_eval_binop(Sema *sema, const BinOp *expr) {
 
   switch (expr->op) {
     case BOK_Eq:
-      if (lhs.result_kind == rhs.result_kind)
-        return compare_constexpr_result_types(&lhs, &rhs) == 0 ? TrueResult
-                                                               : FalseResult;
+      if (lhs.result_kind == rhs.result_kind) {
+        ConstExprResult res;
+        res.result_kind = RK_Boolean;
+        res.result.b = compare_constexpr_result_types(&lhs, &rhs) == 0;
+        return res;
+      }
 
       printf(
           "TODO: Implement constant evaluation for the == of other "
@@ -6639,10 +6742,9 @@ ConstExprResult sema_eval_alignof(Sema *sema, const AlignOf *ao) {
   }
 
   size_t size = sema_eval_alignof_type(sema, type);
-  ConstExprResult res = {
-      .result_kind = RK_UnsignedLongLong,
-      .result.ull = size,
-  };
+  ConstExprResult res;
+  res.result_kind = RK_UnsignedLongLong;
+  res.result.ull = size;
   return res;
 }
 
@@ -6655,10 +6757,9 @@ ConstExprResult sema_eval_sizeof(Sema *sema, const SizeOf *so) {
   }
 
   size_t size = sema_eval_sizeof_type(sema, type);
-  ConstExprResult res = {
-      .result_kind = RK_UnsignedLongLong,
-      .result.ull = size,
-  };
+  ConstExprResult res;
+  res.result_kind = RK_UnsignedLongLong;
+  res.result.ull = size;
   return res;
 }
 
@@ -6669,10 +6770,9 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
     case EK_SizeOf:
       return sema_eval_sizeof(sema, (const SizeOf *)expr);
     case EK_Int: {
-      ConstExprResult res = {
-          .result_kind = RK_UnsignedLongLong,
-          .result.ull = ((const Int *)expr)->val,
-      };
+      ConstExprResult res;
+      res.result_kind = RK_UnsignedLongLong;
+      res.result.ull = ((const Int *)expr)->val;
       return res;
     }
     case EK_UnOp: {
@@ -6702,10 +6802,9 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
       const DeclRef *decl = (const DeclRef *)expr;
       void *val;
       if (tree_map_get(&sema->enum_values, decl->name, &val)) {
-        ConstExprResult res = {
-            .result_kind = RK_UnsignedLongLong,
-            .result.i = (int)(uintptr_t)val,
-        };
+        ConstExprResult res;
+        res.result_kind = RK_UnsignedLongLong;
+        res.result.i = (int)(uintptr_t)val;
         return res;
       }
 
@@ -6714,22 +6813,6 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
         const GlobalVariable *gv = val;
         assert(gv->initializer);
         return sema_eval_expr(sema, gv->initializer);
-        // if (gv->type->vtable->kind == TK_BuiltinType) {
-        //   const BuiltinType *bt = (const BuiltinType *)gv->type;
-        //   switch (bt->kind) {
-        //     case BTK_Bool:
-        //       ConstExprResult res = {
-        //         .result_kind = RK_Bool,
-        //         .result.b =
-        //       };
-        //     default:
-        //       printf("Unhandled builtin type for global %d\n", bt->kind);
-        //       __builtin_trap();
-        //   }
-        // }
-
-        // printf("Unhandled type for global %d\n", gv->type->vtable->kind);
-        //__builtin_trap();
       }
 
       printf("Unknown global '%s'\n", decl->name);
@@ -6789,6 +6872,8 @@ void compiler_destroy(Compiler *compiler) {}
 LLVMTypeRef get_llvm_type(Compiler *compiler, const Type *type);
 
 LLVMTypeRef get_llvm_struct_type(Compiler *compiler, const StructType *st) {
+  st = sema_resolve_struct_type(compiler->sema, st);
+
   void *llvm_struct;
 
   // First see if we already made one.
@@ -6796,6 +6881,8 @@ LLVMTypeRef get_llvm_struct_type(Compiler *compiler, const StructType *st) {
     if ((llvm_struct = LLVMGetTypeByName(compiler->mod, st->name)))
       return llvm_struct;
   }
+
+  assert(st->members);
 
   // Doesn't exits. Create the struct body.
   vector elems;
@@ -7029,6 +7116,19 @@ LLVMValueRef compile_constant_expr(Compiler *compiler, const Expr *expr,
 
       return res;
     }
+    case EK_UnOp: {
+      const UnOp *unop = (const UnOp *)expr;
+      switch (unop->op) {
+        case UOK_AddrOf:
+          return compile_constant_expr(compiler, unop->subexpr, to_ty);
+        default:
+          printf(
+              "TODO: Implement IR constant expr evaluation for unop expr op "
+              "%d\n",
+              unop->op);
+          __builtin_trap();
+      }
+    }
     default:
       printf("TODO: Implement IR constant expr evaluation for expr kind %d\n",
              expr->vtable->kind);
@@ -7076,14 +7176,16 @@ LLVMValueRef maybe_compile_constant_implicit_cast(Compiler *compiler,
 
   printf(
       "TODO: Unhandled implicit constant cast conversion:\n"
-      "lhs: %d %d (%s)\n"
-      "rhs: %d %d (%s)\n",
+      "lhs: %d %d (%s) %p\n"
+      "rhs: %d %d (%s) %p\n",
       from_ty->vtable->kind, from_ty->qualifiers,
-      (from_ty->vtable->kind == TK_StructType ? ((StructType *)from_ty)->name
-                                              : ""),
-      to_ty->vtable->kind, to_ty->qualifiers,
-      (to_ty->vtable->kind == TK_StructType ? ((StructType *)to_ty)->name
-                                            : ""));
+      (from_ty->vtable->kind == TK_StructType
+           ? ((const StructType *)from_ty)->name
+           : ""),
+      from_ty, to_ty->vtable->kind, to_ty->qualifiers,
+      (to_ty->vtable->kind == TK_StructType ? ((const StructType *)to_ty)->name
+                                            : ""),
+      to_ty);
   __builtin_trap();
 }
 
@@ -7144,8 +7246,8 @@ LLVMValueRef compile_unop_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
                                      TreeMap *local_allocas) {
   switch (expr->op) {
     case UOK_Deref: {
-      return compile_lvalue_ptr(compiler, builder, expr->subexpr, local_ctx,
-                                local_allocas);
+      return compile_expr(compiler, builder, expr->subexpr, local_ctx,
+                          local_allocas);
     }
     default:
       printf("TODO: Implement compile_unop_lvalue_ptr for this op %d\n",
@@ -7163,7 +7265,9 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
       LLVMValueRef to_bool = compile_to_bool(compiler, builder, expr->subexpr,
                                              local_ctx, local_allocas);
       LLVMValueRef zero = LLVMConstNull(LLVMInt1Type());
-      return LLVMBuildICmp(builder, LLVMIntEQ, to_bool, zero, "not");
+      LLVMValueRef res =
+          LLVMBuildICmp(builder, LLVMIntEQ, to_bool, zero, "not");
+      return LLVMBuildZExt(builder, res, LLVMInt8Type(), "");
     }
     case UOK_BitNot: {
       LLVMValueRef val = compile_expr(compiler, builder, expr->subexpr,
@@ -7257,7 +7361,6 @@ LLVMValueRef compile_implicit_cast(Compiler *compiler, LLVMBuilderRef builder,
       unsigned from_size = LLVMGetIntTypeWidth(llvm_from_ty);
       LLVMTargetDataRef data_layout = LLVMGetModuleDataLayout(compiler->mod);
       unsigned ptr_size = LLVMPointerSize(data_layout) * kCharBit;
-      printf("%u %u\n", from_size, ptr_size);
       assert(from_size == ptr_size);
       return LLVMBuildIntToPtr(builder, llvm_from, llvm_to_ty, "");
     }
@@ -7369,7 +7472,8 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
     return gep;
   }
 
-  LLVMValueRef lhs, rhs;
+  LLVMValueRef lhs;
+  LLVMValueRef rhs;
   const Type *common_ty;
   if (is_logical_binop(expr->op)) {
     lhs =
@@ -7475,6 +7579,13 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
       LLVMBuildStore(builder, res, lhs);
       break;
     }
+    case BOK_LShiftAssign: {
+      LLVMTypeRef llvm_lhs_ty = get_llvm_type(compiler, lhs_ty);
+      LLVMValueRef lhs_val = LLVMBuildLoad2(builder, llvm_lhs_ty, lhs, "");
+      res = LLVMBuildShl(builder, lhs_val, rhs, "");
+      LLVMBuildStore(builder, res, lhs);
+      break;
+    }
     default:
       printf("TODO: Implement compile_binop for this op %d\n", expr->op);
       __builtin_trap();
@@ -7532,6 +7643,19 @@ vector compile_call_args(Compiler *compiler, LLVMBuilderRef builder,
     }
   }
   return llvm_args;
+}
+
+LLVMValueRef call_llvm_debugtrap(Compiler *compiler, LLVMBuilderRef builder) {
+  const char name[] = "llvm.debugtrap";
+  unsigned intrinsic_id = LLVMLookupIntrinsicID(name, sizeof(name) - 1);
+  LLVMValueRef intrinsic = LLVMGetIntrinsicDeclaration(
+      compiler->mod, intrinsic_id, /*ParamTypes=*/NULL,
+      /*ParamCount=*/0);
+  LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
+  LLVMTypeRef intrinsic_ty = LLVMIntrinsicGetType(
+      ctx, intrinsic_id, /*ParamTypes=*/NULL, /*ParamCount=*/0);
+  return LLVMBuildCall2(builder, intrinsic_ty, intrinsic,
+                        /*Args=*/NULL, /*NumArgs=*/0, "");
 }
 
 LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
@@ -7606,18 +7730,8 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
       const Call *call = (const Call *)expr;
       if (call->base->vtable->kind == EK_DeclRef) {
         const DeclRef *decl = (const DeclRef *)call->base;
-        if (strcmp(decl->name, "__builtin_trap") == 0) {
-          const char name[] = "llvm.debugtrap";
-          unsigned intrinsic_id = LLVMLookupIntrinsicID(name, sizeof(name) - 1);
-          LLVMValueRef intrinsic = LLVMGetIntrinsicDeclaration(
-              compiler->mod, intrinsic_id, /*ParamTypes=*/NULL,
-              /*ParamCount=*/0);
-          LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
-          LLVMTypeRef intrinsic_ty = LLVMIntrinsicGetType(
-              ctx, intrinsic_id, /*ParamTypes=*/NULL, /*ParamCount=*/0);
-          return LLVMBuildCall2(builder, intrinsic_ty, intrinsic,
-                                /*Args=*/NULL, /*NumArgs=*/0, "");
-        }
+        if (strcmp(decl->name, "__builtin_trap") == 0)
+          return call_llvm_debugtrap(compiler, builder);
       }
 
       const Type *ty =
@@ -7644,13 +7758,25 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
       const MemberAccess *access = (const MemberAccess *)expr;
       const StructType *base_ty = sema_get_struct_type_from_member_access(
           compiler->sema, access, local_ctx);
-      const StructMember *member =
-          sema_get_struct_member(compiler->sema, base_ty, access->member, NULL);
-      LLVMValueRef ptr =
-          compile_lvalue_ptr(compiler, builder, expr, local_ctx, local_allocas);
-      LLVMValueRef val = LLVMBuildLoad2(
-          builder, get_llvm_type(compiler, member->type), ptr, "");
-      return val;
+      size_t offset;
+      const StructMember *member = sema_get_struct_member(
+          compiler->sema, base_ty, access->member, &offset);
+
+      LLVMValueRef ptr;
+      if (access->is_arrow) {
+        ptr = compile_expr(compiler, builder, access->base, local_ctx,
+                           local_allocas);
+        LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
+        LLVMValueRef llvm_offset =
+            LLVMConstInt(LLVMInt32Type(), offset, /*signed=*/0);
+        LLVMValueRef offsets[] = {llvm_offset};
+        ptr = LLVMBuildGEP2(builder, llvm_base_ty, ptr, offsets, 1, "");
+      } else {
+        ptr = compile_lvalue_ptr(compiler, builder, expr, local_ctx,
+                                 local_allocas);
+      }
+      return LLVMBuildLoad2(builder, get_llvm_type(compiler, member->type), ptr,
+                            "");
     }
     case EK_Conditional: {
       const Conditional *conditional = (const Conditional *)expr;
@@ -7705,7 +7831,8 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
   LLVMPositionBuilderAtEnd(builder, ifbb);
 
   {
-    TreeMap local_ctx_cpy, local_allocas_cpy;
+    TreeMap local_ctx_cpy;
+    TreeMap local_allocas_cpy;
     string_tree_map_construct(&local_ctx_cpy);
     string_tree_map_construct(&local_allocas_cpy);
     tree_map_clone(&local_ctx_cpy, local_ctx);
@@ -7731,7 +7858,8 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
   LLVMPositionBuilderAtEnd(builder, elsebb);
   if (stmt->else_stmt) {
     {
-      TreeMap local_ctx_cpy, local_allocas_cpy;
+      TreeMap local_ctx_cpy;
+      TreeMap local_allocas_cpy;
       string_tree_map_construct(&local_ctx_cpy);
       string_tree_map_construct(&local_allocas_cpy);
       tree_map_clone(&local_ctx_cpy, local_ctx);
@@ -7776,7 +7904,8 @@ void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
   LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
 
   // Scope local to the loop.
-  TreeMap local_ctx_cpy, local_allocas_cpy;
+  TreeMap local_ctx_cpy;
+  TreeMap local_allocas_cpy;
   string_tree_map_construct(&local_ctx_cpy);
   string_tree_map_construct(&local_allocas_cpy);
   tree_map_clone(&local_ctx_cpy, local_ctx);
@@ -7928,7 +8057,12 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
       // TODO: There should be an ImplicitCast AST node that we can parser over
       // rather than doing this here.
 
-      LLVMBuildRet(builder, val);
+      const Type *expr_ty =
+          sema_get_type_of_expr_in_ctx(compiler->sema, ret->expr, local_ctx);
+      if (is_void_type(expr_ty))
+        LLVMBuildRetVoid(builder);
+      else
+        LLVMBuildRet(builder, val);
       return;
     }
     case SK_ContinueStmt: {
@@ -7940,7 +8074,8 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
       return;
     }
     case SK_CompoundStmt: {
-      TreeMap local_ctx_cpy, local_allocas_cpy;
+      TreeMap local_ctx_cpy;
+      TreeMap local_allocas_cpy;
       string_tree_map_construct(&local_ctx_cpy);
       string_tree_map_construct(&local_allocas_cpy);
       tree_map_clone(&local_ctx_cpy, local_ctx);
@@ -7999,7 +8134,8 @@ void compile_function_definition(Compiler *compiler,
 
   FunctionType *func_ty = (FunctionType *)(f->type);
 
-  TreeMap local_ctx, local_allocas;
+  TreeMap local_ctx;
+  TreeMap local_allocas;
   string_tree_map_construct(&local_ctx);
   string_tree_map_construct(&local_allocas);
 
@@ -8022,8 +8158,14 @@ void compile_function_definition(Compiler *compiler,
   compile_statement(compiler, builder, &f->body->base, &local_ctx,
                     &local_allocas, NULL, NULL);
 
-  if (is_void_type(func_ty->return_type))
-    LLVMBuildRetVoid(builder);
+  if (!last_instruction_is_terminator(builder)) {
+    if (is_void_type(func_ty->return_type)) {
+      LLVMBuildRetVoid(builder);
+    } else {
+      call_llvm_debugtrap(compiler, builder);
+      LLVMBuildUnreachable(builder);
+    }
+  }
 
   tree_map_destroy(&local_ctx);
   tree_map_destroy(&local_allocas);
@@ -8064,8 +8206,16 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
           compiler->sema, access, local_ctx);
       size_t offset;
       sema_get_struct_member(compiler->sema, base_ty, access->member, &offset);
-      LLVMValueRef base_llvm = compile_lvalue_ptr(
-          compiler, builder, access->base, local_ctx, local_allocas);
+
+      LLVMValueRef base_llvm;
+      if (access->is_arrow) {
+        base_llvm = compile_expr(compiler, builder, access->base, local_ctx,
+                                 local_allocas);
+      } else {
+        base_llvm = compile_lvalue_ptr(compiler, builder, access->base,
+                                       local_ctx, local_allocas);
+      }
+
       LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
       LLVMValueRef llvm_offset =
           LLVMConstInt(LLVMInt32Type(), offset, /*signed=*/0);
@@ -8216,7 +8366,7 @@ int main(int argc, char **argv) {
   vector nodes_to_destroy;
   vector_construct(&nodes_to_destroy, sizeof(Node *), alignof(Node *));
 
-  while (1) {
+  for (;;) {
     const Token *token = parser_peek_token(&parser);
     if (token->kind == TK_Eof) {
       break;
@@ -8261,7 +8411,6 @@ int main(int argc, char **argv) {
       Node **storage = vector_append_storage(&nodes_to_destroy);
       *storage = top_level_decl;
 
-      // LLVMDumpModule(mod);
       if (LLVMVerifyModule(mod, LLVMPrintMessageAction, NULL)) {
         printf("Verify module failed\n");
         LLVMDumpModule(mod);
@@ -8271,7 +8420,7 @@ int main(int argc, char **argv) {
   }
 
   for (size_t i = 0; i < nodes_to_destroy.size; ++i) {
-    Node *node = (Node *)vector_at(&nodes_to_destroy, i);
+    Node *node = *(Node **)vector_at(&nodes_to_destroy, i);
     node->vtable->dtor(node);
   }
   vector_destroy(&nodes_to_destroy);
