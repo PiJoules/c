@@ -89,6 +89,17 @@ LLVMBool LLVMVerifyFunction(LLVMValueRef Fn, LLVMVerifierFailureAction Action);
 void LLVMDumpValue(LLVMValueRef Val);
 void LLVMDumpType(LLVMTypeRef Val);
 void LLVMDumpModule(LLVMModuleRef M);
+void LLVMDisposeModule(LLVMModuleRef M);
+void LLVMDisposeTargetData(LLVMTargetDataRef TD);
+void LLVMDisposeTargetMachine(LLVMTargetMachineRef T);
+void LLVMDeleteBasicBlock(LLVMBasicBlockRef BB);
+void LLVMDisposeBuilder(LLVMBuilderRef Builder);
+
+typedef enum { LLVMAssemblyFile, LLVMObjectFile } LLVMCodeGenFileType;
+LLVMBool LLVMTargetMachineEmitToFile(LLVMTargetMachineRef T, LLVMModuleRef M,
+                                     const char *Filename,
+                                     LLVMCodeGenFileType codegen,
+                                     char **ErrorMessage);
 
 LLVMValueRef LLVMAddGlobal(LLVMModuleRef M, LLVMTypeRef Ty, const char *Name);
 void LLVMSetInitializer(LLVMValueRef GlobalVar, LLVMValueRef ConstantVal);
@@ -340,8 +351,6 @@ typedef enum {
   LLVMCodeModelMedium,
   LLVMCodeModelLarge
 } LLVMCodeModel;
-
-typedef enum { LLVMAssemblyFile, LLVMObjectFile } LLVMCodeGenFileType;
 
 char *LLVMGetDefaultTargetTriple(void);
 LLVMBool LLVMGetTargetFromTriple(const char *Triple, LLVMTargetRef *T,
@@ -965,6 +974,8 @@ static void TestStringClear() {
   string_clear(&s);
   assert(s.size == 0);
   assert(string_equals(&s, ""));
+
+  string_destroy(&s);
 }
 
 static void RunStringTests() {
@@ -1962,10 +1973,11 @@ typedef struct {
 
 void expr_destroy(struct Expr *);
 
-void member_destroy(StructMember *member) {
+void struct_member_destroy(StructMember *member) {
   if (member->name)
     free(member->name);
 
+  type_destroy(member->type);
   free(member->type);
 
   if (member->bitfield) {
@@ -2006,9 +2018,7 @@ void struct_type_destroy(Type *type) {
   if (st->members) {
     for (size_t i = 0; i < st->members->size; ++i) {
       StructMember *sm = vector_at(st->members, i);
-      if (sm->name)
-        free(sm->name);
-      free(sm->type);
+      struct_member_destroy(sm);
     }
     vector_destroy(st->members);
     free(st->members);
@@ -2072,7 +2082,7 @@ void enum_type_destroy(Type *type) {
 
   if (et->members) {
     for (size_t i = 0; i < et->members->size; ++i) {
-      EnumMember *em = vector_at(et->members, 0);
+      EnumMember *em = vector_at(et->members, i);
 
       if (em->name)
         free(em->name);
@@ -2248,11 +2258,7 @@ typedef struct {
 
 void named_type_construct(NamedType *nt, const char *name) {
   type_construct(&nt->type, &NamedTypeVtable);
-
-  size_t len = strlen(name);
-  nt->name = malloc(sizeof(char) * (len + 1));
-  memcpy(nt->name, name, len);
-  nt->name[len] = 0;
+  nt->name = strdup(name);
 }
 
 void named_type_destroy(Type *type) { free(((NamedType *)type)->name); }
@@ -2475,8 +2481,10 @@ typedef struct {
 void typedef_destroy(Node *node) {
   Typedef *td = (Typedef *)node;
 
-  if (td->type)
+  if (td->type) {
     type_destroy(td->type);
+    free(td->type);
+  }
 
   if (td->name)
     free(td->name);
@@ -3918,7 +3926,7 @@ void initializer_list_destroy(Expr *expr) {
     if (elem->name)
       free(elem->name);
     expr_destroy(elem->expr);
-    free(elem);
+    free(elem->expr);
   }
   vector_destroy(&init->elems);
 }
@@ -4922,6 +4930,7 @@ Statement *parse_declaration(Parser *parser) {
 
   Declaration *decl = malloc(sizeof(Declaration));
   declaration_construct(decl, name, type, init);
+  free(name);
   return &decl->base;
 }
 
@@ -5174,6 +5183,8 @@ Node *parse_global_variable_or_function_definition(Parser *parser) {
     if (storage.static_)
       func_def->is_extern = false;
 
+    free(name);
+
     return &func_def->node;
   }
 
@@ -5191,6 +5202,8 @@ Node *parse_global_variable_or_function_definition(Parser *parser) {
     Expr *init = parse_expr(parser);
     gv->initializer = init;
   }
+
+  free(name);
 
   return &gv->node;
 }
@@ -5276,6 +5289,7 @@ static void TestSimpleDeclarationParse() {
   assert(type->qualifiers == 0);
 
   type_destroy(type);
+  free(type);
   free(name);
 }
 
@@ -5297,6 +5311,7 @@ static void TestArrayParsing() {
   assert(((Int *)size)->val == 5);
 
   type_destroy(type);
+  free(type);
   free(name);
 }
 
@@ -5313,6 +5328,7 @@ static void TestPointerParsing() {
   assert(((BuiltinType *)pointee)->kind == BTK_Int);
 
   type_destroy(type);
+  free(type);
   free(name);
 }
 
@@ -5355,6 +5371,7 @@ static void TestArrayPointerParsing() {
   assert(((BuiltinType *)ptr->pointee)->kind == BTK_Int);
 
   type_destroy(type);
+  free(type);
   free(name);
 }
 
@@ -5372,6 +5389,7 @@ static void TestPointerQualifierParsing() {
   assert(pointee->qualifiers == kConstMask);
 
   type_destroy(type);
+  free(type);
   free(name);
 }
 
@@ -5398,6 +5416,7 @@ void TestFunctionParsing() {
   assert(is_builtin_type(((PointerType *)ret)->pointee, BTK_Void));
 
   type_destroy(type);
+  free(type);
   free(name);
 }
 
@@ -5422,6 +5441,7 @@ void TestFunctionParsing2() {
   assert(strcmp(((NamedType *)ret)->name, "size_t") == 0);
 
   type_destroy(type);
+  free(type);
   free(name);
 }
 
@@ -5442,6 +5462,7 @@ void TestFunctionPointerParsing() {
   assert(is_builtin_type(func->return_type, BTK_Int));
 
   type_destroy(type);
+  free(type);
   free(name);
 }
 
@@ -5465,6 +5486,7 @@ static void TestFunctionParsingVarArgs() {
   assert(is_builtin_type(ret, BTK_Int));
 
   type_destroy(type);
+  free(type);
   free(name);
 }
 
@@ -7887,6 +7909,11 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
     // Emit merge BB.
     LLVMAppendExistingBasicBlock(fn, mergebb);
     LLVMPositionBuilderAtEnd(builder, mergebb);
+  } else {
+    // For some reason, there's no function for just deleting a BB. The delete
+    // function both removes a block from a function and deletes it.
+    LLVMAppendExistingBasicBlock(fn, mergebb);
+    LLVMDeleteBasicBlock(mergebb);
   }
 }
 
@@ -8038,7 +8065,7 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
     case SK_ExprStmt:
       compile_expr(compiler, builder, ((const ExprStmt *)stmt)->expr, local_ctx,
                    local_allocas);
-      break;
+      return;
     case SK_IfStmt:
       return compile_if_statement(compiler, builder, (const IfStmt *)stmt,
                                   local_ctx, local_allocas, break_bb, cont_bb);
@@ -8169,6 +8196,8 @@ void compile_function_definition(Compiler *compiler,
 
   tree_map_destroy(&local_ctx);
   tree_map_destroy(&local_allocas);
+
+  LLVMDisposeBuilder(builder);
 
   if (LLVMVerifyFunction(func, LLVMPrintMessageAction)) {
     printf("Verify function '%s' failed\n", f->name);
@@ -8310,6 +8339,8 @@ int main(int argc, char **argv) {
   RunParserTests();
   printf("PASSED\n");
 
+  printf("main %p\n", &main);
+
   if (argc < 2) {
     printf("Usage: %s input_file\n", argv[0]);
     return -1;
@@ -8419,9 +8450,17 @@ int main(int argc, char **argv) {
     }
   }
 
+  if (LLVMTargetMachineEmitToFile(target_machine, mod, "out.obj",
+                                  LLVMObjectFile, &error)) {
+    printf("llvm error: %s\n", error);
+    LLVMDisposeMessage(error);
+    return -1;
+  }
+
   for (size_t i = 0; i < nodes_to_destroy.size; ++i) {
     Node *node = *(Node **)vector_at(&nodes_to_destroy, i);
-    node->vtable->dtor(node);
+    node_destroy(node);
+    free(node);
   }
   vector_destroy(&nodes_to_destroy);
 
@@ -8429,6 +8468,10 @@ int main(int argc, char **argv) {
   sema_destroy(&sema);
   parser_destroy(&parser);
   input_stream_destroy(&input.base);
+
+  LLVMDisposeModule(mod);
+  LLVMDisposeTargetData(data_layout);
+  LLVMDisposeTargetMachine(target_machine);
 
   return 0;
 }
