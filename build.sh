@@ -1,3 +1,5 @@
+set -e
+
 BUILD_DIR=build
 SRC_DIR=$(pwd)
 OUTPUT_BIN=c

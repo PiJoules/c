@@ -34,6 +34,7 @@ void free(void *);
 size_t strlen(const char *);
 int strncmp(const char *, const char *, size_t);
 void *memcpy(void *, const void *, size_t);
+void *memset(void *, int ch, size_t);
 int strcmp(const char *, const char *);
 char *strdup(const char *);
 
@@ -94,6 +95,8 @@ void LLVMDisposeTargetData(LLVMTargetDataRef TD);
 void LLVMDisposeTargetMachine(LLVMTargetMachineRef T);
 void LLVMDeleteBasicBlock(LLVMBasicBlockRef BB);
 void LLVMDisposeBuilder(LLVMBuilderRef Builder);
+LLVMBool LLVMPrintModuleToFile(LLVMModuleRef M, const char *Filename,
+                               char **ErrorMessage);
 
 typedef enum { LLVMAssemblyFile, LLVMObjectFile } LLVMCodeGenFileType;
 LLVMBool LLVMTargetMachineEmitToFile(LLVMTargetMachineRef T, LLVMModuleRef M,
@@ -216,6 +219,9 @@ LLVMValueRef LLVMBuildShl(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
 LLVMValueRef LLVMGetLastInstruction(LLVMBasicBlockRef BB);
 LLVMValueRef LLVMConstStruct(LLVMValueRef *ConstantVals, unsigned Count,
                              LLVMBool Packed);
+LLVMValueRef LLVMBuildMemSet(LLVMBuilderRef B, LLVMValueRef Ptr,
+                             LLVMValueRef Val, LLVMValueRef Len,
+                             unsigned Align);
 
 typedef enum {
   LLVMArgumentValueKind,
@@ -364,6 +370,146 @@ LLVMTargetDataRef LLVMCreateTargetDataLayout(LLVMTargetMachineRef T);
 void LLVMSetModuleDataLayout(LLVMModuleRef M, LLVMTargetDataRef DL);
 unsigned LLVMPointerSize(LLVMTargetDataRef TD);
 LLVMTargetDataRef LLVMGetModuleDataLayout(LLVMModuleRef M);
+
+typedef struct LLVMOpaqueDIBuilder *LLVMDIBuilderRef;
+LLVMDIBuilderRef LLVMCreateDIBuilder(LLVMModuleRef M);
+void LLVMDisposeDIBuilder(LLVMDIBuilderRef Builder);
+typedef struct LLVMOpaqueMetadata *LLVMMetadataRef;
+typedef enum {
+  LLVMDIFlagZero = 0,
+  LLVMDIFlagPrivate = 1,
+  LLVMDIFlagProtected = 2,
+  LLVMDIFlagPublic = 3,
+  LLVMDIFlagFwdDecl = 1 << 2,
+  LLVMDIFlagAppleBlock = 1 << 3,
+  LLVMDIFlagReservedBit4 = 1 << 4,
+  LLVMDIFlagVirtual = 1 << 5,
+  LLVMDIFlagArtificial = 1 << 6,
+  LLVMDIFlagExplicit = 1 << 7,
+  LLVMDIFlagPrototyped = 1 << 8,
+  LLVMDIFlagObjcClassComplete = 1 << 9,
+  LLVMDIFlagObjectPointer = 1 << 10,
+  LLVMDIFlagVector = 1 << 11,
+  LLVMDIFlagStaticMember = 1 << 12,
+  LLVMDIFlagLValueReference = 1 << 13,
+  LLVMDIFlagRValueReference = 1 << 14,
+  LLVMDIFlagReserved = 1 << 15,
+  LLVMDIFlagSingleInheritance = 1 << 16,
+  LLVMDIFlagMultipleInheritance = 2 << 16,
+  LLVMDIFlagVirtualInheritance = 3 << 16,
+  LLVMDIFlagIntroducedVirtual = 1 << 18,
+  LLVMDIFlagBitField = 1 << 19,
+  LLVMDIFlagNoReturn = 1 << 20,
+  LLVMDIFlagTypePassByValue = 1 << 22,
+  LLVMDIFlagTypePassByReference = 1 << 23,
+  LLVMDIFlagEnumClass = 1 << 24,
+  LLVMDIFlagFixedEnum = LLVMDIFlagEnumClass,  // Deprecated.
+  LLVMDIFlagThunk = 1 << 25,
+  LLVMDIFlagNonTrivial = 1 << 26,
+  LLVMDIFlagBigEndian = 1 << 27,
+  LLVMDIFlagLittleEndian = 1 << 28,
+  LLVMDIFlagIndirectVirtualBase = (1 << 2) | (1 << 5),
+  LLVMDIFlagAccessibility =
+      LLVMDIFlagPrivate | LLVMDIFlagProtected | LLVMDIFlagPublic,
+  LLVMDIFlagPtrToMemberRep = LLVMDIFlagSingleInheritance |
+                             LLVMDIFlagMultipleInheritance |
+                             LLVMDIFlagVirtualInheritance
+} LLVMDIFlags;
+typedef enum {
+  LLVMDWARFSourceLanguageC89,
+  LLVMDWARFSourceLanguageC,
+  LLVMDWARFSourceLanguageAda83,
+  LLVMDWARFSourceLanguageC_plus_plus,
+  LLVMDWARFSourceLanguageCobol74,
+  LLVMDWARFSourceLanguageCobol85,
+  LLVMDWARFSourceLanguageFortran77,
+  LLVMDWARFSourceLanguageFortran90,
+  LLVMDWARFSourceLanguagePascal83,
+  LLVMDWARFSourceLanguageModula2,
+  // New in DWARF v3:
+  LLVMDWARFSourceLanguageJava,
+  LLVMDWARFSourceLanguageC99,
+  LLVMDWARFSourceLanguageAda95,
+  LLVMDWARFSourceLanguageFortran95,
+  LLVMDWARFSourceLanguagePLI,
+  LLVMDWARFSourceLanguageObjC,
+  LLVMDWARFSourceLanguageObjC_plus_plus,
+  LLVMDWARFSourceLanguageUPC,
+  LLVMDWARFSourceLanguageD,
+  // New in DWARF v4:
+  LLVMDWARFSourceLanguagePython,
+  // New in DWARF v5:
+  LLVMDWARFSourceLanguageOpenCL,
+  LLVMDWARFSourceLanguageGo,
+  LLVMDWARFSourceLanguageModula3,
+  LLVMDWARFSourceLanguageHaskell,
+  LLVMDWARFSourceLanguageC_plus_plus_03,
+  LLVMDWARFSourceLanguageC_plus_plus_11,
+  LLVMDWARFSourceLanguageOCaml,
+  LLVMDWARFSourceLanguageRust,
+  LLVMDWARFSourceLanguageC11,
+  LLVMDWARFSourceLanguageSwift,
+  LLVMDWARFSourceLanguageJulia,
+  LLVMDWARFSourceLanguageDylan,
+  LLVMDWARFSourceLanguageC_plus_plus_14,
+  LLVMDWARFSourceLanguageFortran03,
+  LLVMDWARFSourceLanguageFortran08,
+  LLVMDWARFSourceLanguageRenderScript,
+  LLVMDWARFSourceLanguageBLISS,
+  LLVMDWARFSourceLanguageKotlin,
+  LLVMDWARFSourceLanguageZig,
+  LLVMDWARFSourceLanguageCrystal,
+  LLVMDWARFSourceLanguageC_plus_plus_17,
+  LLVMDWARFSourceLanguageC_plus_plus_20,
+  LLVMDWARFSourceLanguageC17,
+  LLVMDWARFSourceLanguageFortran18,
+  LLVMDWARFSourceLanguageAda2005,
+  LLVMDWARFSourceLanguageAda2012,
+  LLVMDWARFSourceLanguageHIP,
+  LLVMDWARFSourceLanguageAssembly,
+  LLVMDWARFSourceLanguageC_sharp,
+  LLVMDWARFSourceLanguageMojo,
+  LLVMDWARFSourceLanguageGLSL,
+  LLVMDWARFSourceLanguageGLSL_ES,
+  LLVMDWARFSourceLanguageHLSL,
+  LLVMDWARFSourceLanguageOpenCL_CPP,
+  LLVMDWARFSourceLanguageCPP_for_OpenCL,
+  LLVMDWARFSourceLanguageSYCL,
+  LLVMDWARFSourceLanguageRuby,
+  LLVMDWARFSourceLanguageMove,
+  LLVMDWARFSourceLanguageHylo,
+  LLVMDWARFSourceLanguageMetal,
+
+  // Vendor extensions:
+  LLVMDWARFSourceLanguageMips_Assembler,
+  LLVMDWARFSourceLanguageGOOGLE_RenderScript,
+  LLVMDWARFSourceLanguageBORLAND_Delphi
+} LLVMDWARFSourceLanguage;
+typedef enum {
+  LLVMDWARFEmissionNone = 0,
+  LLVMDWARFEmissionFull,
+  LLVMDWARFEmissionLineTablesOnly
+} LLVMDWARFEmissionKind;
+LLVMMetadataRef LLVMDIBuilderCreateFunction(
+    LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, const char *Name,
+    size_t NameLen, const char *LinkageName, size_t LinkageNameLen,
+    LLVMMetadataRef File, unsigned LineNo, LLVMMetadataRef Ty,
+    LLVMBool IsLocalToUnit, LLVMBool IsDefinition, unsigned ScopeLine,
+    LLVMDIFlags Flags, LLVMBool IsOptimized);
+LLVMMetadataRef LLVMDIBuilderCreateCompileUnit(
+    LLVMDIBuilderRef Builder, LLVMDWARFSourceLanguage Lang,
+    LLVMMetadataRef FileRef, const char *Producer, size_t ProducerLen,
+    LLVMBool isOptimized, const char *Flags, size_t FlagsLen,
+    unsigned RuntimeVer, const char *SplitName, size_t SplitNameLen,
+    LLVMDWARFEmissionKind Kind, unsigned DWOId, LLVMBool SplitDebugInlining,
+    LLVMBool DebugInfoForProfiling, const char *SysRoot, size_t SysRootLen,
+    const char *SDK, size_t SDKLen);
+LLVMMetadataRef LLVMDIBuilderCreateFile(LLVMDIBuilderRef Builder,
+                                        const char *Filename,
+                                        size_t FilenameLen,
+                                        const char *Directory,
+                                        size_t DirectoryLen);
+LLVMMetadataRef LLVMDIScopeGetFile(LLVMMetadataRef Scope);
 
 ///
 /// Start Vector Implementation
@@ -1370,6 +1516,22 @@ bool lexer_peek_then_consume_char(Lexer *lexer, char c) {
   return true;
 }
 
+char handle_escape_char(int c) {
+  switch (c) {
+    case 'n':
+      return '\n';
+    case 't':
+      return '\t';
+    case '\'':
+      return '\'';
+    case '\\':
+      return '\\';
+    default:
+      printf("Unhandled escape character '%c'\n", c);
+      __builtin_trap();
+  }
+}
+
 // Callers of this function should destroy the token.
 Token lex(Lexer *lexer) {
   Token tok;
@@ -1563,6 +1725,10 @@ Token lex(Lexer *lexer) {
         printf("Got EOF before finishing string parsing\n");
         __builtin_trap();
       }
+
+      if (c == '\\')
+        c = handle_escape_char(lexer_get_char(lexer));
+
       string_append_char(&tok.chars, (char)c);
     }
 
@@ -1576,26 +1742,8 @@ Token lex(Lexer *lexer) {
     int c = lexer_get_char(lexer);
     assert(!is_eof(c));
 
-    if (c == '\\') {
-      switch (lexer_get_char(lexer)) {
-        case 'n':
-          c = '\n';
-          break;
-        case 't':
-          c = '\t';
-          break;
-        case '\'':
-          c = '\'';
-          break;
-        case '\\':
-          c = '\\';
-          break;
-        default:
-          printf("%llu:%llu: Unhandled escape character '%c'\n", tok.line,
-                 tok.col, c);
-          __builtin_trap();
-      }
-    }
+    if (c == '\\')
+      c = handle_escape_char(lexer_get_char(lexer));
 
     string_append_char(&tok.chars, (char)c);
 
@@ -2154,7 +2302,7 @@ const TypeVtable ArrayTypeVtable = {
 typedef struct {
   Type type;
   Type *elem_type;
-  struct Expr *size;  // NULL indicates no size.
+  struct Expr *size;  // NULL indicates no specified size.
 } ArrayType;
 
 void array_type_construct(ArrayType *arr, Type *elem_type, struct Expr *size) {
@@ -6743,13 +6891,29 @@ ConstExprResult sema_eval_binop(Sema *sema, const BinOp *expr) {
           lhs.result.i <<= result_to_u64(&rhs);
           return lhs;
         case RK_UnsignedLongLong:
-          assert(sizeof(unsigned long long) > result_to_u64(&rhs));
+          assert(sizeof(unsigned long long) * 8 > result_to_u64(&rhs));
           lhs.result.ull <<= result_to_u64(&rhs);
           return lhs;
       }
       break;
+    case BOK_BitwiseOr:
+      assert(lhs.result_kind == rhs.result_kind);
+      switch (lhs.result_kind) {
+        case RK_Boolean:
+          lhs.result.b |= rhs.result.b;
+          return lhs;
+        case RK_Int:
+          lhs.result.i |= rhs.result.i;
+          return lhs;
+        case RK_UnsignedLongLong:
+          lhs.result.ull |= rhs.result.ull;
+          return lhs;
+      }
+      break;
     default:
-      printf("TODO: Implement constant evaluation for the remaining binops\n");
+      printf(
+          "TODO: Implement constant evaluation for the remaining binops %d\n",
+          expr->op);
       __builtin_trap();
       break;
   }
@@ -6882,11 +7046,24 @@ typedef struct {
   // The compiler does not own the Sema or the module. It only modifies them.
   LLVMModuleRef mod;
   Sema *sema;
+  LLVMDIBuilderRef dibuilder;
+  LLVMMetadataRef dicu;
+  LLVMMetadataRef difile;
 } Compiler;
 
-void compiler_construct(Compiler *compiler, LLVMModuleRef mod, Sema *sema) {
+void compiler_construct(Compiler *compiler, LLVMModuleRef mod, Sema *sema,
+                        LLVMDIBuilderRef dibuilder) {
   compiler->mod = mod;
   compiler->sema = sema;
+  compiler->dibuilder = dibuilder;
+  compiler->difile = LLVMDIBuilderCreateFile(dibuilder, "<input>", 7, "", 0);
+  compiler->dicu = LLVMDIBuilderCreateCompileUnit(
+      dibuilder, LLVMDWARFSourceLanguageC, compiler->difile,
+      /*Producer=*/"", /*ProducerLen=*/0, /*IsOptimized=*/0,
+      /*Flags=*/"", /*FlagsLen=*/0, /*RuntimeVer=*/0, /*SplitName=*/"",
+      /*SplitNameLen=*/0, LLVMDWARFEmissionFull, /*DWOId=*/0,
+      /*SplitDebugInlining=*/0, /*DebugInfoForProfiling=*/0, /*SysRoot=*/"",
+      /*SysRootLen=*/0, /*SDK=*/"", /*SDKLen=*/0);
 }
 
 void compiler_destroy(Compiler *compiler) {}
@@ -7460,6 +7637,63 @@ LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
   return phi;
 }
 
+LLVMValueRef compile_logical_binop(Compiler *compiler, LLVMBuilderRef builder,
+                                   const Expr *lhs, const Expr *rhs,
+                                   BinOpKind op, TreeMap *local_ctx,
+                                   TreeMap *local_allocas) {
+  // Account for short-circuit evaluation.
+  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+  LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
+
+  LLVMValueRef lhs_val =
+      compile_to_bool(compiler, builder, lhs, local_ctx, local_allocas);
+  LLVMBasicBlockRef current_bb = LLVMGetInsertBlock(builder);
+
+  LLVMBasicBlockRef eval_rhs_bb =
+      LLVMAppendBasicBlockInContext(ctx, fn, "sc_rhs");
+  LLVMBasicBlockRef res_bb = LLVMCreateBasicBlockInContext(ctx, "sc_res");
+
+  switch (op) {
+    case BOK_LogicalAnd:
+      // Jump to the rhs if lsh is true. Otherwise go to the result bb.
+      LLVMBuildCondBr(builder, lhs_val, eval_rhs_bb, res_bb);
+      break;
+    case BOK_LogicalOr:
+      // Jump to the res BB if true. Otherwise check rhs.
+      LLVMBuildCondBr(builder, lhs_val, res_bb, eval_rhs_bb);
+      break;
+    default:
+      printf("Unhandled local operator %d\n", op);
+      __builtin_trap();
+  }
+
+  // BB for evaluating RHS.
+  LLVMPositionBuilderAtEnd(builder, eval_rhs_bb);
+  LLVMValueRef rhs_val =
+      compile_to_bool(compiler, builder, rhs, local_ctx, local_allocas);
+  rhs_val = LLVMBuildZExt(builder, rhs_val, LLVMInt8Type(), "");
+  LLVMBuildBr(builder, res_bb);
+  eval_rhs_bb = LLVMGetInsertBlock(builder);
+
+  // Result BB.
+  LLVMAppendExistingBasicBlock(fn, res_bb);
+  LLVMPositionBuilderAtEnd(builder, res_bb);
+
+  LLVMValueRef phi = LLVMBuildPhi(builder, LLVMInt8Type(), "");
+
+  LLVMValueRef default_val =
+      LLVMConstInt(LLVMInt8Type(), op == BOK_LogicalOr, /*IsSigned=*/0);
+
+  LLVMValueRef incoming_vals[] = {
+      default_val,
+      rhs_val,
+  };
+  LLVMBasicBlockRef incoming_blocks[] = {current_bb, eval_rhs_bb};
+  LLVMAddIncoming(phi, incoming_vals, incoming_blocks, 2);
+
+  return phi;
+}
+
 LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
                            const BinOp *expr, TreeMap *local_ctx,
                            TreeMap *local_allocas) {
@@ -7494,21 +7728,41 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
     return gep;
   }
 
+  // FIXME: This currently evaluates all operands before doing the actual binop.
+  // This breaks the rules for short-circuit evaluation. For example, this will
+  // not be evaluated correctly:
+  //
+  //   bool b = ptr && *ptr;
+  //
+  // Even if `ptr` is NULL, the dereference will still occur. We need to keep
+  // track of sequence points.
+  //
   LLVMValueRef lhs;
   LLVMValueRef rhs;
   const Type *common_ty;
   if (is_logical_binop(expr->op)) {
-    lhs =
-        compile_to_bool(compiler, builder, expr->lhs, local_ctx, local_allocas);
-    rhs =
-        compile_to_bool(compiler, builder, expr->rhs, local_ctx, local_allocas);
+    return compile_logical_binop(compiler, builder, expr->lhs, expr->rhs,
+                                 expr->op, local_ctx, local_allocas);
   } else if (is_assign_binop(expr->op)) {
     rhs = compile_implicit_cast(compiler, builder, expr->rhs, lhs_ty, local_ctx,
                                 local_allocas);
     lhs = compile_lvalue_ptr(compiler, builder, expr->lhs, local_ctx,
                              local_allocas);
+  } else if (expr->op == BOK_Eq || expr->op == BOK_Ne) {
+    if (sema_is_pointer_type(compiler->sema, lhs_ty, local_ctx) &&
+        sema_is_pointer_type(compiler->sema, rhs_ty, local_ctx)) {
+      common_ty = sema_get_type_of_binop_expr(compiler->sema, expr, local_ctx);
+    } else {
+      common_ty = sema_get_common_arithmetic_type(compiler->sema, lhs_ty,
+                                                  rhs_ty, local_ctx);
+    }
+    lhs = compile_implicit_cast(compiler, builder, expr->lhs, common_ty,
+                                local_ctx, local_allocas);
+    rhs = compile_implicit_cast(compiler, builder, expr->rhs, common_ty,
+                                local_ctx, local_allocas);
   } else {
-    common_ty = sema_get_type_of_binop_expr(compiler->sema, expr, local_ctx);
+    common_ty = sema_get_common_arithmetic_type(compiler->sema, lhs_ty, rhs_ty,
+                                                local_ctx);
     lhs = compile_implicit_cast(compiler, builder, expr->lhs, common_ty,
                                 local_ctx, local_allocas);
     rhs = compile_implicit_cast(compiler, builder, expr->rhs, common_ty,
@@ -7668,8 +7922,9 @@ vector compile_call_args(Compiler *compiler, LLVMBuilderRef builder,
 }
 
 LLVMValueRef call_llvm_debugtrap(Compiler *compiler, LLVMBuilderRef builder) {
+  // FIXME: We should be able to do `sizeof(name)`.
   const char name[] = "llvm.debugtrap";
-  unsigned intrinsic_id = LLVMLookupIntrinsicID(name, sizeof(name) - 1);
+  unsigned intrinsic_id = LLVMLookupIntrinsicID(name, 14);
   LLVMValueRef intrinsic = LLVMGetIntrinsicDeclaration(
       compiler->mod, intrinsic_id, /*ParamTypes=*/NULL,
       /*ParamCount=*/0);
@@ -7791,8 +8046,8 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
         LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
         LLVMValueRef llvm_offset =
             LLVMConstInt(LLVMInt32Type(), offset, /*signed=*/0);
-        LLVMValueRef offsets[] = {llvm_offset};
-        ptr = LLVMBuildGEP2(builder, llvm_base_ty, ptr, offsets, 1, "");
+        LLVMValueRef offsets[] = {LLVMConstNull(LLVMInt32Type()), llvm_offset};
+        ptr = LLVMBuildGEP2(builder, llvm_base_ty, ptr, offsets, 2, "");
       } else {
         ptr = compile_lvalue_ptr(compiler, builder, expr, local_ctx,
                                  local_allocas);
@@ -8126,11 +8381,67 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
       LLVMTypeRef llvm_ty = get_llvm_type(compiler, decl->type);
       LLVMValueRef alloca = LLVMBuildAlloca(builder, llvm_ty, decl->name);
 
+      if (decl->initializer) {
+        if (decl->initializer->vtable->kind == EK_InitializerList) {
+          const InitializerList *init =
+              (const InitializerList *)decl->initializer;
+
+          size_t agg_size;
+          bool is_array =
+              sema_is_array_type(compiler->sema, decl->type, local_ctx);
+          if (is_array) {
+            const ArrayType *arr_ty =
+                sema_get_array_type(compiler->sema, decl->type, local_ctx);
+            if (arr_ty->size) {
+              agg_size = sema_eval_sizeof_type(compiler->sema, decl->type);
+            } else {
+              assert(init->elems.size > 0);
+              agg_size =
+                  sema_eval_sizeof_type(compiler->sema, arr_ty->elem_type) *
+                  init->elems.size;
+            }
+          } else {
+            agg_size = sema_eval_sizeof_type(compiler->sema, decl->type);
+          }
+          LLVMBuildMemSet(
+              builder, alloca, LLVMConstNull(LLVMInt8Type()),
+              LLVMConstInt(LLVMInt32Type(), agg_size, /*IsSigned=*/0),
+              /*Align=*/0);
+
+          for (size_t i = 0; i < init->elems.size; ++i) {
+            const InitializerListElem *elem = vector_at(&init->elems, i);
+            LLVMValueRef val = compile_expr(compiler, builder, elem->expr,
+                                            local_ctx, local_allocas);
+
+            // TODO: Handle designated initializer names.
+
+            LLVMValueRef gep;
+            if (is_array) {
+              LLVMValueRef offsets[] = {
+                  LLVMConstInt(LLVMInt32Type(), i, /*IsSigned=*/0)};
+              gep = LLVMBuildGEP2(builder, llvm_ty, alloca, offsets, 1, "");
+            } else {
+              LLVMValueRef offsets[] = {
+                  LLVMConstNull(LLVMInt32Type()),
+                  LLVMConstInt(LLVMInt32Type(), i, /*IsSigned=*/0)};
+              gep = LLVMBuildGEP2(builder, llvm_ty, alloca, offsets, 2, "");
+            }
+            LLVMBuildStore(builder, val, gep);
+          }
+        } else {
+          LLVMValueRef init =
+              compile_implicit_cast(compiler, builder, decl->initializer,
+                                    decl->type, local_ctx, local_allocas);
+          LLVMBuildStore(builder, init, alloca);
+        }
+      }
+
       // Note this may override allocas and types declared in a higher scope,
       // but this should be ok since we should've cloned any local contexts
       // before entering a lower scope.
       tree_map_set(local_allocas, decl->name, alloca);
       tree_map_set(local_ctx, decl->name, decl->type);
+
       return;
     }
     case SK_SwitchStmt: {
@@ -8158,6 +8469,10 @@ void compile_function_definition(Compiler *compiler,
   LLVMBasicBlockRef entry = LLVMAppendBasicBlock(func, "entry");
   LLVMBuilderRef builder = LLVMCreateBuilder();
   LLVMPositionBuilderAtEnd(builder, entry);
+
+  // LLVMMetadataRef subprogram = LLVMDIBuilderCreateFunction(
+  //   compiler->dibuilder, /*Scope=*/NULL, f->name, strlen(f->name),
+  //   f->name, strlen(f->name), compiler->difile, );
 
   FunctionType *func_ty = (FunctionType *)(f->type);
 
@@ -8248,9 +8563,9 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
       LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
       LLVMValueRef llvm_offset =
           LLVMConstInt(LLVMInt32Type(), offset, /*signed=*/0);
-      LLVMValueRef offsets[] = {llvm_offset};
+      LLVMValueRef offsets[] = {LLVMConstNull(LLVMInt32Type()), llvm_offset};
       LLVMValueRef gep =
-          LLVMBuildGEP2(builder, llvm_base_ty, base_llvm, offsets, 1, "");
+          LLVMBuildGEP2(builder, llvm_base_ty, base_llvm, offsets, 2, "");
       return gep;
     }
     case EK_UnOp:
@@ -8277,23 +8592,27 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
       const Type *base_ty =
           sema_get_type_of_expr_in_ctx(compiler->sema, base, local_ctx);
       LLVMValueRef base_ptr =
-          compile_lvalue_ptr(compiler, builder, base, local_ctx, local_allocas);
+          compile_expr(compiler, builder, base, local_ctx, local_allocas);
       assert(LLVMGetTypeKind(LLVMTypeOf(base_ptr)) == LLVMPointerTypeKind);
 
       LLVMValueRef idx =
           compile_expr(compiler, builder, index->idx, local_ctx, local_allocas);
-      LLVMValueRef offsets[] = {idx};
 
       if (sema_is_pointer_type(compiler->sema, base_ty, local_ctx)) {
+        LLVMValueRef offsets[] = {idx};
+
         const Type *pointee_ty =
             sema_get_pointee(compiler->sema, base_ty, local_ctx);
         LLVMTypeRef llvm_pointee_ty = get_llvm_type(compiler, pointee_ty);
         return LLVMBuildGEP2(builder, llvm_pointee_ty, base_ptr, offsets, 1,
-                             "");
+                             "idx_ptr");
       } else if (sema_is_array_type(compiler->sema, base_ty, local_ctx)) {
+        LLVMValueRef offsets[] = {LLVMConstNull(LLVMInt32Type()), idx};
+
         LLVMTypeRef llvm_arr_ty = get_llvm_type(compiler, base_ty);
         assert(LLVMGetTypeKind(llvm_arr_ty) == LLVMArrayTypeKind);
-        return LLVMBuildGEP2(builder, llvm_arr_ty, base_ptr, offsets, 1, "");
+        return LLVMBuildGEP2(builder, llvm_arr_ty, base_ptr, offsets, 2,
+                             "idx_arr");
       }
 
       printf("Indexing non-ptr or arr type\n");
@@ -8332,14 +8651,12 @@ void compile_global_variable(Compiler *compiler, const GlobalVariable *gv) {
 ///
 
 int main(int argc, char **argv) {
-  printf("Running initial tests...");
+  // printf("Running initial tests...");
   RunStringTests();
   RunVectorTests();
   RunTreeMapTests();
   RunParserTests();
-  printf("PASSED\n");
-
-  printf("main %p\n", &main);
+  // printf("PASSED\n");
 
   if (argc < 2) {
     printf("Usage: %s input_file\n", argv[0]);
@@ -8350,6 +8667,7 @@ int main(int argc, char **argv) {
 
   // LLVM Initialization
   LLVMModuleRef mod = LLVMModuleCreateWithName(input_filename);
+  LLVMDIBuilderRef dibuilder = LLVMCreateDIBuilder(mod);
 
   LLVMInitializeX86TargetInfo();
   LLVMInitializeX86Target();
@@ -8392,7 +8710,7 @@ int main(int argc, char **argv) {
   sema_construct(&sema);
 
   Compiler compiler;
-  compiler_construct(&compiler, mod, &sema);
+  compiler_construct(&compiler, mod, &sema, dibuilder);
 
   vector nodes_to_destroy;
   vector_construct(&nodes_to_destroy, sizeof(Node *), alignof(Node *));
@@ -8450,6 +8768,11 @@ int main(int argc, char **argv) {
     }
   }
 
+  if (LLVMPrintModuleToFile(mod, "out.ll", &error)) {
+    printf("llvm error: %s\n", error);
+    LLVMDisposeMessage(error);
+    return -1;
+  }
   if (LLVMTargetMachineEmitToFile(target_machine, mod, "out.obj",
                                   LLVMObjectFile, &error)) {
     printf("llvm error: %s\n", error);
@@ -8472,6 +8795,7 @@ int main(int argc, char **argv) {
   LLVMDisposeModule(mod);
   LLVMDisposeTargetData(data_layout);
   LLVMDisposeTargetMachine(target_machine);
+  LLVMDisposeDIBuilder(dibuilder);
 
   return 0;
 }
