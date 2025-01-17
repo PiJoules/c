@@ -5310,7 +5310,7 @@ Statement *parse_compound_stmt(Parser *parser) {
 
 Node *parse_global_variable_or_function_definition(Parser *parser) {
   char *name = NULL;
-  FoundStorageClasses storage;
+  FoundStorageClasses storage = {};
   Type *type = parse_type_for_declaration(parser, &name, &storage);
   assert(name);
 
@@ -6247,8 +6247,16 @@ void sema_handle_enum_declaration(Sema *sema, EnumType *enum_ty) {
 
     if (member->value) {
       ConstExprResult res = sema_eval_expr(sema, member->value);
-      assert(res.result_kind == RK_UnsignedLongLong);
-      val = (int)res.result.ull;
+      switch (res.result_kind) {
+        case RK_Boolean:
+          __builtin_trap();
+        case RK_Int:
+          val = res.result.i;
+          break;
+        case RK_UnsignedLongLong:
+          val = (int)res.result.ull;
+          break;
+      }
     }
 
     tree_map_set(&sema->enum_values, member->name, (void *)(intptr_t)val);
@@ -6829,25 +6837,62 @@ size_t sema_eval_sizeof_type(Sema *sema, const Type *type) {
 
 int compare_constexpr_result_types(const ConstExprResult *lhs,
                                    const ConstExprResult *rhs) {
-  assert(lhs->result_kind == rhs->result_kind);
-
   // TODO: Would be neat to see if the compiler optimizes this into a normal cmp
   // instruction.
   switch (lhs->result_kind) {
     case RK_Boolean:
-      return (int)(!(lhs->result.b == rhs->result.b));
-    case RK_Int:
-      if (lhs->result.i < rhs->result.i)
-        return -1;
-      if (lhs->result.i > rhs->result.i)
-        return 1;
-      return 0;
-    case RK_UnsignedLongLong:
-      if (lhs->result.ull < rhs->result.ull)
-        return -1;
-      if (lhs->result.ull > rhs->result.ull)
-        return 1;
-      return 0;
+      switch (rhs->result_kind) {
+        case RK_Boolean:
+          return (int)(!(lhs->result.b == rhs->result.b));
+        case RK_Int:
+          return (int)((int)lhs->result.b == rhs->result.i);
+        case RK_UnsignedLongLong:
+          return (int)((unsigned long long)lhs->result.b == rhs->result.ull);
+      }
+    case RK_Int: {
+      switch (rhs->result_kind) {
+        case RK_Boolean:
+          if (lhs->result.i < rhs->result.b)
+            return -1;
+          if (lhs->result.i > rhs->result.b)
+            return 1;
+          return 0;
+        case RK_Int:
+          if (lhs->result.i < rhs->result.i)
+            return -1;
+          if (lhs->result.i > rhs->result.i)
+            return 1;
+          return 0;
+        case RK_UnsignedLongLong:
+          if (lhs->result.i < rhs->result.ull)
+            return -1;
+          if (lhs->result.i > rhs->result.ull)
+            return 1;
+          return 0;
+      }
+    }
+    case RK_UnsignedLongLong: {
+      switch (rhs->result_kind) {
+        case RK_Boolean:
+          if (lhs->result.ull < rhs->result.b)
+            return -1;
+          if (lhs->result.ull > rhs->result.b)
+            return 1;
+          return 0;
+        case RK_Int:
+          if (lhs->result.ull < rhs->result.i)
+            return -1;
+          if (lhs->result.ull > rhs->result.i)
+            return 1;
+          return 0;
+        case RK_UnsignedLongLong:
+          if (lhs->result.ull < rhs->result.ull)
+            return -1;
+          if (lhs->result.ull > rhs->result.ull)
+            return 1;
+          return 0;
+      }
+    }
   }
 }
 
@@ -6868,26 +6913,19 @@ ConstExprResult sema_eval_binop(Sema *sema, const BinOp *expr) {
   ConstExprResult rhs = sema_eval_expr(sema, expr->rhs);
 
   switch (expr->op) {
-    case BOK_Eq:
-      if (lhs.result_kind == rhs.result_kind) {
-        ConstExprResult res;
-        res.result_kind = RK_Boolean;
-        res.result.b = compare_constexpr_result_types(&lhs, &rhs) == 0;
-        return res;
-      }
-
-      printf(
-          "TODO: Implement constant evaluation for the == of other "
-          "ConstExprResults\n");
-      __builtin_trap();
-      break;
+    case BOK_Eq: {
+      ConstExprResult res;
+      res.result_kind = RK_Boolean;
+      res.result.b = compare_constexpr_result_types(&lhs, &rhs) == 0;
+      return res;
+    }
     case BOK_LShift:
       switch (lhs.result_kind) {
         case RK_Boolean:
           printf("Cannot shift boolean\n");
           __builtin_trap();
         case RK_Int:
-          assert(sizeof(int) > result_to_u64(&rhs));
+          assert(sizeof(int) * 8 > result_to_u64(&rhs));
           lhs.result.i <<= result_to_u64(&rhs);
           return lhs;
         case RK_UnsignedLongLong:
@@ -6957,8 +6995,8 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
       return sema_eval_sizeof(sema, (const SizeOf *)expr);
     case EK_Int: {
       ConstExprResult res;
-      res.result_kind = RK_UnsignedLongLong;
-      res.result.ull = ((const Int *)expr)->val;
+      res.result_kind = RK_Int;
+      res.result.i = (int)((const Int *)expr)->val;
       return res;
     }
     case EK_UnOp: {
@@ -6989,8 +7027,8 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
       void *val;
       if (tree_map_get(&sema->enum_values, decl->name, &val)) {
         ConstExprResult res;
-        res.result_kind = RK_UnsignedLongLong;
-        res.result.i = (int)(uintptr_t)val;
+        res.result_kind = RK_Int;
+        res.result.i = (int)(intptr_t)val;
         return res;
       }
 
@@ -8255,6 +8293,8 @@ void compile_switch_statement(Compiler *compiler, LLVMBuilderRef builder,
 
   LLVMBasicBlockRef end_bb = LLVMCreateBasicBlockInContext(ctx, "switch_end");
 
+  LLVMValueRef should_fallthrough = LLVMConstNull(LLVMInt1Type());
+
   for (size_t i = 0; i < stmt->cases.size; ++i) {
     const SwitchCase *switch_case = vector_at(&stmt->cases, i);
 
@@ -8268,7 +8308,8 @@ void compile_switch_statement(Compiler *compiler, LLVMBuilderRef builder,
         compile_implicit_cast(compiler, builder, switch_case->cond, common_ty,
                               local_ctx, local_allocas);
     LLVMValueRef cond = LLVMBuildICmp(builder, LLVMIntEQ, check, case_val, "");
-    LLVMBuildCondBr(builder, cond, case_bb, next_bb);
+    should_fallthrough = LLVMBuildOr(builder, cond, should_fallthrough, "");
+    LLVMBuildCondBr(builder, should_fallthrough, case_bb, next_bb);
 
     LLVMPositionBuilderAtEnd(builder, case_bb);
 
@@ -8278,12 +8319,8 @@ void compile_switch_statement(Compiler *compiler, LLVMBuilderRef builder,
       compile_statement(compiler, builder, *case_stmt, local_ctx, local_allocas,
                         end_bb, cont_bb);
 
-      LLVMBasicBlockRef last_bb = LLVMGetInsertBlock(builder);
-      LLVMValueRef last = LLVMGetLastInstruction(last_bb);
-      if (last && LLVMIsATerminatorInst(last)) {
-        last_stmt_terminates = true;
+      if ((last_stmt_terminates = last_instruction_is_terminator(builder)))
         break;
-      }
     }
 
     if (!last_stmt_terminates)
@@ -8720,8 +8757,8 @@ int main(int argc, char **argv) {
     if (token->kind == TK_Eof) {
       break;
     } else {
-      printf("Evaluating top level node at %llu:%llu (%s)\n", token->line,
-             token->col, token->chars.data);
+      // printf("Evaluating top level node at %llu:%llu (%s)\n", token->line,
+      //        token->col, token->chars.data);
 
       // Note that the parse_* functions destroy the tokens.
       Node *top_level_decl = parse_top_level_decl(&parser);
