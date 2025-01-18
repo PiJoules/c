@@ -136,9 +136,12 @@ LLVMTypeRef LLVMFunctionType(LLVMTypeRef ReturnType, LLVMTypeRef *ParamTypes,
 LLVMTypeRef LLVMPointerType(LLVMTypeRef ElementType, unsigned AddressSpace);
 char *LLVMPrintTypeToString(LLVMTypeRef Val);
 
+LLVMBasicBlockRef LLVMGetEntryBasicBlock(LLVMValueRef Fn);
 LLVMBasicBlockRef LLVMAppendBasicBlock(LLVMValueRef Fn, const char *Name);
 LLVMBuilderRef LLVMCreateBuilder(void);
 void LLVMPositionBuilderAtEnd(LLVMBuilderRef Builder, LLVMBasicBlockRef Block);
+void LLVMPositionBuilder(LLVMBuilderRef Builder, LLVMBasicBlockRef Block,
+                         LLVMValueRef Instr);
 LLVMValueRef LLVMConstInt(LLVMTypeRef IntTy, unsigned long long N,
                           LLVMBool SignExtend);
 unsigned long long LLVMConstIntGetZExtValue(LLVMValueRef ConstantVal);
@@ -7609,17 +7612,23 @@ LLVMValueRef compile_implicit_cast(Compiler *compiler, LLVMBuilderRef builder,
   __builtin_trap();
 }
 
-LLVMValueRef compile_local_variable(Compiler *compiler, LLVMBuilderRef builder,
-                                    const char *name, const Type *ty,
-                                    TreeMap *local_ctx,
-                                    TreeMap *local_allocas) {
-  void *val;
-  if (tree_map_get(local_allocas, name, &val))
-    return val;
+// This creates an alloca in this function but ensures it's always at the start
+// of the function. Having an alloca in the middle of the function can cause
+// the stack pointer to keep decrementing if it's in a loop.
+LLVMValueRef build_alloca_at_func_start(LLVMBuilderRef builder,
+                                        const char *name, LLVMTypeRef llvm_ty) {
+  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+  LLVMBasicBlockRef current_bb = LLVMGetInsertBlock(builder);
+  LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(fn);
 
-  LLVMTypeRef llvm_ty = get_llvm_type(compiler, ty);
+  // Place builder before this instruction. If it's null, place the builder
+  // at the end of the bb.
+  LLVMPositionBuilder(builder, entry_bb, LLVMGetLastInstruction(entry_bb));
+
   LLVMValueRef alloca = LLVMBuildAlloca(builder, llvm_ty, name);
-  tree_map_set(local_allocas, name, alloca);
+
+  LLVMPositionBuilderAtEnd(builder, current_bb);
+
   return alloca;
 }
 
@@ -8243,6 +8252,7 @@ void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
   LLVMPositionBuilderAtEnd(builder, for_start);
 
   LLVMBasicBlockRef for_end = LLVMCreateBasicBlockInContext(ctx, "for_end");
+  LLVMBasicBlockRef for_iter = LLVMCreateBasicBlockInContext(ctx, "for_iter");
 
   // Check the condition if any.
   if (stmt->cond) {
@@ -8258,8 +8268,15 @@ void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
   // Now emit the body.
   if (stmt->body) {
     compile_statement(compiler, builder, stmt->body, &local_ctx_cpy,
-                      &local_allocas_cpy, for_end, for_start);
+                      &local_allocas_cpy, for_end, for_iter);
   }
+
+  // Branch to the iterator.
+  if (!last_instruction_is_terminator(builder))
+    LLVMBuildBr(builder, for_iter);
+
+  LLVMAppendExistingBasicBlock(fn, for_iter);
+  LLVMPositionBuilderAtEnd(builder, for_iter);
 
   // Then do the iter.
   if (stmt->iter) {
@@ -8416,7 +8433,8 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
     case SK_Declaration: {
       const Declaration *decl = (const Declaration *)stmt;
       LLVMTypeRef llvm_ty = get_llvm_type(compiler, decl->type);
-      LLVMValueRef alloca = LLVMBuildAlloca(builder, llvm_ty, decl->name);
+      LLVMValueRef alloca =
+          build_alloca_at_func_start(builder, decl->name, llvm_ty);
 
       if (decl->initializer) {
         if (decl->initializer->vtable->kind == EK_InitializerList) {
@@ -8526,10 +8544,9 @@ void compile_function_definition(Compiler *compiler,
     // Copy the parameter locally.
     LLVMValueRef llvm_arg = LLVMGetParam(func, (unsigned)i);
     LLVMValueRef alloca =
-        LLVMBuildAlloca(builder, LLVMTypeOf(llvm_arg), arg->name);
+        build_alloca_at_func_start(builder, arg->name, LLVMTypeOf(llvm_arg));
     LLVMBuildStore(builder, llvm_arg, alloca);
 
-    // tree_map_set(&local_ctx, arg->name, param);
     tree_map_set(&local_ctx, arg->name, arg->type);
     tree_map_set(&local_allocas, arg->name, alloca);
   }
