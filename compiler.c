@@ -179,6 +179,8 @@ LLVMValueRef LLVMGetIntrinsicDeclaration(LLVMModuleRef Mod, unsigned ID,
                                          size_t ParamCount);
 LLVMTypeRef LLVMIntrinsicGetType(LLVMContextRef Ctx, unsigned ID,
                                  LLVMTypeRef *ParamTypes, size_t ParamCount);
+LLVMValueRef LLVMBuildExtractValue(LLVMBuilderRef, LLVMValueRef AggVal,
+                                   unsigned Index, const char *Name);
 LLVMValueRef LLVMBuildRetVoid(LLVMBuilderRef);
 LLVMValueRef LLVMBuildRet(LLVMBuilderRef, LLVMValueRef V);
 LLVMValueRef LLVMConstIntToPtr(LLVMValueRef ConstantVal, LLVMTypeRef ToType);
@@ -1921,10 +1923,12 @@ struct Type;
 
 typedef void (*TypeDtor)(struct Type *);
 typedef size_t (*TypeGetSize)(const struct Type *);
+typedef void (*TypeDump)(const struct Type *);
 
 typedef struct {
   TypeKind kind;
   TypeDtor dtor;
+  TypeDump dump;
 } TypeVtable;
 
 static const int kConstShift = 0;
@@ -1953,6 +1957,12 @@ void type_construct(Type *type, const TypeVtable *vtable) {
 
 void type_destroy(Type *type) { type->vtable->dtor(type); }
 
+void type_dump(const Type *type) {
+  if (!type->vtable->dump)
+    printf("TODO: Implement dump for type %d\n", type->vtable->kind);
+  type->vtable->dump(type);
+}
+
 void type_set_const(Type *type) { type->qualifiers |= kConstMask; }
 void type_set_volatile(Type *type) { type->qualifiers |= kVolatileMask; }
 void type_set_restrict(Type *type) { type->qualifiers |= kRestrictMask; }
@@ -1974,6 +1984,7 @@ void replacement_sentinel_type_destroy(Type *) {}
 const TypeVtable ReplacementSentinelTypeVtable = {
     .kind = TK_ReplacementSentinelType,
     .dtor = &replacement_sentinel_type_destroy,
+    .dump = NULL,
 };
 
 ReplacementSentinelType GetSentinel() {
@@ -2002,10 +2013,12 @@ typedef enum {
 } BuiltinTypeKind;
 
 void builtin_type_destroy(Type *) {}
+void builtin_type_dump(const Type *);
 
 const TypeVtable BuiltinTypeVtable = {
     .kind = TK_BuiltinType,
     .dtor = builtin_type_destroy,
+    .dump = builtin_type_dump,
 };
 
 typedef struct {
@@ -2022,6 +2035,11 @@ BuiltinType *create_builtin_type(BuiltinTypeKind kind) {
   BuiltinType *bt = malloc(sizeof(BuiltinType));
   builtin_type_construct(bt, kind);
   return bt;
+}
+
+void builtin_type_dump(const Type *type) {
+  const BuiltinType *bt = (const BuiltinType *)type;
+  printf("BuiltinType kind=%d\n", bt->kind);
 }
 
 bool is_builtin_type(const Type *type, BuiltinTypeKind kind) {
@@ -2108,10 +2126,12 @@ bool is_void_type(const Type *type) { return is_builtin_type(type, BTK_Void); }
 bool is_bool_type(const Type *type) { return is_builtin_type(type, BTK_Bool); }
 
 void struct_type_destroy(Type *);
+void struct_type_dump(const Type *);
 
 const TypeVtable StructTypeVtable = {
     .kind = TK_StructType,
     .dtor = struct_type_destroy,
+    .dump = struct_type_dump,
 };
 
 struct Expr;
@@ -2176,6 +2196,19 @@ void struct_type_destroy(Type *type) {
   }
 }
 
+void struct_type_dump(const Type *type) {
+  const StructType *st = (const StructType *)type;
+  printf("<StructType name=%s packed=%d>\n", st->name, st->packed);
+  if (st->members) {
+    for (size_t i = 0; i < st->members->size; ++i) {
+      StructMember *sm = vector_at(st->members, i);
+      printf("StructMember name=%s type=\n", sm->name);
+      type_dump(sm->type);
+    }
+  }
+  printf("</StructType>\n");
+}
+
 const StructMember *struct_get_member(const StructType *st, const char *name,
                                       size_t *offset) {
   if (!st->members) {
@@ -2197,10 +2230,12 @@ const StructMember *struct_get_member(const StructType *st, const char *name,
 }
 
 void enum_type_destroy(Type *);
+void enum_type_dump(const Type *);
 
 const TypeVtable EnumTypeVtable = {
     .kind = TK_EnumType,
     .dtor = enum_type_destroy,
+    .dump = enum_type_dump,
 };
 
 void expr_destroy(struct Expr *);
@@ -2248,11 +2283,18 @@ void enum_type_destroy(Type *type) {
   }
 }
 
+void enum_type_dump(const Type *type) {
+  const EnumType *et = (const EnumType *)type;
+  printf("<EnumType name=%s>\n", et->name);
+}
+
 void function_type_destroy(Type *);
+void function_type_dump(const Type *);
 
 const TypeVtable FunctionTypeVtable = {
     .kind = TK_FunctionType,
     .dtor = function_type_destroy,
+    .dump = function_type_dump,
 };
 
 typedef struct {
@@ -2290,6 +2332,19 @@ void function_type_destroy(Type *type) {
   vector_destroy(&f->pos_args);
 }
 
+void function_type_dump(const Type *type) {
+  const FunctionType *ft = (const FunctionType *)type;
+  printf("<FunctionType has_var_args=%d>\n", ft->has_var_args);
+  printf("return_type ");
+  type_dump(ft->return_type);
+  for (size_t i = 0; i < ft->pos_args.size; ++i) {
+    FunctionArg *a = vector_at(&ft->pos_args, i);
+    printf("pos_arg i=%llu name=%s ", i, a->name);
+    type_dump(a->type);
+  }
+  printf("</FunctionType>\n");
+}
+
 Type *get_arg_type(const FunctionType *func, size_t i) {
   FunctionArg *a = vector_at(&func->pos_args, i);
   return a->type;
@@ -2300,6 +2355,7 @@ void array_type_destroy(Type *);
 const TypeVtable ArrayTypeVtable = {
     .kind = TK_ArrayType,
     .dtor = array_type_destroy,
+    .dump = NULL,
 };
 
 typedef struct {
@@ -2332,10 +2388,12 @@ void array_type_destroy(Type *type) {
 }
 
 void pointer_type_destroy(Type *);
+void pointer_type_dump(const Type *);
 
 const TypeVtable PointerTypeVtable = {
     .kind = TK_PointerType,
     .dtor = pointer_type_destroy,
+    .dump = pointer_type_dump,
 };
 
 typedef struct {
@@ -2354,6 +2412,13 @@ void pointer_type_destroy(Type *type) {
   free(ptr->pointee);
 }
 
+void pointer_type_dump(const Type *type) {
+  const PointerType *pt = (const PointerType *)type;
+  printf("<PointerType>\n");
+  type_dump(pt->pointee);
+  printf("</PointerType>\n");
+}
+
 PointerType *create_pointer_to(Type *type) {
   PointerType *ptr = malloc(sizeof(PointerType));
   pointer_type_construct(ptr, type);
@@ -2361,10 +2426,12 @@ PointerType *create_pointer_to(Type *type) {
 }
 
 void non_owning_pointer_type_destroy(Type *) {}
+void non_owning_pointer_type_dump(const Type *);
 
 const TypeVtable NonOwningPointerTypeVtable = {
     .kind = TK_PointerType,
     .dtor = non_owning_pointer_type_destroy,
+    .dump = non_owning_pointer_type_dump,
 };
 
 // This is just like a PointerType with the only difference being it doesn't
@@ -2385,6 +2452,13 @@ void non_owning_pointer_type_construct(NonOwningPointerType *ptr,
   ptr->pointee = pointee;
 }
 
+void non_owning_pointer_type_dump(const Type *type) {
+  const NonOwningPointerType *pt = (const NonOwningPointerType *)type;
+  printf("<NonOwningPointerType>\n");
+  type_dump(pt->pointee);
+  printf("</NonOwningPointerType>\n");
+}
+
 bool is_pointer_to(const Type *type, TypeKind pointee) {
   if (!is_pointer_type(type))
     return false;
@@ -2396,10 +2470,12 @@ const Type *get_pointee(const Type *type) {
 }
 
 void named_type_destroy(Type *);
+void named_type_dump(const Type *);
 
 const TypeVtable NamedTypeVtable = {
     .kind = TK_NamedType,
     .dtor = named_type_destroy,
+    .dump = named_type_dump,
 };
 
 typedef struct {
@@ -2413,6 +2489,11 @@ void named_type_construct(NamedType *nt, const char *name) {
 }
 
 void named_type_destroy(Type *type) { free(((NamedType *)type)->name); }
+
+void named_type_dump(const Type *type) {
+  const NamedType *nt = (const NamedType *)type;
+  printf("NamedType name=%s\n", nt->name);
+}
 
 NamedType *create_named_type(const char *name) {
   NamedType *nt = malloc(sizeof(NamedType));
@@ -7157,10 +7238,15 @@ LLVMTypeRef get_llvm_array_type(Compiler *compiler, const ArrayType *at) {
     return get_opaque_ptr(compiler);
 
   ConstExprResult size = sema_eval_expr(compiler->sema, at->size);
-  assert(size.result_kind == RK_UnsignedLongLong);
-
   LLVMTypeRef elem = get_llvm_type(compiler, at->elem_type);
-  return LLVMArrayType(elem, (unsigned)size.result.ull);
+  switch (size.result_kind) {
+    case RK_UnsignedLongLong:
+      return LLVMArrayType(elem, (unsigned)size.result.ull);
+    case RK_Int:
+      return LLVMArrayType(elem, (unsigned)size.result.i);
+    case RK_Boolean:
+      return LLVMArrayType(elem, (unsigned)size.result.b);
+  }
 }
 
 LLVMTypeRef get_llvm_function_type(Compiler *compiler, const FunctionType *ft) {
@@ -7572,10 +7658,10 @@ LLVMValueRef compile_implicit_cast(Compiler *compiler, LLVMBuilderRef builder,
   LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, to);
   LLVMTypeRef llvm_from_ty = LLVMTypeOf(llvm_from);
 
-  if (llvm_to_ty == llvm_from_ty)
-    return llvm_from;  // TODO: Is this branch ever reached?
-
   if (LLVMGetTypeKind(llvm_from_ty) == LLVMPointerTypeKind) {
+    if (LLVMGetTypeKind(llvm_to_ty) == LLVMPointerTypeKind)
+      return llvm_from;
+
     if (LLVMGetTypeKind(llvm_to_ty) == LLVMIntegerTypeKind) {
       // TODO: Check the size.
       // unsigned int_width = LLVMGetIntTypeWidth(llvm_from_ty);
@@ -7607,7 +7693,7 @@ LLVMValueRef compile_implicit_cast(Compiler *compiler, LLVMBuilderRef builder,
   }
 
   printf("TODO: Handle this implicit cast\n");
-  LLVMDumpType(llvm_from_ty);
+  LLVMDumpValue(llvm_from);
   LLVMDumpType(llvm_to_ty);
   __builtin_trap();
 }
@@ -7970,7 +8056,7 @@ vector compile_call_args(Compiler *compiler, LLVMBuilderRef builder,
 
 LLVMValueRef call_llvm_debugtrap(Compiler *compiler, LLVMBuilderRef builder) {
   // FIXME: We should be able to do `sizeof(name)`.
-  const char name[] = "llvm.debugtrap";
+  const char *name = "llvm.debugtrap";
   unsigned intrinsic_id = LLVMLookupIntrinsicID(name, 14);
   LLVMValueRef intrinsic = LLVMGetIntrinsicDeclaration(
       compiler->mod, intrinsic_id, /*ParamTypes=*/NULL,
@@ -8048,6 +8134,10 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
 
       LLVMValueRef val =
           compile_lvalue_ptr(compiler, builder, expr, local_ctx, local_allocas);
+
+      if (sema_is_array_type(compiler->sema, decl_ty, local_ctx))
+        return val;
+
       return LLVMBuildLoad2(builder, type, val, "");
     }
     case EK_Call: {
@@ -8432,7 +8522,35 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
     }
     case SK_Declaration: {
       const Declaration *decl = (const Declaration *)stmt;
-      LLVMTypeRef llvm_ty = get_llvm_type(compiler, decl->type);
+
+      LLVMTypeRef llvm_ty = NULL;
+      if (sema_is_array_type(compiler->sema, decl->type, local_ctx)) {
+        const ArrayType *arr_ty =
+            sema_get_array_type(compiler->sema, decl->type, local_ctx);
+        if (!arr_ty->size) {
+          // Get the type from the initializer.
+          assert(decl->initializer);
+
+          if (decl->initializer->vtable->kind == EK_InitializerList) {
+            // Since this is an array, we can just get the first element.
+            const InitializerList *init =
+                (const InitializerList *)decl->initializer;
+
+            assert(init->elems.size > 0);
+            InitializerListElem *first_elem = vector_at(&init->elems, 0);
+            LLVMTypeRef elem_ty =
+                get_llvm_type_of_expr(compiler, first_elem->expr, local_ctx);
+            llvm_ty = LLVMArrayType(elem_ty, (unsigned)init->elems.size);
+          } else {
+            llvm_ty =
+                get_llvm_type_of_expr(compiler, decl->initializer, local_ctx);
+          }
+        }
+      }
+
+      if (!llvm_ty)
+        llvm_ty = get_llvm_type(compiler, decl->type);
+
       LLVMValueRef alloca =
           build_alloca_at_func_start(builder, decl->name, llvm_ty);
 
@@ -8473,8 +8591,10 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
             LLVMValueRef gep;
             if (is_array) {
               LLVMValueRef offsets[] = {
-                  LLVMConstInt(LLVMInt32Type(), i, /*IsSigned=*/0)};
-              gep = LLVMBuildGEP2(builder, llvm_ty, alloca, offsets, 1, "");
+                  LLVMConstNull(LLVMInt32Type()),
+                  LLVMConstInt(LLVMInt32Type(), i, /*IsSigned=*/0),
+              };
+              gep = LLVMBuildGEP2(builder, llvm_ty, alloca, offsets, 2, "");
             } else {
               LLVMValueRef offsets[] = {
                   LLVMConstNull(LLVMInt32Type()),
@@ -8645,12 +8765,14 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
       const Expr *base = index->base;
       const Type *base_ty =
           sema_get_type_of_expr_in_ctx(compiler->sema, base, local_ctx);
-      LLVMValueRef base_ptr =
-          compile_expr(compiler, builder, base, local_ctx, local_allocas);
-      assert(LLVMGetTypeKind(LLVMTypeOf(base_ptr)) == LLVMPointerTypeKind);
 
       LLVMValueRef idx =
           compile_expr(compiler, builder, index->idx, local_ctx, local_allocas);
+
+      LLVMValueRef base_ptr =
+          compile_expr(compiler, builder, base, local_ctx, local_allocas);
+
+      assert(LLVMGetTypeKind(LLVMTypeOf(base_ptr)) == LLVMPointerTypeKind);
 
       if (sema_is_pointer_type(compiler->sema, base_ty, local_ctx)) {
         LLVMValueRef offsets[] = {idx};
@@ -8661,11 +8783,15 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
         return LLVMBuildGEP2(builder, llvm_pointee_ty, base_ptr, offsets, 1,
                              "idx_ptr");
       } else if (sema_is_array_type(compiler->sema, base_ty, local_ctx)) {
-        LLVMValueRef offsets[] = {LLVMConstNull(LLVMInt32Type()), idx};
+        // TODO: This could probably be consolidated with the branch above.
 
-        LLVMTypeRef llvm_arr_ty = get_llvm_type(compiler, base_ty);
-        assert(LLVMGetTypeKind(llvm_arr_ty) == LLVMArrayTypeKind);
-        return LLVMBuildGEP2(builder, llvm_arr_ty, base_ptr, offsets, 2,
+        LLVMValueRef offsets[] = {idx};
+
+        const Type *elem_ty =
+            sema_get_array_type(compiler->sema, base_ty, local_ctx)->elem_type;
+
+        LLVMTypeRef llvm_elem_ty = get_llvm_type(compiler, elem_ty);
+        return LLVMBuildGEP2(builder, llvm_elem_ty, base_ptr, offsets, 1,
                              "idx_arr");
       }
 
@@ -8705,12 +8831,10 @@ void compile_global_variable(Compiler *compiler, const GlobalVariable *gv) {
 ///
 
 int main(int argc, char **argv) {
-  // printf("Running initial tests...");
   RunStringTests();
   RunVectorTests();
   RunTreeMapTests();
   RunParserTests();
-  // printf("PASSED\n");
 
   if (argc < 2) {
     printf("Usage: %s input_file\n", argv[0]);
