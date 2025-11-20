@@ -1,18 +1,5 @@
-typedef unsigned long long uint64_t;
-static_assert(sizeof(uint64_t) == 8);
-
-// This likely isn't the best size but it's suitable for 64-bit host.
-typedef unsigned long long size_t;
-static_assert(sizeof(size_t) == 8);
-
-typedef unsigned long long uintptr_t;
-static_assert(sizeof(uintptr_t) == sizeof(void *));
-
-typedef long long intptr_t;
-static_assert(sizeof(intptr_t) == sizeof(void *));
-
-typedef unsigned char uint8_t;
-static_assert(sizeof(uint8_t) == 1);
+#include <stddef.h>
+#include <stdint.h>
 
 // IO functions
 int printf(const char *, ...);
@@ -49,9 +36,6 @@ void assert(bool b) {
   if (!b)
     __builtin_trap();
 }
-
-// FIXME: This shold be a macro.
-void *const NULL = (void *)(0);
 
 // LLVM does not actually have a way of providing the CHAR_BIT for the arch.
 // Clang unconditionally sets it to 8.
@@ -1340,8 +1324,9 @@ typedef enum {
   TK_Continue,
   TK_Case,
   TK_Default,
-  TK_True,
+  TK_True,  // TODO: I believe these are macros instead of actual keywords.
   TK_False,
+  TK_Attribute,
 
   TK_Identifier,
 
@@ -1597,7 +1582,7 @@ Token lex(Lexer *lexer) {
   if (c == '.') {
     if (lexer_peek_then_consume_char(lexer, '.')) {
       if (!lexer_peek_then_consume_char(lexer, '.')) {
-        printf("%llu:%llu: Expected 3 '.' for elipses but found 2.", tok.line,
+        printf("%zu:%zu: Expected 3 '.' for elipses but found 2.", tok.line,
                tok.col);
         __builtin_trap();
       }
@@ -1716,6 +1701,14 @@ Token lex(Lexer *lexer) {
     if (lexer_peek_then_consume_char(lexer, '=')) {
       string_append_char(&tok.chars, '=');
       tok.kind = TK_Ge;
+    } else if (lexer_peek_then_consume_char(lexer, '>')) {
+      string_append_char(&tok.chars, '>');
+      if (lexer_peek_then_consume_char(lexer, '=')) {
+        string_append_char(&tok.chars, '=');
+        tok.kind = TK_RShiftAssign;
+      } else {
+        tok.kind = TK_RShift;
+      }
     } else {
       tok.kind = TK_Gt;
     }
@@ -1753,7 +1746,7 @@ Token lex(Lexer *lexer) {
     string_append_char(&tok.chars, (char)c);
 
     if (!lexer_peek_then_consume_char(lexer, '\'')) {
-      printf("%llu:%llu: Expected `'` for ending char.\n", tok.line, tok.col);
+      printf("%zu:%zu: Expected `'` for ending char.\n", tok.line, tok.col);
       __builtin_trap();
     }
 
@@ -1846,6 +1839,8 @@ Token lex(Lexer *lexer) {
     tok.kind = TK_Enum;
   } else if (string_equals(&tok.chars, "union")) {
     tok.kind = TK_Union;
+  } else if (string_equals(&tok.chars, "__attribute__")) {
+    tok.kind = TK_Attribute;
   } else if (string_equals(&tok.chars, "typedef")) {
     tok.kind = TK_Typedef;
   } else if (string_equals(&tok.chars, "struct")) {
@@ -2339,7 +2334,7 @@ void function_type_dump(const Type *type) {
   type_dump(ft->return_type);
   for (size_t i = 0; i < ft->pos_args.size; ++i) {
     FunctionArg *a = vector_at(&ft->pos_args, i);
-    printf("pos_arg i=%llu name=%s ", i, a->name);
+    printf("pos_arg i=%zu name=%s ", i, a->name);
     type_dump(a->type);
   }
   printf("</FunctionType>\n");
@@ -2543,7 +2538,7 @@ bool parser_has_named_type(const Parser *parser, const char *name) {
 
 static void expect_token(const Token *tok, TokenKind expected) {
   if (tok->kind != expected) {
-    printf("%llu:%llu: Expected token %d but found %d: '%s'\n", tok->line,
+    printf("%zu:%zu: Expected token %d but found %d: '%s'\n", tok->line,
            tok->col, expected, tok->kind, tok->chars.data);
     __builtin_trap();
   }
@@ -2584,7 +2579,7 @@ void parser_skip_next_token(Parser *parser) {
 void parser_consume_token(Parser *parser, TokenKind kind) {
   Token next = parser_pop_token(parser);
   if (next.kind != kind) {
-    printf("%llu:%llu: Expected token kind %d but found %d: '%s'\n", next.line,
+    printf("%zu:%zu: Expected token kind %d but found %d: '%s'\n", next.line,
            next.col, kind, next.kind, next.chars.data);
     __builtin_trap();
   }
@@ -3241,6 +3236,28 @@ typedef struct {
 Type *parse_type_for_declaration(Parser *parser, char **name,
                                  FoundStorageClasses *);
 
+// TODO: Don't handle attributes for now. Just consume them.
+void parser_consume_attribute(Parser* parser) {
+  parser_consume_token(parser, TK_Attribute);
+  parser_consume_token(parser, TK_LPar);
+  parser_consume_token(parser, TK_LPar);
+
+  // This is a cheeky way of just consuming the whole attribute.
+  // Consume tokens until we match the opening left parenthesis.
+  int par_count = 2;
+  for (; par_count;) {
+    Token tok = parser_pop_token(parser);
+
+    if (tok.kind == TK_RPar) {
+      par_count--;
+    } else if (tok.kind == TK_LPar) {
+      par_count++;
+    }
+
+    token_destroy(&tok);
+  }
+}
+
 void parse_struct_name_and_members(Parser *parser, char **name,
                                    vector **members) {
   assert(name);
@@ -3279,6 +3296,10 @@ void parse_struct_name_and_members(Parser *parser, char **name,
     member->type = member_ty;
     member->name = member_name;
     member->bitfield = bitfield;
+
+    if (parser_peek_token(parser)->kind == TK_Attribute) {
+      parser_consume_attribute(parser);
+    }
 
     parser_consume_token(parser, TK_Semicolon);
   }
@@ -3543,7 +3564,7 @@ Type *parse_specifiers_and_qualifiers_and_storage(
   } else {
     const Token *tok = parser_peek_token(parser);
     printf(
-        "%llu:%llu: parse_specifiers_and_qualifiers: Unhandled token (%d): "
+        "%zu:%zu: parse_specifiers_and_qualifiers: Unhandled token (%d): "
         "'%s'\n",
         tok->line, tok->col, tok->kind, tok->chars.data);
     __builtin_trap();
@@ -3623,7 +3644,7 @@ Type *parse_function_suffix(Parser *parser, Type *outer_ty,
       if (!next_token_is(parser, TK_RPar)) {
         const Token *peek = parser_peek_token(parser);
         printf(
-            "%llu:%llu: parse_function_suffix: '...' must be the last in the "
+            "%zu:%zu: parse_function_suffix: '...' must be the last in the "
             "parameter list; instead found '%s'.",
             peek->line, peek->col, peek->chars.data);
         __builtin_trap();
@@ -3821,6 +3842,9 @@ void alignof_destroy(Expr *expr) {
 // <sizeof> = "sizeof" "(" (<expr> | <type>) ")"
 //
 Expr *parse_sizeof(Parser *parser) {
+  size_t line = parser_peek_token(parser)->line;
+  size_t col = parser_peek_token(parser)->col;
+
   parser_consume_token(parser, TK_SizeOf);
   parser_consume_token(parser, TK_LPar);
 
@@ -3839,6 +3863,8 @@ Expr *parse_sizeof(Parser *parser) {
   parser_consume_token(parser, TK_RPar);
 
   sizeof_construct(so, expr_or_type, is_expr);
+  so->expr.line = line;
+  so->expr.col = col;
   return &so->expr;
 }
 
@@ -3846,6 +3872,9 @@ Expr *parse_sizeof(Parser *parser) {
 // <alignof> = "alignof" "(" (<expr> | <type>) ")"
 //
 Expr *parse_alignof(Parser *parser) {
+  size_t line = parser_peek_token(parser)->line;
+  size_t col = parser_peek_token(parser)->col;
+
   parser_consume_token(parser, TK_AlignOf);
   parser_consume_token(parser, TK_LPar);
 
@@ -3864,6 +3893,8 @@ Expr *parse_alignof(Parser *parser) {
   parser_consume_token(parser, TK_RPar);
 
   alignof_construct(ao, expr_or_type, is_expr);
+  ao->expr.line = line;
+  ao->expr.col = col;
   return &ao->expr;
 }
 
@@ -3978,6 +4009,9 @@ void binop_construct(BinOp *binop, Expr *lhs, Expr *rhs, BinOpKind op) {
   binop->lhs = lhs;
   binop->rhs = rhs;
   binop->op = op;
+
+  assert(lhs->line != 0 && lhs->col != 0);
+  assert(rhs->line != 0 && rhs->col != 0);
 }
 
 void binop_destroy(Expr *expr) {
@@ -4290,8 +4324,8 @@ Expr *parse_primary_expr(Parser *parser) {
     return &init->expr;
   }
 
-  printf("%llu:%llu: parse_primary_expr: Unhandled token (%d): '%s'\n",
-         tok->line, tok->col, tok->kind, tok->chars.data);
+  printf("%zu:%zu: parse_primary_expr: Unhandled token (%d): '%s'\n", tok->line,
+         tok->col, tok->kind, tok->chars.data);
   __builtin_trap();
   return NULL;
 }
@@ -4419,6 +4453,9 @@ vector parse_argument_list(Parser *parser) {
 //                | <postfix_expr> "--"
 //
 Expr *parse_postfix_expr_with_primary(Parser *parser, Expr *expr) {
+  size_t line = parser_peek_token(parser)->line;
+  size_t col = parser_peek_token(parser)->col;
+
   bool should_continue = true;
   for (; should_continue;) {
     const Token *tok = parser_peek_token(parser);
@@ -4455,8 +4492,6 @@ Expr *parse_postfix_expr_with_primary(Parser *parser, Expr *expr) {
       case TK_Dot:
       case TK_Arrow: {
         bool is_arrow = tok->kind == TK_Arrow;
-        size_t line = tok->line;
-        size_t col = tok->col;
 
         parser_consume_token(parser, tok->kind);
 
@@ -4465,8 +4500,6 @@ Expr *parse_postfix_expr_with_primary(Parser *parser, Expr *expr) {
 
         MemberAccess *member_access = malloc(sizeof(MemberAccess));
         member_access_construct(member_access, expr, id.chars.data, is_arrow);
-        member_access->expr.line = line;
-        member_access->expr.col = col;
         expr = &member_access->expr;
 
         token_destroy(&id);
@@ -4493,6 +4526,8 @@ Expr *parse_postfix_expr_with_primary(Parser *parser, Expr *expr) {
         should_continue = false;
     }
   }
+  expr->line = line;
+  expr->col = col;
   return expr;
 }
 
@@ -4508,6 +4543,9 @@ Expr *parse_postfix_expr(Parser *parser) {
 //             | "sizeof" "(" (<unary_expr> | <type>) ")"
 //
 Expr *parse_unary_expr(Parser *parser) {
+  size_t line = parser_peek_token(parser)->line;
+  size_t col = parser_peek_token(parser)->col;
+
   const Token *tok = parser_peek_token(parser);
 
   UnOpKind op;
@@ -4555,6 +4593,8 @@ Expr *parse_unary_expr(Parser *parser) {
 
   UnOp *unop = malloc(sizeof(UnOp));
   unop_construct(unop, expr, op);
+  unop->expr.line = line;
+  unop->expr.col = col;
   return &unop->expr;
 }
 
@@ -4626,6 +4666,9 @@ bool is_next_token_type_token(Parser *parser) {
 // expression surrounded by parenthesis since we need to know if the contents
 // after the LPar is a type or not.
 Expr *parse_cast_or_paren_expr(Parser *parser) {
+  size_t line = parser_peek_token(parser)->line;
+  size_t col = parser_peek_token(parser)->col;
+
   parser_consume_token(parser, TK_LPar);
 
   if (!is_next_token_type_token(parser)) {
@@ -4642,6 +4685,8 @@ Expr *parse_cast_or_paren_expr(Parser *parser) {
 
   Cast *cast = malloc(sizeof(Cast));
   cast_construct(cast, base, type);
+  cast->expr.line = line;
+  cast->expr.col = col;
   return &cast->expr;
 }
 
@@ -4652,10 +4697,15 @@ Expr *parse_cast_or_paren_expr(Parser *parser) {
 Expr *parse_cast_expr(Parser *parser) {
   const Token *tok = parser_peek_token(parser);
 
-  if (tok->kind == TK_LPar)
-    return parse_cast_or_paren_expr(parser);
+  if (tok->kind == TK_LPar) {
+    Expr* e = parse_cast_or_paren_expr(parser);
+    assert(e->line && e->col);
+    return e;
+  }
 
-  return parse_unary_expr(parser);
+  Expr* e = parse_unary_expr(parser);
+  assert(e->line && e->col);
+  return e;
 }
 
 //
@@ -4668,6 +4718,10 @@ Expr *parse_multiplicative_expr(Parser *parser) {
 
   Expr *expr = parse_cast_expr(parser);
   assert(expr);
+  if (!(expr->line && expr->col)) {
+    printf("line: %zu, col: %zu\n", expr->line, expr->col);
+  }
+  assert(expr->line && expr->col);
 
   const Token *token = parser_peek_token(parser);
   BinOpKind op;
@@ -4707,6 +4761,7 @@ Expr *parse_additive_expr(Parser *parser) {
 
   Expr *expr = parse_multiplicative_expr(parser);
   assert(expr);
+  assert(expr->line && expr->col);
 
   const Token *token = parser_peek_token(parser);
   BinOpKind op;
@@ -4740,9 +4795,11 @@ Expr *parse_additive_expr(Parser *parser) {
 Expr *parse_shift_expr(Parser *parser) {
   size_t line = parser_peek_token(parser)->line;
   size_t col = parser_peek_token(parser)->col;
+  assert(line && col);
 
   Expr *expr = parse_additive_expr(parser);
   assert(expr);
+  assert(expr->line && expr->col);
 
   const Token *token = parser_peek_token(parser);
   BinOpKind op;
@@ -4987,6 +5044,9 @@ Expr *parse_logical_or_expr(Parser *parser) {
 //                    | <logical_or_expr> "?" <expr> ":" <conditional_expr>
 //
 Expr *parse_conditional_expr(Parser *parser) {
+  size_t line = parser_peek_token(parser)->line;
+  size_t col = parser_peek_token(parser)->col;
+
   Expr *expr = parse_logical_or_expr(parser);
   assert(expr);
 
@@ -5006,7 +5066,8 @@ Expr *parse_conditional_expr(Parser *parser) {
 
   Conditional *cond = malloc(sizeof(Conditional));
   conditional_construct(cond, expr, true_expr, false_expr);
-
+  cond->expr.line = line;
+  cond->expr.col = col;
   return &cond->expr;
 }
 
@@ -5023,6 +5084,7 @@ Expr *parse_assignment_expr(Parser *parser) {
 
   Expr *expr = parse_conditional_expr(parser);
   assert(expr);
+  assert(expr->line && expr->col);
 
   BinOpKind op;
   const Token *token = parser_peek_token(parser);
@@ -5244,7 +5306,7 @@ Statement *parse_statement(Parser *parser) {
           // warn on missing fallthroughs.
           parser_consume_token(parser, TK_Identifier);
         } else {
-          printf("%llu:%llu: Unknown attribute '%s'\n", attr->line, attr->col,
+          printf("%zu:%zu: Unknown attribute '%s'\n", attr->line, attr->col,
                  attr->chars.data);
           __builtin_trap();
         }
@@ -5400,7 +5462,7 @@ Node *parse_global_variable_or_function_definition(Parser *parser) {
 
   if (storage.auto_) {
     const Token *tok = parser_peek_token(parser);
-    printf("%llu:%llu: 'auto' can only be used at block scope\n", tok->line,
+    printf("%zu:%zu: 'auto' can only be used at block scope\n", tok->line,
            tok->col);
     __builtin_trap();
   }
@@ -5481,7 +5543,7 @@ Node *parse_top_level_decl(Parser *parser) {
     return node;
   }
 
-  printf("%llu:%llu: parse_top_level_decl: Unhandled token (%d): '%s'\n",
+  printf("%zu:%zu: parse_top_level_decl: Unhandled token (%d): '%s'\n",
          token->line, token->col, token->kind, token->chars.data);
   __builtin_trap();
   return NULL;
@@ -6591,7 +6653,7 @@ const Type *sema_get_type_of_binop_expr(Sema *sema, const BinOp *expr,
     case BOK_RShift:
       return lhs_ty;
     default:
-      printf("TODO: Implement get type for binop kind %d on %llu:%llu\n",
+      printf("TODO: Implement get type for binop kind %d on %zu:%zu\n",
              expr->op, expr->expr.line, expr->expr.col);
       __builtin_trap();
   }
@@ -7601,18 +7663,22 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
       LLVMValueRef ones = LLVMConstAllOnes(LLVMTypeOf(val));
       return LLVMBuildXor(builder, val, ones, "");
     }
+    case UOK_PreDec:
+    case UOK_PostDec:
     case UOK_PreInc:
     case UOK_PostInc: {
-      bool is_pre = expr->op == UOK_PreInc;
+      bool is_pre = expr->op == UOK_PreInc || expr->op == UOK_PreDec;
+      bool is_inc = expr->op == UOK_PreInc || expr->op == UOK_PostInc;
       LLVMValueRef ptr = compile_lvalue_ptr(compiler, builder, expr->subexpr,
                                             local_ctx, local_allocas);
       LLVMTypeRef llvm_type =
           get_llvm_type_of_expr(compiler, expr->subexpr, local_ctx);
       LLVMValueRef val = LLVMBuildLoad2(builder, llvm_type, ptr, "");
       LLVMValueRef one = LLVMConstInt(llvm_type, 1, /*signed=*/0);
-      LLVMValueRef inc = LLVMBuildAdd(builder, val, one, "");
-      LLVMBuildStore(builder, inc, ptr);
-      return is_pre ? inc : val;
+      LLVMValueRef postop = is_inc ? LLVMBuildAdd(builder, val, one, "")
+                                   : LLVMBuildSub(builder, val, one, "");
+      LLVMBuildStore(builder, postop, ptr);
+      return is_pre ? postop : val;
     }
     case UOK_Negate: {
       LLVMValueRef val = compile_expr(compiler, builder, expr->subexpr,
@@ -7687,7 +7753,13 @@ LLVMValueRef compile_implicit_cast(Compiler *compiler, LLVMBuilderRef builder,
       unsigned from_size = LLVMGetIntTypeWidth(llvm_from_ty);
       LLVMTargetDataRef data_layout = LLVMGetModuleDataLayout(compiler->mod);
       unsigned ptr_size = LLVMPointerSize(data_layout) * kCharBit;
-      assert(from_size == ptr_size);
+
+      assert(from_size <= ptr_size);
+
+      if (from_size < ptr_size)
+        llvm_from =
+            LLVMBuildZExt(builder, llvm_from, LLVMIntType(ptr_size), "");
+
       return LLVMBuildIntToPtr(builder, llvm_from, llvm_to_ty, "");
     }
   }
