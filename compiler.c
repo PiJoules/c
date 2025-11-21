@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -24,11 +25,6 @@ void *memcpy(void *, const void *, size_t);
 void *memset(void *, int ch, size_t);
 int strcmp(const char *, const char *);
 char *strdup(const char *);
-
-// ctype.h functions
-int isspace(int);
-int isalnum(int);
-int isdigit(int);
 
 unsigned long long strtoull(const char *restrict, char **restrict, int);
 
@@ -205,6 +201,8 @@ LLVMValueRef LLVMBuildSRem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                            const char *Name);
 LLVMValueRef LLVMBuildShl(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                           const char *Name);
+LLVMValueRef LLVMBuildAShr(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
+                           const char* Name);
 LLVMValueRef LLVMGetLastInstruction(LLVMBasicBlockRef BB);
 LLVMValueRef LLVMConstStruct(LLVMValueRef *ConstantVals, unsigned Count,
                              LLVMBool Packed);
@@ -2639,6 +2637,7 @@ typedef enum {
   NK_GlobalVariable,  // Also accounts for function decls, but not function defs
   NK_FunctionDefinition,
   NK_StructDeclaration,
+  NK_EnumDeclaration,
 } NodeKind;
 
 struct Node;
@@ -3142,6 +3141,29 @@ void struct_declaration_destroy(Node *node) {
   type_destroy(&decl->type.type);
 }
 
+void enum_declaration_destroy(Node*);
+
+const NodeVtable EnumDeclarationVtable = {
+    .kind = NK_EnumDeclaration,
+    .dtor = enum_declaration_destroy,
+};
+
+typedef struct {
+  Node node;
+  EnumType type;
+} EnumDeclaration;
+
+void enum_declaration_construct(EnumDeclaration* decl, char* name,
+                                vector* members) {
+  node_construct(&decl->node, &EnumDeclarationVtable);
+  enum_type_construct(&decl->type, name, members);
+}
+
+void enum_declaration_destroy(Node* node) {
+  EnumDeclaration* decl = (EnumDeclaration*)node;
+  type_destroy(&decl->type.type);
+}
+
 void function_definition_destroy(Node *);
 
 const NodeVtable FunctionDefinitionVtable = {
@@ -3317,29 +3339,28 @@ StructType *parse_struct_type(Parser *parser) {
   return struct_ty;
 }
 
-EnumType *parse_enum_type(Parser *parser) {
+void parse_enum_name_and_members(Parser* parser, char** name,
+                                 vector** members) {
+  assert(name);
+  assert(members);
+
   parser_consume_token(parser, TK_Enum);
 
-  const Token *peek = parser_peek_token(parser);
-  char *name;
+  const Token* peek = parser_peek_token(parser);
   if (peek->kind == TK_Identifier) {
-    name = strdup(peek->chars.data);
+    *name = strdup(peek->chars.data);
     parser_consume_token(parser, TK_Identifier);
   } else {
-    name = NULL;
+    *name = NULL;
   }
 
-  EnumType *enum_ty = malloc(sizeof(EnumType));
-
-  if (!next_token_is(parser, TK_LCurlyBrace)) {
-    enum_type_construct(enum_ty, name, /*members=*/NULL);
-    return enum_ty;
-  }
+  if (!next_token_is(parser, TK_LCurlyBrace))
+    return;
 
   parser_consume_token(parser, TK_LCurlyBrace);
 
-  vector *members = malloc(sizeof(vector));
-  vector_construct(members, sizeof(EnumMember), alignof(EnumMember));
+  *members = malloc(sizeof(vector));
+  vector_construct(*members, sizeof(EnumMember), alignof(EnumMember));
   for (; !next_token_is(parser, TK_RCurlyBrace);) {
     Token next = parser_pop_token(parser);
     assert(next.kind == TK_Identifier);
@@ -3357,7 +3378,7 @@ EnumType *parse_enum_type(Parser *parser) {
       member_val = NULL;
     }
 
-    EnumMember *member = vector_append_storage(members);
+    EnumMember* member = vector_append_storage(*members);
     member->name = member_name;
     member->value = member_val;
 
@@ -3365,7 +3386,14 @@ EnumType *parse_enum_type(Parser *parser) {
   }
 
   parser_consume_token(parser, TK_RCurlyBrace);
+}
 
+EnumType* parse_enum_type(Parser* parser) {
+  char* name = NULL;
+  vector* members = NULL;
+  parse_enum_name_and_members(parser, &name, &members);
+
+  EnumType* enum_ty = malloc(sizeof(EnumType));
   enum_type_construct(enum_ty, name, members);
   return enum_ty;
 }
@@ -3667,6 +3695,22 @@ Type *parse_function_suffix(Parser *parser, Type *outer_ty,
 
   parser_consume_token(parser, TK_RPar);
 
+  // https://gcc.gnu.org/onlinedocs/gcc/Attribute-Syntax.html
+  //
+  // An attribute specifier list may appear immediately before the comma, ‘=’,
+  // or semicolon terminating the declaration of an identifier other than a
+  // function definition. Such attribute specifiers apply to the declared object
+  // or function. Where an assembler name for an object or function is specified
+  // (see Controlling Names Used in Assembler Code), the attribute must follow
+  // the asm specification.
+  bool found_attr = parser_peek_token(parser)->kind == TK_Attribute;
+
+  for (; parser_peek_token(parser)->kind == TK_Attribute;)
+    parser_consume_attribute(parser);
+
+  if (found_attr)
+    assert(parser_peek_token(parser)->kind == TK_Semicolon);
+
   // <blank> is a function (with params ...) returning <outer_ty>
   FunctionType *func = malloc(sizeof(FunctionType));
   function_type_construct(func, outer_ty, param_tys);
@@ -3760,21 +3804,6 @@ Type *parse_type_for_declaration(Parser *parser, char **name,
                                              /*type_usage_addr=*/NULL);
   return parse_declarator(parser, type, name, /*type_usage_addr=*/NULL);
 }
-
-// Example: struct TreeMapNode *left, *right
-//
-// `names` is an optional pointer to an array of strings. If provided, and at
-// least one name is found, the address of this malloc'd array will be stored
-// at `names` and the number of names found stored in `num_names`. Callers are
-// in charge of freeing both the array (*names) and each of the individual
-// strings in this array ((*names)[i]).
-// Type *parse_declarations(Parser *parser, char ***names, size_t *num_names,
-//                         FoundStorageClasses *storage) {
-//  Type *type = parse_specifiers_and_qualifiers_and_storage(parser, storage);
-//  type = maybe_parse_pointers_and_qualifiers(parser, type,
-//                                             /*type_usage_addr=*/NULL);
-//  return parse_declarator(parser, type, name, /*type_usage_addr=*/NULL);
-//}
 
 Type *parse_type(Parser *parser) {
   return parse_type_for_declaration(parser, /*name=*/NULL, /*storage=*/NULL);
@@ -5455,9 +5484,15 @@ Statement *parse_compound_stmt(Parser *parser) {
 }
 
 Node *parse_global_variable_or_function_definition(Parser *parser) {
+  size_t line = parser_peek_token(parser)->line;
+  size_t col = parser_peek_token(parser)->col;
+
   char *name = NULL;
   FoundStorageClasses storage = {};
   Type *type = parse_type_for_declaration(parser, &name, &storage);
+  if (!name) {
+    printf("No name for global on %zu:%zu\n", line, col);
+  }
   assert(name);
 
   if (storage.auto_) {
@@ -5512,6 +5547,16 @@ Node *parse_struct_declaration(Parser *parser) {
   return &decl->node;
 }
 
+Node* parse_enum_declaration(Parser* parser) {
+  char* name = NULL;
+  vector* members = NULL;
+  parse_enum_name_and_members(parser, &name, &members);
+
+  EnumDeclaration* decl = malloc(sizeof(EnumDeclaration));
+  enum_declaration_construct(decl, name, members);
+  return &decl->node;
+}
+
 // NOTE: Callers of this function are in charge of destroying and freeing the
 // poiner.
 Node *parse_top_level_decl(Parser *parser) {
@@ -5528,6 +5573,9 @@ Node *parse_top_level_decl(Parser *parser) {
       break;
     case TK_Struct:
       node = parse_struct_declaration(parser);
+      break;
+    case TK_Enum:
+      node = parse_enum_declaration(parser);
       break;
     default:
       if (is_token_type_token(parser, token) ||
@@ -6368,7 +6416,7 @@ void sema_handle_struct_declaration(Sema *sema, StructDeclaration *decl) {
   sema_handle_struct_declaration_impl(sema, &decl->type);
 }
 
-void sema_handle_enum_declaration(Sema *sema, EnumType *enum_ty) {
+void sema_handle_enum_declaration_impl(Sema* sema, EnumType* enum_ty) {
   if (!enum_ty->members)
     return;
 
@@ -6412,6 +6460,10 @@ void sema_handle_enum_declaration(Sema *sema, EnumType *enum_ty) {
   }
 }
 
+void sema_handle_enum_declaration(Sema* sema, EnumDeclaration* decl) {
+  sema_handle_enum_declaration_impl(sema, &decl->type);
+}
+
 void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
   if (tree_map_get(&sema->typedef_types, name, NULL)) {
     printf("sema_add_typedef_type: typedef for '%s' already exists\n", name);
@@ -6423,7 +6475,7 @@ void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
     sema_handle_struct_declaration_impl(sema, struct_ty);
   } else if (type->vtable->kind == TK_EnumType) {
     EnumType *enum_ty = (EnumType *)type;
-    sema_handle_enum_declaration(sema, enum_ty);
+    sema_handle_enum_declaration_impl(sema, enum_ty);
   }
 
   switch (type->vtable->kind) {
@@ -7080,6 +7132,21 @@ ConstExprResult sema_eval_binop(Sema *sema, const BinOp *expr) {
           return lhs;
       }
       break;
+    case BOK_RShift:
+      switch (lhs.result_kind) {
+        case RK_Boolean:
+          printf("Cannot shift boolean\n");
+          __builtin_trap();
+        case RK_Int:
+          assert(sizeof(int) * 8 > result_to_u64(&rhs));
+          lhs.result.i >>= result_to_u64(&rhs);
+          return lhs;
+        case RK_UnsignedLongLong:
+          assert(sizeof(unsigned long long) * 8 > result_to_u64(&rhs));
+          lhs.result.ull >>= result_to_u64(&rhs);
+          return lhs;
+      }
+      break;
     case BOK_BitwiseOr:
       assert(lhs.result_kind == rhs.result_kind);
       switch (lhs.result_kind) {
@@ -7094,6 +7161,23 @@ ConstExprResult sema_eval_binop(Sema *sema, const BinOp *expr) {
           return lhs;
       }
       break;
+    case BOK_Lt: {
+      assert(lhs.result_kind == rhs.result_kind);
+      switch (lhs.result_kind) {
+        case RK_Boolean:
+          printf("TODO: Check if booleans can be compared %zu:%zu\n",
+                 expr->expr.line, expr->expr.col);
+          __builtin_trap();
+        case RK_Int:
+          lhs.result.b = lhs.result.i < rhs.result.i;
+          lhs.result_kind = RK_Boolean;
+          return lhs;
+        case RK_UnsignedLongLong:
+          lhs.result.b = lhs.result.ull < rhs.result.ull;
+          lhs.result_kind = RK_Boolean;
+          return lhs;
+      }
+    }
     default:
       printf(
           "TODO: Implement constant evaluation for the remaining binops %d\n",
@@ -7187,6 +7271,13 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
 
       printf("Unknown global '%s'\n", decl->name);
       __builtin_trap();
+    }
+    case EK_Conditional: {
+      const Conditional* conditional = (const Conditional*)expr;
+      ConstExprResult cond_res = sema_eval_expr(sema, conditional->cond);
+      assert(cond_res.result_kind == RK_Boolean);
+      return sema_eval_expr(sema, cond_res.result.b ? conditional->true_expr
+                                                    : conditional->false_expr);
     }
     default:
       printf(
@@ -8060,10 +8151,15 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
       LLVMBuildStore(builder, res, lhs);
       break;
     }
-    case BOK_LShiftAssign: {
+    case BOK_LShiftAssign:
+    case BOK_RShiftAssign: {
       LLVMTypeRef llvm_lhs_ty = get_llvm_type(compiler, lhs_ty);
       LLVMValueRef lhs_val = LLVMBuildLoad2(builder, llvm_lhs_ty, lhs, "");
-      res = LLVMBuildShl(builder, lhs_val, rhs, "");
+      if (expr->op == BOK_LShiftAssign) {
+        res = LLVMBuildShl(builder, lhs_val, rhs, "");
+      } else {
+        res = LLVMBuildAShr(builder, lhs_val, rhs, "");
+      }
       LLVMBuildStore(builder, res, lhs);
       break;
     }
@@ -9003,6 +9099,11 @@ int main(int argc, char **argv) {
         case NK_StructDeclaration: {
           StructDeclaration *decl = (StructDeclaration *)top_level_decl;
           sema_handle_struct_declaration(&sema, decl);
+          break;
+        }
+        case NK_EnumDeclaration: {
+          EnumDeclaration* decl = (EnumDeclaration*)top_level_decl;
+          sema_handle_enum_declaration(&sema, decl);
           break;
         }
       }
