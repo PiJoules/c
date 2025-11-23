@@ -1,6 +1,7 @@
 #include <ctype.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 // IO functions
 int printf(const char *, ...);
@@ -12,11 +13,6 @@ void *fopen(const char *, const char *);
 int fclose(void *);
 int fgetc(void *);
 int feof(void *);
-
-// Alloc functions
-void *malloc(size_t);
-void *realloc(void *, size_t);
-void free(void *);
 
 // String functions
 size_t strlen(const char *);
@@ -67,6 +63,7 @@ typedef enum {
 LLVMBool LLVMVerifyModule(LLVMModuleRef M, LLVMVerifierFailureAction Action,
                           char **OutMessage);
 LLVMBool LLVMVerifyFunction(LLVMValueRef Fn, LLVMVerifierFailureAction Action);
+LLVMBool LLVMIsConstant(LLVMValueRef Val);
 void LLVMDumpValue(LLVMValueRef Val);
 void LLVMDumpType(LLVMTypeRef Val);
 void LLVMDumpModule(LLVMModuleRef M);
@@ -93,6 +90,7 @@ LLVMValueRef LLVMGetNamedGlobal(LLVMModuleRef M, const char *Name);
 char *LLVMPrintModuleToString(LLVMModuleRef M);
 char *LLVMPrintValueToString(LLVMValueRef Val);
 void LLVMDisposeMessage(char *Message);
+LLVMBool LLVMTypeIsSized(LLVMTypeRef Ty);
 LLVMTypeRef LLVMVoidType(void);
 LLVMTypeRef LLVMInt1Type();
 LLVMTypeRef LLVMInt8Type();
@@ -145,6 +143,7 @@ LLVMValueRef LLVMConstNull(LLVMTypeRef Ty);
 LLVMValueRef LLVMConstAllOnes(LLVMTypeRef Ty);
 LLVMValueRef LLVMGetParam(LLVMValueRef Fn, unsigned Index);
 void LLVMSetValueName2(LLVMValueRef Val, const char *Name, size_t NameLen);
+const char* LLVMGetValueName2(LLVMValueRef Val, size_t* Length);
 LLVMValueRef LLVMBuildAlloca(LLVMBuilderRef, LLVMTypeRef Ty, const char *Name);
 LLVMValueRef LLVMBuildStore(LLVMBuilderRef, LLVMValueRef Val, LLVMValueRef Ptr);
 LLVMValueRef LLVMBuildLoad2(LLVMBuilderRef, LLVMTypeRef Ty,
@@ -204,6 +203,7 @@ LLVMValueRef LLVMBuildShl(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
 LLVMValueRef LLVMBuildAShr(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
                            const char* Name);
 LLVMValueRef LLVMGetLastInstruction(LLVMBasicBlockRef BB);
+LLVMValueRef LLVMGetFirstInstruction(LLVMBasicBlockRef BB);
 LLVMValueRef LLVMConstStruct(LLVMValueRef *ConstantVals, unsigned Count,
                              LLVMBool Packed);
 LLVMValueRef LLVMBuildMemSet(LLVMBuilderRef B, LLVMValueRef Ptr,
@@ -477,6 +477,9 @@ typedef enum {
   LLVMDWARFEmissionFull,
   LLVMDWARFEmissionLineTablesOnly
 } LLVMDWARFEmissionKind;
+LLVMMetadataRef LLVMDIBuilderCreateUnspecifiedType(LLVMDIBuilderRef Builder,
+                                                   const char* Name,
+                                                   size_t NameLen);
 LLVMMetadataRef LLVMDIBuilderCreateFunction(
     LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, const char *Name,
     size_t NameLen, const char *LinkageName, size_t LinkageNameLen,
@@ -497,6 +500,21 @@ LLVMMetadataRef LLVMDIBuilderCreateFile(LLVMDIBuilderRef Builder,
                                         const char *Directory,
                                         size_t DirectoryLen);
 LLVMMetadataRef LLVMDIScopeGetFile(LLVMMetadataRef Scope);
+LLVMMetadataRef LLVMGetSubprogram(LLVMValueRef Func);
+void LLVMSetSubprogram(LLVMValueRef Func, LLVMMetadataRef SP);
+LLVMMetadataRef LLVMDIBuilderCreateDebugLocation(LLVMContextRef Ctx,
+                                                 unsigned Line, unsigned Column,
+                                                 LLVMMetadataRef Scope,
+                                                 LLVMMetadataRef InlinedAt);
+void LLVMInstructionSetDebugLoc(LLVMValueRef Inst, LLVMMetadataRef Loc);
+void LLVMDIBuilderFinalize(LLVMDIBuilderRef Builder);
+void LLVMDIBuilderFinalizeSubprogram(LLVMDIBuilderRef Builder,
+                                     LLVMMetadataRef Subprogram);
+void LLVMSetCurrentDebugLocation2(LLVMBuilderRef Builder, LLVMMetadataRef Loc);
+LLVMMetadataRef LLVMDIBuilderCreateSubroutineType(
+    LLVMDIBuilderRef Builder, LLVMMetadataRef File,
+    LLVMMetadataRef* ParameterTypes, unsigned NumParameterTypes,
+    LLVMDIFlags Flags);
 
 ///
 /// Start Vector Implementation
@@ -1244,7 +1262,8 @@ typedef enum {
   TK_Long,
   TK_Float,
   TK_Double,
-  TK_LongDouble,
+  TK_Complex,
+  TK_Float128,
   TK_Void,
   TK_Bool,
   TK_BuiltinTypesLast = TK_Bool,
@@ -1325,6 +1344,8 @@ typedef enum {
   TK_True,  // TODO: I believe these are macros instead of actual keywords.
   TK_False,
   TK_Attribute,
+  TK_Extension,
+  TK_Inline,
 
   TK_Identifier,
 
@@ -1796,8 +1817,28 @@ Token lex(Lexer *lexer) {
   if (isdigit(c)) {
     tok.kind = TK_IntLiteral;
 
-    for (; isdigit(lexer_peek_char(lexer));)
+    if (lexer_peek_char(lexer) == 'x' || lexer_peek_char(lexer) == 'X') {
       string_append_char(&tok.chars, (char)lexer_get_char(lexer));
+      for (;;) {
+        char c = (char)lexer_peek_char(lexer);
+        if (isdigit(c) || ('a' <= c && c <= 'f') || ('A' <= c && c <= 'F'))
+          string_append_char(&tok.chars, (char)lexer_get_char(lexer));
+        else
+          break;
+      }
+    } else {
+      for (; isdigit(lexer_peek_char(lexer));)
+        string_append_char(&tok.chars, (char)lexer_get_char(lexer));
+    }
+
+    if (lexer_peek_char(lexer) == 'u')
+      string_append_char(&tok.chars, (char)lexer_get_char(lexer));
+
+    if (lexer_peek_char(lexer) == 'l') {
+      string_append_char(&tok.chars, (char)lexer_get_char(lexer));
+      if (lexer_peek_char(lexer) == 'l')
+        string_append_char(&tok.chars, (char)lexer_get_char(lexer));
+    }
 
     return tok;
   }
@@ -1825,13 +1866,18 @@ Token lex(Lexer *lexer) {
     tok.kind = TK_Float;
   } else if (string_equals(&tok.chars, "double")) {
     tok.kind = TK_Double;
+  } else if (string_equals(&tok.chars, "_Complex")) {
+    tok.kind = TK_Complex;
+  } else if (string_equals(&tok.chars, "__float128")) {
+    tok.kind = TK_Float128;
   } else if (string_equals(&tok.chars, "void")) {
     tok.kind = TK_Void;
   } else if (string_equals(&tok.chars, "const")) {
     tok.kind = TK_Const;
   } else if (string_equals(&tok.chars, "volatile")) {
     tok.kind = TK_Volatile;
-  } else if (string_equals(&tok.chars, "restrict")) {
+  } else if (string_equals(&tok.chars, "restrict") ||
+             string_equals(&tok.chars, "__restrict")) {
     tok.kind = TK_Restrict;
   } else if (string_equals(&tok.chars, "enum")) {
     tok.kind = TK_Enum;
@@ -1839,6 +1885,10 @@ Token lex(Lexer *lexer) {
     tok.kind = TK_Union;
   } else if (string_equals(&tok.chars, "__attribute__")) {
     tok.kind = TK_Attribute;
+  } else if (string_equals(&tok.chars, "__extension__")) {
+    tok.kind = TK_Extension;
+  } else if (string_equals(&tok.chars, "__inline")) {
+    tok.kind = TK_Inline;
   } else if (string_equals(&tok.chars, "typedef")) {
     tok.kind = TK_Typedef;
   } else if (string_equals(&tok.chars, "struct")) {
@@ -1903,6 +1953,7 @@ typedef enum {
   TK_NamedType,  // Named from a typedef
   TK_StructType,
   TK_EnumType,
+  TK_UnionType,
   TK_PointerType,
   TK_ArrayType,
   TK_FunctionType,
@@ -2001,6 +2052,10 @@ typedef enum {
   BTK_Float,
   BTK_Double,
   BTK_LongDouble,
+  BTK_Float128,
+  BTK_ComplexFloat,
+  BTK_ComplexDouble,
+  BTK_ComplexLongDouble,
   BTK_Void,
   BTK_Bool,
 } BuiltinTypeKind;
@@ -2131,13 +2186,13 @@ struct Expr;
 
 typedef struct {
   Type *type;
-  char *name;  // Optional. Allocated by the creator of this StructMember.
+  char* name;             // Optional. Allocated by the creator of this Member.
   struct Expr *bitfield;  // Optional.
-} StructMember;
+} Member;
 
 void expr_destroy(struct Expr *);
 
-void struct_member_destroy(StructMember *member) {
+void struct_member_destroy(Member* member) {
   if (member->name)
     free(member->name);
 
@@ -2154,7 +2209,7 @@ typedef struct {
   Type type;
   char *name;  // Optional.
 
-  // This is a vector of StructMembers.
+  // This is a vector of Members.
   // NULL indicates this is a struct declaration but not definition.
   vector *members;
 
@@ -2181,7 +2236,7 @@ void struct_type_destroy(Type *type) {
 
   if (st->members) {
     for (size_t i = 0; i < st->members->size; ++i) {
-      StructMember *sm = vector_at(st->members, i);
+      Member* sm = vector_at(st->members, i);
       struct_member_destroy(sm);
     }
     vector_destroy(st->members);
@@ -2194,23 +2249,103 @@ void struct_type_dump(const Type *type) {
   printf("<StructType name=%s packed=%d>\n", st->name, st->packed);
   if (st->members) {
     for (size_t i = 0; i < st->members->size; ++i) {
-      StructMember *sm = vector_at(st->members, i);
-      printf("StructMember name=%s type=\n", sm->name);
+      Member* sm = vector_at(st->members, i);
+      printf("Member name=%s type=\n", sm->name);
       type_dump(sm->type);
     }
   }
   printf("</StructType>\n");
 }
 
-const StructMember *struct_get_member(const StructType *st, const char *name,
-                                      size_t *offset) {
+const Member* struct_get_member(const StructType* st, const char* name,
+                                size_t* offset) {
   if (!st->members) {
     printf("No members in struct '%s'\n", st->name);
     __builtin_trap();
   }
 
   for (size_t i = 0; i < st->members->size; ++i) {
-    const StructMember *member = vector_at(st->members, i);
+    const Member* member = vector_at(st->members, i);
+    if (strcmp(member->name, name) == 0) {
+      if (offset)
+        *offset = i;
+      return member;
+    }
+  }
+
+  printf("No member named '%s'\n", name);
+  __builtin_trap();
+}
+
+void union_type_destroy(Type*);
+void union_type_dump(const Type*);
+
+const TypeVtable UnionTypeVtable = {
+    .kind = TK_UnionType,
+    .dtor = union_type_destroy,
+    .dump = union_type_dump,
+};
+
+typedef struct {
+  Type type;
+  char* name;  // Optional.
+
+  // This is a vector of Members.
+  // NULL indicates this is a struct declaration but not definition.
+  vector* members;
+
+  bool packed;
+} UnionType;
+
+void union_type_construct(UnionType* ut, char* name, vector* members) {
+  type_construct(&ut->type, &UnionTypeVtable);
+  ut->name = name;
+  ut->members = members;
+
+  // Empty unions are not allowed in C, though most compilers offer this as an
+  // extension.
+  if (members)
+    assert(members->size > 0);
+
+  ut->packed = false;
+}
+
+// TODO: Much of these methods can be shared between unions and structs.
+void union_type_destroy(Type* type) {
+  UnionType* ut = (UnionType*)type;
+
+  if (ut->name)
+    free(ut->name);
+
+  if (ut->members) {
+    for (size_t i = 0; i < ut->members->size; ++i) {
+      Member* sm = vector_at(ut->members, i);
+      struct_member_destroy(sm);
+    }
+    vector_destroy(ut->members);
+    free(ut->members);
+  }
+}
+
+void union_type_dump(const Type* type) {
+  const UnionType* ut = (const UnionType*)type;
+  printf("<UnionType name=%s packed=%d>\n", ut->name, ut->packed);
+  if (ut->members) {
+    for (size_t i = 0; i < ut->members->size; ++i) {
+      Member* sm = vector_at(ut->members, i);
+      printf("Member name=%s type=\n", sm->name);
+      type_dump(sm->type);
+    }
+  }
+  printf("</UnionType>\n");
+}
+
+const Member* union_get_member(const UnionType* ut, const char* name,
+                               size_t* offset) {
+  assert(ut->members);
+
+  for (size_t i = 0; i < ut->members->size; ++i) {
+    const Member* member = vector_at(ut->members, i);
     if (strcmp(member->name, name) == 0) {
       if (offset)
         *offset = i;
@@ -2638,6 +2773,7 @@ typedef enum {
   NK_FunctionDefinition,
   NK_StructDeclaration,
   NK_EnumDeclaration,
+  NK_UnionDeclaration,
 } NodeKind;
 
 struct Node;
@@ -3164,6 +3300,29 @@ void enum_declaration_destroy(Node* node) {
   type_destroy(&decl->type.type);
 }
 
+void union_declaration_destroy(Node*);
+
+const NodeVtable UnionDeclarationVtable = {
+    .kind = NK_UnionDeclaration,
+    .dtor = union_declaration_destroy,
+};
+
+typedef struct {
+  Node node;
+  UnionType type;
+} UnionDeclaration;
+
+void union_declaration_construct(UnionDeclaration* decl, char* name,
+                                 vector* members) {
+  node_construct(&decl->node, &UnionDeclarationVtable);
+  union_type_construct(&decl->type, name, members);
+}
+
+void union_declaration_destroy(Node* node) {
+  UnionDeclaration* decl = (UnionDeclaration*)node;
+  type_destroy(&decl->type.type);
+}
+
 void function_definition_destroy(Node *);
 
 const NodeVtable FunctionDefinitionVtable = {
@@ -3280,12 +3439,13 @@ void parser_consume_attribute(Parser* parser) {
   }
 }
 
-void parse_struct_name_and_members(Parser *parser, char **name,
-                                   vector **members) {
+void parse_struct_or_union_name_and_members_impl(Parser* parser, char** name,
+                                                 vector** members,
+                                                 bool is_struct) {
   assert(name);
   assert(members);
 
-  parser_consume_token(parser, TK_Struct);
+  parser_consume_token(parser, is_struct ? TK_Struct : TK_Union);
 
   const Token *peek = parser_peek_token(parser);
   if (peek->kind == TK_Identifier) {
@@ -3301,8 +3461,15 @@ void parse_struct_name_and_members(Parser *parser, char **name,
   parser_consume_token(parser, TK_LCurlyBrace);
 
   *members = malloc(sizeof(vector));
-  vector_construct(*members, sizeof(StructMember), alignof(StructMember));
+  vector_construct(*members, sizeof(Member), alignof(Member));
   for (; !next_token_is(parser, TK_RCurlyBrace);) {
+    // https://gcc.gnu.org/onlinedocs/gcc/Alternate-Keywords.html
+    //
+    // Writing __extension__ before an expression prevents warnings about
+    // extensions within that expression.
+    if (next_token_is(parser, TK_Extension))
+      parser_consume_token(parser, TK_Extension);
+
     char *member_name = NULL;
     Type *member_ty =
         parse_type_for_declaration(parser, &member_name, /*storage=*/NULL);
@@ -3314,7 +3481,7 @@ void parse_struct_name_and_members(Parser *parser, char **name,
       bitfield = parse_expr(parser);
     }
 
-    StructMember *member = vector_append_storage(*members);
+    Member* member = vector_append_storage(*members);
     member->type = member_ty;
     member->name = member_name;
     member->bitfield = bitfield;
@@ -3329,6 +3496,18 @@ void parse_struct_name_and_members(Parser *parser, char **name,
   parser_consume_token(parser, TK_RCurlyBrace);
 }
 
+void parse_struct_name_and_members(Parser* parser, char** name,
+                                   vector** members) {
+  parse_struct_or_union_name_and_members_impl(parser, name, members,
+                                              /*is_struct=*/true);
+}
+
+void parse_union_name_and_members(Parser* parser, char** name,
+                                  vector** members) {
+  parse_struct_or_union_name_and_members_impl(parser, name, members,
+                                              /*is_struct=*/false);
+}
+
 StructType *parse_struct_type(Parser *parser) {
   char *name = NULL;
   vector *members = NULL;
@@ -3337,6 +3516,16 @@ StructType *parse_struct_type(Parser *parser) {
   StructType *struct_ty = malloc(sizeof(StructType));
   struct_type_construct(struct_ty, name, members);
   return struct_ty;
+}
+
+UnionType* parse_union_type(Parser* parser) {
+  char* name = NULL;
+  vector* members = NULL;
+  parse_union_name_and_members(parser, &name, &members);
+
+  UnionType* union_ty = malloc(sizeof(UnionType));
+  union_type_construct(union_ty, name, members);
+  return union_ty;
 }
 
 void parse_enum_name_and_members(Parser* parser, char** name,
@@ -3406,22 +3595,30 @@ struct TypeSpecifier {
   unsigned int unsigned_ : 1;
   unsigned int long_ : 2;  // long can be specified up to 2 times
   unsigned int float_ : 1;
+  unsigned int float128_ : 1;
   unsigned int double_ : 1;
+  unsigned int complex_ : 1;
   unsigned int void_ : 1;
   unsigned int bool_ : 1;
   unsigned int named_ : 1;
   unsigned int struct_ : 1;
   unsigned int enum_ : 1;
+  unsigned int union_ : 1;
 };
 
-Type *parse_specifiers_and_qualifiers_and_storage(
-    Parser *parser, FoundStorageClasses *storage) {
+Type* parse_specifiers_and_qualifiers_and_storage(Parser* parser,
+                                                  FoundStorageClasses* storage,
+                                                  bool* found_inline) {
   Qualifiers quals = 0;
 
   struct TypeSpecifier spec = {};
 
+  if (found_inline)
+    *found_inline = false;
+
   StructType *struct_ty;
   EnumType *enum_ty;
+  UnionType* union_ty;
   bool should_stop = false;
   char *name;
   for (; !should_stop;) {
@@ -3432,6 +3629,7 @@ Type *parse_specifiers_and_qualifiers_and_storage(
         assert(!spec.struct_);
         assert(!spec.named_);
         assert(!spec.enum_);
+        assert(!spec.union_);
         spec.struct_ = 1;
         consume_next_token = false;
         struct_ty = parse_struct_type(parser);
@@ -3440,9 +3638,19 @@ Type *parse_specifiers_and_qualifiers_and_storage(
         assert(!spec.struct_);
         assert(!spec.named_);
         assert(!spec.enum_);
+        assert(!spec.union_);
         spec.enum_ = 1;
         consume_next_token = false;
         enum_ty = parse_enum_type(parser);
+        break;
+      case TK_Union:
+        assert(!spec.struct_);
+        assert(!spec.named_);
+        assert(!spec.enum_);
+        assert(!spec.union_);
+        spec.union_ = 1;
+        consume_next_token = false;
+        union_ty = parse_union_type(parser);
         break;
       case TK_Char:
         spec.char_ = 1;
@@ -3466,8 +3674,14 @@ Type *parse_specifiers_and_qualifiers_and_storage(
       case TK_Float:
         spec.float_ = 1;
         break;
+      case TK_Float128:
+        spec.float128_ = 1;
+        break;
       case TK_Double:
         spec.double_ = 1;
+        break;
+      case TK_Complex:
+        spec.complex_ = 1;
         break;
       case TK_Void:
         spec.void_ = 1;
@@ -3491,6 +3705,10 @@ Type *parse_specifiers_and_qualifiers_and_storage(
       case TK_Static:
         if (storage)
           storage->static_ = 1;
+        break;
+      case TK_Inline:
+        if (found_inline)
+          *found_inline = true;
         break;
       case TK_Auto:
         if (storage)
@@ -3541,6 +3759,11 @@ Type *parse_specifiers_and_qualifiers_and_storage(
     return &enum_ty->type;
   }
 
+  if (spec.union_) {
+    union_ty->type.qualifiers = quals;
+    return &union_ty->type;
+  }
+
   BuiltinTypeKind kind;
   if (spec.char_) {
     if (spec.signed_) {
@@ -3566,13 +3789,26 @@ Type *parse_specifiers_and_qualifiers_and_storage(
       }
     } else {
       if (spec.double_) {
-        kind = BTK_LongDouble;
+        if (spec.complex_) {
+          kind = BTK_ComplexLongDouble;
+        } else {
+          kind = BTK_LongDouble;
+        }
       } else if (spec.unsigned_) {
         kind = BTK_UnsignedLong;
       } else {
         kind = BTK_Long;
       }
     }
+  } else if (spec.complex_) {
+    if (spec.float_) {
+      kind = BTK_ComplexFloat;
+    } else {
+      assert(spec.double_);
+      kind = BTK_ComplexDouble;
+    }
+    // Note `_Complex long double` should be handled in the top level
+    // `spec.long_` branch.
   } else if (spec.int_) {
     if (spec.unsigned_) {
       kind = BTK_UnsignedInt;
@@ -3585,6 +3821,8 @@ Type *parse_specifiers_and_qualifiers_and_storage(
     kind = BTK_Float;
   } else if (spec.double_) {
     kind = BTK_Double;
+  } else if (spec.float128_) {
+    kind = BTK_Float128;
   } else if (spec.bool_) {
     kind = BTK_Bool;
   } else if (spec.void_) {
@@ -3695,22 +3933,6 @@ Type *parse_function_suffix(Parser *parser, Type *outer_ty,
 
   parser_consume_token(parser, TK_RPar);
 
-  // https://gcc.gnu.org/onlinedocs/gcc/Attribute-Syntax.html
-  //
-  // An attribute specifier list may appear immediately before the comma, ‘=’,
-  // or semicolon terminating the declaration of an identifier other than a
-  // function definition. Such attribute specifiers apply to the declared object
-  // or function. Where an assembler name for an object or function is specified
-  // (see Controlling Names Used in Assembler Code), the attribute must follow
-  // the asm specification.
-  bool found_attr = parser_peek_token(parser)->kind == TK_Attribute;
-
-  for (; parser_peek_token(parser)->kind == TK_Attribute;)
-    parser_consume_attribute(parser);
-
-  if (found_attr)
-    assert(parser_peek_token(parser)->kind == TK_Semicolon);
-
   // <blank> is a function (with params ...) returning <outer_ty>
   FunctionType *func = malloc(sizeof(FunctionType));
   function_type_construct(func, outer_ty, param_tys);
@@ -3799,10 +4021,33 @@ Type *parse_declarator(Parser *parser, Type *type, char **name,
 // `storage` is an optional parameter to indicate storage classes found.
 Type *parse_type_for_declaration(Parser *parser, char **name,
                                  FoundStorageClasses *storage) {
-  Type *type = parse_specifiers_and_qualifiers_and_storage(parser, storage);
+  // TODO: Handle inlines?
+  Type* type = parse_specifiers_and_qualifiers_and_storage(
+      parser, storage, /*found_inline=*/NULL);
   type = maybe_parse_pointers_and_qualifiers(parser, type,
                                              /*type_usage_addr=*/NULL);
-  return parse_declarator(parser, type, name, /*type_usage_addr=*/NULL);
+  Type* ret = parse_declarator(parser, type, name, /*type_usage_addr=*/NULL);
+
+  // https://gcc.gnu.org/onlinedocs/gcc/Attribute-Syntax.html
+  //
+  // An attribute specifier list may appear immediately before the comma, ‘=’,
+  // or semicolon terminating the declaration of an identifier other than a
+  // function definition. Such attribute specifiers apply to the declared object
+  // or function. Where an assembler name for an object or function is specified
+  // (see Controlling Names Used in Assembler Code), the attribute must follow
+  // the asm specification.
+  bool found_attr = parser_peek_token(parser)->kind == TK_Attribute;
+
+  for (; parser_peek_token(parser)->kind == TK_Attribute;)
+    parser_consume_attribute(parser);
+
+  if (found_attr) {
+    assert(parser_peek_token(parser)->kind == TK_Semicolon ||
+           parser_peek_token(parser)->kind == TK_Comma ||
+           parser_peek_token(parser)->kind == TK_Assign);
+  }
+
+  return ret;
 }
 
 Type *parse_type(Parser *parser) {
@@ -4255,7 +4500,12 @@ Expr *parse_primary_expr(Parser *parser) {
   if (tok->kind == TK_IntLiteral) {
     // TODO: Rather than using strtoull, we should probably parse this
     // ourselves for better error handling. This is simpler for now.
-    unsigned long long val = strtoull(tok->chars.data, NULL, 10);
+
+    int base = (tok->chars.size >= 2 &&
+                (tok->chars.data[1] == 'x' || tok->chars.data[1] == 'X'))
+                   ? 16
+                   : 10;
+    unsigned long long val = strtoull(tok->chars.data, NULL, base);
     Int *i = malloc(sizeof(Int));
     // FIXME: This doesn't account for suffixes.
     int_construct(i, val, BTK_Int);
@@ -5557,11 +5807,31 @@ Node* parse_enum_declaration(Parser* parser) {
   return &decl->node;
 }
 
+Node* parse_union_declaration(Parser* parser) {
+  char* name = NULL;
+  vector* members = NULL;
+  parse_union_name_and_members(parser, &name, &members);
+
+  UnionDeclaration* decl = malloc(sizeof(UnionDeclaration));
+  union_declaration_construct(decl, name, members);
+  return &decl->node;
+}
+
 // NOTE: Callers of this function are in charge of destroying and freeing the
 // poiner.
 Node *parse_top_level_decl(Parser *parser) {
   const Token *token = parser_peek_token(parser);
   assert(token->kind != TK_Eof);
+
+  // https://gcc.gnu.org/onlinedocs/gcc/Alternate-Keywords.html
+  //
+  // Writing __extension__ before an expression prevents warnings about
+  // extensions within that expression.
+  if (token->kind == TK_Extension) {
+    // TODO: Eventually handle it.
+    parser_consume_token(parser, TK_Extension);
+    token = parser_peek_token(parser);
+  }
 
   Node *node;
   switch (token->kind) {
@@ -5573,6 +5843,9 @@ Node *parse_top_level_decl(Parser *parser) {
       break;
     case TK_Struct:
       node = parse_struct_declaration(parser);
+      break;
+    case TK_Union:
+      node = parse_union_declaration(parser);
       break;
     case TK_Enum:
       node = parse_enum_declaration(parser);
@@ -5858,6 +6131,7 @@ static void RunParserTests() {
 typedef struct {
   TreeMap typedef_types;
   TreeMap struct_types;
+  TreeMap union_types;
   TreeMap enum_types;
 
   // This is a map of all globals seen in this TU. If any of them are
@@ -5909,6 +6183,7 @@ void sema_handle_global_variable(Sema *sema, GlobalVariable *gv);
 void sema_construct(Sema *sema) {
   string_tree_map_construct(&sema->typedef_types);
   string_tree_map_construct(&sema->struct_types);
+  string_tree_map_construct(&sema->union_types);
   string_tree_map_construct(&sema->enum_types);
   string_tree_map_construct(&sema->globals);
   string_tree_map_construct(&sema->enum_values);
@@ -5959,6 +6234,7 @@ void sema_construct(Sema *sema) {
 void sema_destroy(Sema *sema) {
   tree_map_destroy(&sema->typedef_types);
   tree_map_destroy(&sema->struct_types);
+  tree_map_destroy(&sema->union_types);
   tree_map_destroy(&sema->enum_types);
   tree_map_destroy(&sema->globals);
   tree_map_destroy(&sema->enum_values);
@@ -6054,9 +6330,22 @@ const StructType *sema_resolve_struct_type(const Sema *sema,
   return found;
 }
 
-const StructMember *sema_get_struct_member(const Sema *sema,
-                                           const StructType *st,
-                                           const char *name, size_t *offset) {
+const UnionType* sema_resolve_union_type(const Sema* sema,
+                                         const UnionType* ut) {
+  if (ut->members)
+    return ut;
+
+  void* found;
+  if (!tree_map_get(&sema->union_types, ut->name, &found)) {
+    printf("No union named '%s'\n", ut->name);
+    __builtin_trap();
+  }
+
+  return found;
+}
+
+const Member* sema_get_struct_member(const Sema* sema, const StructType* st,
+                                     const char* name, size_t* offset) {
   return struct_get_member(sema_resolve_struct_type(sema, st), name, offset);
 }
 
@@ -6116,6 +6405,59 @@ bool sema_is_pointer_to(const Sema *sema, const Type *type, TypeKind kind,
   return pointee->vtable->kind == TK_StructType;
 }
 
+bool sema_types_are_compatible_impl(Sema* sema, const Type* lhs,
+                                    const Type* rhs, bool ignore_quals);
+
+bool sema_struct_or_union_components_are_compatible(
+    Sema* sema, const char* lhs_name, const vector* lhs_members,
+    const char* rhs_name, const vector* rhs_members, bool ignore_quals) {
+  // If one is declared with a tag, the other must also be declared with the
+  // same tag.
+  if ((lhs_name && !rhs_name) || (!lhs_name && rhs_name))
+    return false;
+
+  // This should be enough since we wouldn't be able to define different
+  // structs/unions with the same name.
+  if (lhs_name && rhs_name && strcmp(lhs_name, rhs_name) != 0)
+    return false;
+
+  if (lhs_members && rhs_members) {
+    if (lhs_members->size != rhs_members->size)
+      return false;
+
+    for (size_t i = 0; i < lhs_members->size; ++i) {
+      Member* lhs_member = vector_at(lhs_members, i);
+      Member* rhs_member = vector_at(rhs_members, i);
+      if ((lhs_member->name && !rhs_member->name) ||
+          (!lhs_member->name && rhs_member->name))
+        return false;
+
+      if (lhs_member->name && rhs_member->name &&
+          strcmp(lhs_member->name, rhs_member->name) != 0)
+        return false;
+
+      if ((lhs_member->bitfield && !rhs_member->bitfield) ||
+          (!lhs_member->bitfield && rhs_member->bitfield))
+        return false;
+
+      if (lhs_member->bitfield && rhs_member->bitfield) {
+        ConstExprResult lhs_bitfield =
+            sema_eval_expr(sema, lhs_member->bitfield);
+        ConstExprResult rhs_bitfield =
+            sema_eval_expr(sema, rhs_member->bitfield);
+        if (compare_constexpr_result_types(&lhs_bitfield, &rhs_bitfield))
+          return false;
+      }
+
+      if (!sema_types_are_compatible_impl(sema, lhs_member->type,
+                                          rhs_member->type, ignore_quals))
+        return false;
+    }
+  }
+
+  return true;
+}
+
 bool sema_types_are_compatible_impl(Sema *sema, const Type *lhs,
                                     const Type *rhs, bool ignore_quals) {
   if (lhs->vtable->kind == TK_NamedType) {
@@ -6129,21 +6471,6 @@ bool sema_types_are_compatible_impl(Sema *sema, const Type *lhs,
     return sema_types_are_compatible_impl(sema, lhs, resolved_rhs,
                                           ignore_quals);
   }
-
-  // TODO: Should this be handled here? Also is this correct?
-  // Handling comparisons of pointers and functions.
-  // if (lhs->vtable->kind == TK_PointerType &&
-  //    rhs->vtable->kind == TK_FunctionType) {
-  //  const PointerType *ptr = (const PointerType *)lhs;
-  //  return sema_types_are_compatible_impl(sema, ptr->pointee, rhs,
-  //                                        ignore_quals);
-  //}
-  // if (rhs->vtable->kind == TK_PointerType &&
-  //    lhs->vtable->kind == TK_FunctionType) {
-  //  const PointerType *ptr = (const PointerType *)rhs;
-  //  return sema_types_are_compatible_impl(sema, lhs, ptr->pointee,
-  //                                        ignore_quals);
-  //}
 
   if (lhs->vtable->kind != rhs->vtable->kind)
     return false;
@@ -6187,51 +6514,21 @@ bool sema_types_are_compatible_impl(Sema *sema, const Type *lhs,
       StructType *lhs_struct = (StructType *)lhs;
       StructType *rhs_struct = (StructType *)rhs;
 
-      // If one is declared with a tag, the other must also be declared with the
-      // same tag.
-      if ((lhs_struct->name && !rhs_struct->name) ||
-          (!lhs_struct->name && rhs_struct->name))
+      if (!sema_struct_or_union_components_are_compatible(
+              sema, lhs_struct->name, lhs_struct->members, rhs_struct->name,
+              rhs_struct->members, ignore_quals))
         return false;
 
-      // This should be enough since we wouldn't be able to define different
-      // structs with the same name.
-      if (lhs_struct->name && rhs_struct->name &&
-          strcmp(lhs_struct->name, rhs_struct->name) != 0)
+      break;
+    }
+    case TK_UnionType: {
+      UnionType* lhs_union = (UnionType*)lhs;
+      UnionType* rhs_union = (UnionType*)rhs;
+
+      if (!sema_struct_or_union_components_are_compatible(
+              sema, lhs_union->name, lhs_union->members, rhs_union->name,
+              rhs_union->members, ignore_quals))
         return false;
-
-      if (lhs_struct->members && rhs_struct->members) {
-        if (lhs_struct->members->size != rhs_struct->members->size)
-          return false;
-
-        for (size_t i = 0; i < lhs_struct->members->size; ++i) {
-          StructMember *lhs_member = vector_at(lhs_struct->members, i);
-          StructMember *rhs_member = vector_at(rhs_struct->members, i);
-          if ((lhs_member->name && !rhs_member->name) ||
-              (!lhs_member->name && rhs_member->name))
-            return false;
-
-          if (lhs_member->name && rhs_member->name &&
-              strcmp(lhs_member->name, rhs_member->name) != 0)
-            return false;
-
-          if ((lhs_member->bitfield && !rhs_member->bitfield) ||
-              (!lhs_member->bitfield && rhs_member->bitfield))
-            return false;
-
-          if (lhs_member->bitfield && rhs_member->bitfield) {
-            ConstExprResult lhs_bitfield =
-                sema_eval_expr(sema, lhs_member->bitfield);
-            ConstExprResult rhs_bitfield =
-                sema_eval_expr(sema, rhs_member->bitfield);
-            if (compare_constexpr_result_types(&lhs_bitfield, &rhs_bitfield))
-              return false;
-          }
-
-          if (!sema_types_are_compatible_impl(sema, lhs_member->type,
-                                              rhs_member->type, ignore_quals))
-            return false;
-        }
-      }
 
       break;
     }
@@ -6416,6 +6713,28 @@ void sema_handle_struct_declaration(Sema *sema, StructDeclaration *decl) {
   sema_handle_struct_declaration_impl(sema, &decl->type);
 }
 
+void sema_handle_union_declaration_impl(Sema* sema, UnionType* union_ty) {
+  // This is an anonymous union.
+  if (!union_ty->name)
+    return;
+
+  // We received a uniondeclaration but not definition.
+  if (!union_ty->members)
+    return;
+
+  void* found;
+  if (tree_map_get(&sema->union_types, union_ty->name, &found)) {
+    UnionType* found_union = found;
+    assert(found_union->members);
+  }
+
+  tree_map_set(&sema->union_types, union_ty->name, union_ty);
+}
+
+void sema_handle_union_declaration(Sema* sema, UnionDeclaration* decl) {
+  sema_handle_union_declaration_impl(sema, &decl->type);
+}
+
 void sema_handle_enum_declaration_impl(Sema* sema, EnumType* enum_ty) {
   if (!enum_ty->members)
     return;
@@ -6480,6 +6799,7 @@ void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
 
   switch (type->vtable->kind) {
     case TK_StructType:
+    case TK_UnionType:
     case TK_FunctionType:
     case TK_BuiltinType:
     case TK_EnumType:  // TODO: Handle enum values.
@@ -6764,6 +7084,15 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
     case EK_DeclRef: {
       const DeclRef *decl = (const DeclRef *)expr;
       void *val;
+
+      // Not a global. Search the local scope.
+      if (tree_map_get(local_ctx, decl->name, &val))
+        return (const Type*)val;
+
+      // Maybe an enum?
+      if (tree_map_get(&sema->enum_names, decl->name, &val))
+        return (const Type*)val;
+
       if (tree_map_get(&sema->globals, decl->name, &val)) {
         if (((Node *)val)->vtable->kind == NK_GlobalVariable) {
           GlobalVariable *gv = val;
@@ -6774,14 +7103,6 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
           return f->type;
         }
       }
-
-      // Not a global. Search the local scope.
-      if (tree_map_get(local_ctx, decl->name, &val))
-        return (const Type *)val;
-
-      // Maybe an enum?
-      if (tree_map_get(&sema->enum_names, decl->name, &val))
-        return (const Type *)val;
 
       printf("Unknown symbol '%s'\n", decl->name);
       __builtin_trap();
@@ -6808,7 +7129,7 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       const StructType *base_ty =
           sema_get_struct_type_from_member_access(sema, access, local_ctx);
 
-      const StructMember *member = sema_get_struct_member(
+      const Member* member = sema_get_struct_member(
           sema, base_ty, access->member, /*offset=*/NULL);
       return member->type;
     }
@@ -6882,8 +7203,16 @@ static size_t builtin_type_get_size(const BuiltinType *bt) {
       return sizeof(double);
     case BTK_LongDouble:
       return sizeof(long double);
+    case BTK_Float128:
+      return sizeof(__float128);
     case BTK_Bool:
       return sizeof(bool);
+    case BTK_ComplexFloat:
+      return sizeof(_Complex float);
+    case BTK_ComplexDouble:
+      return sizeof(_Complex double);
+    case BTK_ComplexLongDouble:
+      return sizeof(_Complex long double);
     case BTK_Void:
       printf("Attempting to get sizeof void\n");
       __builtin_trap();
@@ -6921,8 +7250,16 @@ static size_t builtin_type_get_align(const BuiltinType *bt) {
       return alignof(double);
     case BTK_LongDouble:
       return alignof(long double);
+    case BTK_Float128:
+      return alignof(__float128);
     case BTK_Bool:
       return alignof(bool);
+    case BTK_ComplexFloat:
+      return alignof(_Complex float);
+    case BTK_ComplexDouble:
+      return alignof(_Complex double);
+    case BTK_ComplexLongDouble:
+      return alignof(_Complex long double);
     case BTK_Void:
       printf("Attempting to get alignof void\n");
       __builtin_trap();
@@ -6931,6 +7268,19 @@ static size_t builtin_type_get_align(const BuiltinType *bt) {
 
 size_t sema_eval_sizeof_array(Sema *, const ArrayType *);
 size_t sema_eval_alignof_array(Sema *, const ArrayType *);
+size_t sema_eval_alignof_type(Sema* sema, const Type* type);
+
+size_t sema_eval_alignof_members(Sema* sema, const vector* members) {
+  assert(members);
+  size_t max_align = 0;
+  for (size_t i = 0; i < members->size; ++i) {
+    const Member* member = vector_at(members, i);
+    size_t member_align = sema_eval_alignof_type(sema, member->type);
+    if (member_align > max_align)
+      max_align = member_align;
+  }
+  return max_align;
+}
 
 size_t sema_eval_alignof_type(Sema *sema, const Type *type) {
   switch (type->vtable->kind) {
@@ -6960,15 +7310,12 @@ size_t sema_eval_alignof_type(Sema *sema, const Type *type) {
     case TK_StructType: {
       const StructType *struct_ty =
           sema_resolve_struct_type(sema, (const StructType *)type);
-      assert(struct_ty->members);
-      size_t max_align = 0;
-      for (size_t i = 0; i < struct_ty->members->size; ++i) {
-        const StructMember *member = vector_at(struct_ty->members, i);
-        size_t member_align = sema_eval_alignof_type(sema, member->type);
-        if (member_align > max_align)
-          max_align = member_align;
-      }
-      return max_align;
+      return sema_eval_alignof_members(sema, struct_ty->members);
+    }
+    case TK_UnionType: {
+      const UnionType* union_ty =
+          sema_resolve_union_type(sema, (const UnionType*)type);
+      return sema_eval_alignof_members(sema, union_ty->members);
     }
     case TK_ReplacementSentinelType:
       printf("Replacement sentinel type should not be used\n");
@@ -6988,7 +7335,7 @@ size_t sema_eval_sizeof_struct_type(Sema *sema, const StructType *type) {
   size_t size = 0;
   for (size_t i = 0; i < type->members->size; ++i) {
     // TODO: Account for bitfields.
-    const StructMember *member = vector_at(type->members, i);
+    const Member* member = vector_at(type->members, i);
     const Type *member_ty = member->type;
     size_t align = sema_eval_alignof_type(sema, member_ty);
     if (size % align != 0)
@@ -6996,6 +7343,31 @@ size_t sema_eval_sizeof_struct_type(Sema *sema, const StructType *type) {
     size += sema_eval_sizeof_type(sema, member_ty);
   }
   return size;
+}
+
+const Member* sema_get_largest_union_member(Sema* sema, const UnionType* type) {
+  type = sema_resolve_union_type(sema, type);
+  assert(type->members && type->members->size);
+
+  size_t size = 0;
+  const Member* largest;
+  for (size_t i = 0; i < type->members->size; ++i) {
+    // TODO: Account for bitfields.
+    const Member* member = vector_at(type->members, i);
+    const Type* member_ty = member->type;
+    size_t member_size = sema_eval_sizeof_type(sema, member_ty);
+    if (member_size > size) {
+      size = member_size;
+      largest = member;
+    }
+  }
+  assert(size);
+  return largest;
+}
+
+size_t sema_eval_sizeof_union_type(Sema* sema, const UnionType* type) {
+  return sema_eval_sizeof_type(sema,
+                               sema_get_largest_union_member(sema, type)->type);
 }
 
 size_t sema_eval_sizeof_type(Sema *sema, const Type *type) {
@@ -7026,6 +7398,8 @@ size_t sema_eval_sizeof_type(Sema *sema, const Type *type) {
       __builtin_trap();
     case TK_StructType:
       return sema_eval_sizeof_struct_type(sema, (const StructType *)type);
+    case TK_UnionType:
+      return sema_eval_sizeof_union_type(sema, (const UnionType*)type);
     case TK_ReplacementSentinelType:
       printf("Replacement sentinel type should not be used\n");
       __builtin_trap();
@@ -7362,7 +7736,7 @@ LLVMTypeRef get_llvm_struct_type(Compiler *compiler, const StructType *st) {
   vector elems;
   vector_construct(&elems, sizeof(LLVMTypeRef), alignof(LLVMTypeRef));
   for (size_t i = 0; i < st->members->size; ++i) {
-    StructMember *member = vector_at(st->members, i);
+    Member* member = vector_at(st->members, i);
     LLVMTypeRef *storage = vector_append_storage(&elems);
     *storage = get_llvm_type(compiler, member->type);
   }
@@ -7379,6 +7753,35 @@ LLVMTypeRef get_llvm_struct_type(Compiler *compiler, const StructType *st) {
   vector_destroy(&elems);
 
   return llvm_struct;
+}
+
+LLVMTypeRef get_llvm_union_type(Compiler* compiler, const UnionType* ut) {
+  ut = sema_resolve_union_type(compiler->sema, ut);
+
+  void* llvm_union;
+
+  // First see if we already made one.
+  if (ut->name) {
+    if ((llvm_union = LLVMGetTypeByName(compiler->mod, ut->name)))
+      return llvm_union;
+  }
+
+  assert(ut->members);
+
+  // Doesn't exits. Create the struct body which only consists of the largest
+  // union member.
+  LLVMTypeRef member = get_llvm_type(
+      compiler, sema_get_largest_union_member(compiler->sema, ut)->type);
+
+  if (ut->name) {
+    llvm_union =
+        LLVMStructCreateNamed(LLVMGetModuleContext(compiler->mod), ut->name);
+    LLVMStructSetBody(llvm_union, &member, /*ElementCount=*/1, ut->packed);
+  } else {
+    llvm_union = LLVMStructType(&member, /*ElementCount=*/1, ut->packed);
+  }
+
+  return llvm_union;
 }
 
 LLVMTypeRef get_opaque_ptr(Compiler *compiler) {
@@ -7445,11 +7848,27 @@ LLVMTypeRef get_llvm_builtin_type(Compiler *compiler, const BuiltinType *bt) {
     case BTK_Double:
       return LLVMDoubleTypeInContext(ctx);
     case BTK_LongDouble:
+    case BTK_Float128:
       return LLVMFP128TypeInContext(ctx);
     case BTK_Void:
       return LLVMVoidType();
     case BTK_Bool:
       return LLVMIntType(kCharBit);
+    case BTK_ComplexFloat: {
+      LLVMTypeRef elems[] = {LLVMFloatTypeInContext(ctx),
+                             LLVMFloatTypeInContext(ctx)};
+      return LLVMStructType(elems, /*ElementCount=*/2, /*Packed=*/0);
+    }
+    case BTK_ComplexDouble: {
+      LLVMTypeRef elems[] = {LLVMDoubleTypeInContext(ctx),
+                             LLVMDoubleTypeInContext(ctx)};
+      return LLVMStructType(elems, /*ElementCount=*/2, /*Packed=*/0);
+    }
+    case BTK_ComplexLongDouble: {
+      LLVMTypeRef elems[] = {LLVMFP128TypeInContext(ctx),
+                             LLVMFP128TypeInContext(ctx)};
+      return LLVMStructType(elems, /*ElementCount=*/2, /*Packed=*/0);
+    }
   }
 }
 
@@ -7468,6 +7887,8 @@ LLVMTypeRef get_llvm_type(Compiler *compiler, const Type *type) {
           sema_resolve_named_type(compiler->sema, (const NamedType *)type));
     case TK_StructType:
       return get_llvm_struct_type(compiler, (const StructType *)type);
+    case TK_UnionType:
+      return get_llvm_union_type(compiler, (const UnionType*)type);
     case TK_PointerType:
       return get_opaque_ptr(compiler);
     case TK_ArrayType:
@@ -7705,6 +8126,7 @@ LLVMValueRef compile_to_bool(Compiler *compiler, LLVMBuilderRef builder,
       }
     }
     case TK_StructType:
+    case TK_UnionType:
     case TK_NamedType:
     case TK_FunctionType:
     case TK_ReplacementSentinelType:
@@ -7870,9 +8292,13 @@ LLVMValueRef build_alloca_at_func_start(LLVMBuilderRef builder,
   LLVMBasicBlockRef current_bb = LLVMGetInsertBlock(builder);
   LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(fn);
 
-  // Place builder before this instruction. If it's null, place the builder
-  // at the end of the bb.
-  LLVMPositionBuilder(builder, entry_bb, LLVMGetLastInstruction(entry_bb));
+  // Place builder at the start of the entry BB. If it's empty, place the
+  // builder at the end of the bb.
+  LLVMValueRef inst = LLVMGetFirstInstruction(entry_bb);
+  if (inst)
+    LLVMPositionBuilder(builder, entry_bb, inst);
+  else
+    LLVMPositionBuilderAtEnd(builder, entry_bb);
 
   LLVMValueRef alloca = LLVMBuildAlloca(builder, llvm_ty, name);
 
@@ -8151,16 +8577,23 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
       LLVMBuildStore(builder, res, lhs);
       break;
     }
+    case BOK_LShift:
+    case BOK_RShift:
     case BOK_LShiftAssign:
     case BOK_RShiftAssign: {
+      bool is_assign =
+          expr->op == BOK_LShiftAssign || expr->op == BOK_RShiftAssign;
+      bool is_shl = expr->op == BOK_LShiftAssign || expr->op == BOK_LShift;
       LLVMTypeRef llvm_lhs_ty = get_llvm_type(compiler, lhs_ty);
-      LLVMValueRef lhs_val = LLVMBuildLoad2(builder, llvm_lhs_ty, lhs, "");
-      if (expr->op == BOK_LShiftAssign) {
+      LLVMValueRef lhs_val =
+          is_assign ? LLVMBuildLoad2(builder, llvm_lhs_ty, lhs, "") : lhs;
+      if (is_shl) {
         res = LLVMBuildShl(builder, lhs_val, rhs, "");
       } else {
         res = LLVMBuildAShr(builder, lhs_val, rhs, "");
       }
-      LLVMBuildStore(builder, res, lhs);
+      if (is_assign)
+        LLVMBuildStore(builder, res, lhs);
       break;
     }
     default:
@@ -8279,8 +8712,10 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
                            local_allocas);
     case EK_DeclRef: {
       const DeclRef *decl = (const DeclRef *)expr;
+
+      LLVMValueRef val = NULL;
       bool is_func = LLVMGetTypeKind(type) == LLVMFunctionTypeKind;
-      if (is_func) {
+      if (is_func && !tree_map_get(local_allocas, decl->name, (void*)&val)) {
         LLVMValueRef val = LLVMGetNamedFunction(compiler->mod, decl->name);
         assert(val);
         return val;
@@ -8300,7 +8735,7 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
         __builtin_trap();
       }
 
-      LLVMValueRef val =
+      val =
           compile_lvalue_ptr(compiler, builder, expr, local_ctx, local_allocas);
 
       if (sema_is_array_type(compiler->sema, decl_ty, local_ctx))
@@ -8332,6 +8767,16 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
           LLVMBuildCall2(builder, llvm_func_ty, llvm_func, llvm_args.data,
                          (unsigned)llvm_args.size, "");
 
+      LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
+      LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+      LLVMMetadataRef local_scope = LLVMGetSubprogram(fn);
+      assert(local_scope);
+
+      // TODO: Fill these in with correct values.
+      LLVMMetadataRef debug_loc = LLVMDIBuilderCreateDebugLocation(
+          ctx, /*Line=*/0, /*Column=*/0, local_scope, /*InlinedAt=*/NULL);
+      LLVMInstructionSetDebugLoc(res, debug_loc);
+
       vector_destroy(&llvm_args);
 
       return res;
@@ -8341,8 +8786,8 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
       const StructType *base_ty = sema_get_struct_type_from_member_access(
           compiler->sema, access, local_ctx);
       size_t offset;
-      const StructMember *member = sema_get_struct_member(
-          compiler->sema, base_ty, access->member, &offset);
+      const Member* member = sema_get_struct_member(compiler->sema, base_ty,
+                                                    access->member, &offset);
 
       LLVMValueRef ptr;
       if (access->is_arrow) {
@@ -8800,8 +9245,28 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
   }
 }
 
+LLVMMetadataRef get_di_function_type(Compiler* compiler,
+                                     const FunctionType* func_ty) {
+  vector args;
+  vector_construct(&args, sizeof(LLVMMetadataRef), alignof(LLVMMetadataRef));
+
+  for (size_t i = 0; i < func_ty->pos_args.size; ++i) {
+    LLVMMetadataRef* arg_md = vector_append_storage(&args);
+    // TODO: Use the correct type.
+    *arg_md = LLVMDIBuilderCreateUnspecifiedType(
+        compiler->dibuilder, /*Name=*/"TODO", /*NameLen=*/4);
+  }
+
+  LLVMMetadataRef md = LLVMDIBuilderCreateSubroutineType(
+      compiler->dibuilder, compiler->difile, args.data,
+      (unsigned)func_ty->pos_args.size, /*Flags=*/0);
+  vector_destroy(&args);
+  return md;
+}
+
 void compile_function_definition(Compiler *compiler,
                                  const FunctionDefinition *f) {
+  FunctionType* func_ty = (FunctionType*)(f->type);
   LLVMTypeRef llvm_func_ty = get_llvm_type(compiler, f->type);
 
   LLVMValueRef func = get_named_global(compiler, f->name);
@@ -8809,15 +9274,25 @@ void compile_function_definition(Compiler *compiler,
     func = LLVMAddFunction(compiler->mod, f->name, llvm_func_ty);
   assert(LLVMGetTypeKind(LLVMTypeOf(func)) == LLVMPointerTypeKind);
 
+  // TODO: Fill out the line number and other relevant fields.
+  LLVMMetadataRef subprogram = LLVMDIBuilderCreateFunction(
+      compiler->dibuilder, compiler->difile, f->name, strlen(f->name), f->name,
+      strlen(f->name), compiler->difile, /*LineNo=*/1,
+      get_di_function_type(compiler, func_ty), /*IsLocalToUnit=*/0,
+      /*IsDefinition=*/1, /*ScopeLine=*/0,
+      /*Flags=*/0, /*IsOptimized=*/0);
+  LLVMSetSubprogram(func, subprogram);
+  LLVMDIBuilderFinalizeSubprogram(compiler->dibuilder, subprogram);
+
   LLVMBasicBlockRef entry = LLVMAppendBasicBlock(func, "entry");
   LLVMBuilderRef builder = LLVMCreateBuilder();
   LLVMPositionBuilderAtEnd(builder, entry);
 
-  // LLVMMetadataRef subprogram = LLVMDIBuilderCreateFunction(
-  //   compiler->dibuilder, /*Scope=*/NULL, f->name, strlen(f->name),
-  //   f->name, strlen(f->name), compiler->difile, );
-
-  FunctionType *func_ty = (FunctionType *)(f->type);
+  LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
+  // TODO: Fill these in with correct values.
+  LLVMMetadataRef debug_loc = LLVMDIBuilderCreateDebugLocation(
+      ctx, /*Line=*/1, /*Column=*/0, subprogram, /*InlinedAt=*/NULL);
+  LLVMSetCurrentDebugLocation2(builder, debug_loc);
 
   TreeMap local_ctx;
   TreeMap local_allocas;
@@ -9066,7 +9541,7 @@ int main(int argc, char **argv) {
     if (token->kind == TK_Eof) {
       break;
     } else {
-      // printf("Evaluating top level node at %llu:%llu (%s)\n", token->line,
+      // printf("Evaluating top level node at %zu:%zu (%s)\n", token->line,
       //        token->col, token->chars.data);
 
       // Note that the parse_* functions destroy the tokens.
@@ -9106,6 +9581,11 @@ int main(int argc, char **argv) {
           sema_handle_enum_declaration(&sema, decl);
           break;
         }
+        case NK_UnionDeclaration: {
+          UnionDeclaration* decl = (UnionDeclaration*)top_level_decl;
+          sema_handle_union_declaration(&sema, decl);
+          break;
+        }
       }
 
       Node **storage = vector_append_storage(&nodes_to_destroy);
@@ -9118,6 +9598,8 @@ int main(int argc, char **argv) {
       }
     }
   }
+
+  LLVMDIBuilderFinalize(dibuilder);
 
   if (LLVMPrintModuleToFile(mod, "out.ll", &error)) {
     printf("llvm error: %s\n", error);

@@ -36,4 +36,7 @@ if [ "$1" = "stage3" ]; then
   ${BUILD_DIR}/${OUTPUT_BIN}.stage2 ${BUILD_DIR}/compiler.preprocessed.c
   ${CC} -o ${BUILD_DIR}/${OUTPUT_BIN}.stage3 "out.obj" \
     ${LLVM_CONFIG_LD_FLAGS} ${LLVM_CONFIG_SYSTEM_LIBS} ${LLVM_CONFIG_CORE_LIBS}
+
+  # These should have the same contents for the same compilation.
+  diff ${BUILD_DIR}/${OUTPUT_BIN}.stage2 ${BUILD_DIR}/${OUTPUT_BIN}.stage3
 fi
