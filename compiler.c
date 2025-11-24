@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 // IO functions
 int printf(const char *, ...);
@@ -14,16 +15,6 @@ void *fopen(const char *, const char *);
 int fclose(void *);
 int fgetc(void *);
 int feof(void *);
-
-// String functions
-size_t strlen(const char *);
-int strncmp(const char *, const char *, size_t);
-void *memcpy(void *, const void *, size_t);
-void *memset(void *, int ch, size_t);
-int strcmp(const char *, const char *);
-char *strdup(const char *);
-
-unsigned long long strtoull(const char *restrict, char **restrict, int);
 
 // LLVM does not actually have a way of providing the CHAR_BIT for the arch.
 // Clang unconditionally sets it to 8.
@@ -1346,6 +1337,7 @@ typedef enum {
   TK_False,
   TK_Attribute,
   TK_Extension,
+  TK_Asm,
   TK_Inline,
 
   TK_PrettyFunction,
@@ -1891,6 +1883,9 @@ Token lex(Lexer *lexer) {
     tok.kind = TK_Attribute;
   } else if (string_equals(&tok.chars, "__extension__")) {
     tok.kind = TK_Extension;
+  } else if (string_equals(&tok.chars, "__asm__") ||
+             string_equals(&tok.chars, "asm")) {
+    tok.kind = TK_Asm;
   } else if (string_equals(&tok.chars, "__inline")) {
     tok.kind = TK_Inline;
   } else if (string_equals(&tok.chars, "typedef")) {
@@ -3449,6 +3444,26 @@ void parser_consume_attribute(Parser* parser) {
   }
 }
 
+void parser_consume_asm_label(Parser* parser) {
+  parser_consume_token(parser, TK_Asm);
+  parser_consume_token(parser, TK_LPar);
+
+  // This is a cheeky way of just consuming the whole attribute.
+  // Consume tokens until we match the opening left parenthesis.
+  int par_count = 1;
+  for (; par_count;) {
+    Token tok = parser_pop_token(parser);
+
+    if (tok.kind == TK_RPar) {
+      par_count--;
+    } else if (tok.kind == TK_LPar) {
+      par_count++;
+    }
+
+    token_destroy(&tok);
+  }
+}
+
 void parse_struct_or_union_name_and_members_impl(Parser* parser, char** name,
                                                  vector** members,
                                                  bool is_struct) {
@@ -4038,6 +4053,15 @@ Type *parse_type_for_declaration(Parser *parser, char **name,
                                              /*type_usage_addr=*/NULL);
   Type* ret = parse_declarator(parser, type, name, /*type_usage_addr=*/NULL);
 
+  // https://gcc.gnu.org/onlinedocs/gcc/Asm-Labels.html
+  //
+  // Parse an asm label after a declarator. The compiler should replace all
+  // references to this variable with the name specified in the asm label.
+  //
+  // TODO: Handle this. For now, we just consume it.
+  if (next_token_is(parser, TK_Asm))
+    parser_consume_asm_label(parser);
+
   // https://gcc.gnu.org/onlinedocs/gcc/Attribute-Syntax.html
   //
   // An attribute specifier list may appear immediately before the comma, ‘=’,
@@ -4046,7 +4070,7 @@ Type *parse_type_for_declaration(Parser *parser, char **name,
   // or function. Where an assembler name for an object or function is specified
   // (see Controlling Names Used in Assembler Code), the attribute must follow
   // the asm specification.
-  bool found_attr = parser_peek_token(parser)->kind == TK_Attribute;
+  bool found_attr = next_token_is(parser, TK_Attribute);
 
   for (; parser_peek_token(parser)->kind == TK_Attribute;)
     parser_consume_attribute(parser);
