@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <ctype.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -23,11 +24,6 @@ int strcmp(const char *, const char *);
 char *strdup(const char *);
 
 unsigned long long strtoull(const char *restrict, char **restrict, int);
-
-void assert(bool b) {
-  if (!b)
-    __builtin_trap();
-}
 
 // LLVM does not actually have a way of providing the CHAR_BIT for the arch.
 // Clang unconditionally sets it to 8.
@@ -584,6 +580,11 @@ void *vector_at(const vector *v, size_t i) {
   void *ptr = (char *)v->data + allocation_size * i;
   assert((uintptr_t)ptr % v->data_alignment == 0);
   return ptr;
+}
+
+void* vector_back(const vector* v) {
+  assert(v->size > 0);
+  return vector_at(v, v->size - 1);
 }
 
 ///
@@ -1347,6 +1348,7 @@ typedef enum {
   TK_Extension,
   TK_Inline,
 
+  TK_PrettyFunction,
   TK_Identifier,
 
   // Literals
@@ -1535,6 +1537,8 @@ char handle_escape_char(int c) {
       return '\'';
     case '\\':
       return '\\';
+    case '"':
+      return '"';
     default:
       printf("Unhandled escape character '%c'\n", c);
       __builtin_trap();
@@ -1929,6 +1933,8 @@ Token lex(Lexer *lexer) {
     tok.kind = TK_Register;
   } else if (string_equals(&tok.chars, "thread_local")) {
     tok.kind = TK_ThreadLocal;
+  } else if (string_equals(&tok.chars, "__PRETTY_FUNCTION__")) {
+    tok.kind = TK_PrettyFunction;
   } else if (string_equals(&tok.chars, "true")) {
     tok.kind = TK_True;
   } else if (string_equals(&tok.chars, "false")) {
@@ -2733,6 +2739,7 @@ typedef enum {
   EK_BinOp,
   EK_Conditional,  // x ? y : z
   EK_DeclRef,
+  EK_PrettyFunction,
   EK_Int,
   EK_Bool,  // true/false
   EK_String,
@@ -2743,6 +2750,7 @@ typedef enum {
   EK_Call,
   EK_Cast,
   EK_FunctionParam,
+  EK_StmtExpr,
 } ExprKind;
 
 typedef void (*ExprDtor)(struct Expr *);
@@ -3033,7 +3041,7 @@ struct IfStmt {
   Statement base;
   Expr *cond;  // Required only for the first If. All chained Ifs through the
                // else_stmt can have this optionally.
-  Statement *body;
+  Statement* body;       // Optional.
   Statement *else_stmt;  // Optional.
 };
 typedef struct IfStmt IfStmt;
@@ -3052,8 +3060,10 @@ void if_stmt_destroy(Statement *stmt) {
     free(ifstmt->cond);
   }
 
-  statement_destroy(ifstmt->body);
-  free(ifstmt->body);
+  if (ifstmt->body) {
+    statement_destroy(ifstmt->body);
+    free(ifstmt->body);
+  }
 
   if (ifstmt->else_stmt) {
     statement_destroy(ifstmt->else_stmt);
@@ -4387,6 +4397,21 @@ void char_construct(Char *c, char val) {
   c->val = val;
 }
 
+void pretty_function_destroy(Expr* expr) {}
+
+const ExprVtable PrettyFunctionVtable = {
+    .kind = EK_PrettyFunction,
+    .dtor = pretty_function_destroy,
+};
+
+typedef struct {
+  Expr expr;
+} PrettyFunction;
+
+void pretty_function_construct(PrettyFunction* pf) {
+  expr_construct(&pf->expr, &PrettyFunctionVtable);
+}
+
 void int_destroy(Expr *expr);
 
 const ExprVtable IntVtable = {
@@ -4480,7 +4505,7 @@ Expr *parse_parentheses_expr_tail(Parser *parser) {
 
 //
 // <primary_expr> = <identifier> | <constant> | <string_literal>
-//                | "(" <expr> ")"
+//                | "__PRETTY_FUNCTION__" | "(" <expr> ")"
 //
 Expr *parse_primary_expr(Parser *parser) {
   const Token *tok = parser_peek_token(parser);
@@ -4488,6 +4513,13 @@ Expr *parse_primary_expr(Parser *parser) {
   if (tok->kind == TK_LPar) {
     parser_consume_token(parser, TK_LPar);
     return parse_parentheses_expr_tail(parser);
+  }
+
+  if (tok->kind == TK_PrettyFunction) {
+    PrettyFunction* pf = malloc(sizeof(PrettyFunction));
+    pretty_function_construct(pf);
+    parser_consume_token(parser, TK_PrettyFunction);
+    return &pf->expr;
   }
 
   if (tok->kind == TK_Identifier) {
@@ -4704,18 +4736,25 @@ vector parse_argument_list(Parser *parser) {
   vector v;
   vector_construct(&v, sizeof(Expr *), alignof(Expr *));
 
-  bool should_continue;
   for (;;) {
-    should_continue = false;
+    // https://gcc.gnu.org/onlinedocs/gcc/Alternate-Keywords.html
+    //
+    // Writing __extension__ before an expression prevents warnings about
+    // extensions within that expression.
+    //
+    // NOTE: Ideally we'd only be handling __extension__ in the start
+    // of parse_expr, but an argument_expr_list can only accept assignment_exprs
+    // since it helps disambiguate between arguments and comma expressions.
+    if (next_token_is(parser, TK_Extension))
+      parser_consume_token(parser, TK_Extension);
 
     Expr *expr = parse_assignment_expr(parser);
     Expr **storage = vector_append_storage(&v);
     *storage = expr;
 
-    if ((should_continue = (next_token_is(parser, TK_Comma))))
+    if (next_token_is(parser, TK_Comma))
       parser_consume_token(parser, TK_Comma);
-
-    if (!should_continue)
+    else
       break;
   }
 
@@ -4925,6 +4964,30 @@ void cast_destroy(Expr *expr) {
   free(cast->to);
 }
 
+void stmt_expr_destroy(Expr* expr);
+
+const ExprVtable StmtExprVtable = {
+    .kind = EK_StmtExpr,
+    .dtor = stmt_expr_destroy,
+};
+
+typedef struct {
+  Expr expr;
+  CompoundStmt* stmt;  // Optional. NULL indicates an empty statement
+                       // expression, which evaluates to `void`.
+} StmtExpr;
+
+void stmt_expr_construct(StmtExpr* se, CompoundStmt* stmt) {
+  expr_construct(&se->expr, &StmtExprVtable);
+  se->stmt = stmt;
+}
+
+void stmt_expr_destroy(Expr* expr) {
+  StmtExpr* se = (StmtExpr*)expr;
+  statement_destroy(&se->stmt->base);
+  free(se->stmt);
+}
+
 bool is_token_type_token(const Parser *parser, const Token *tok) {
   bool is_type = is_builtin_type_token(tok->kind) ||
                  is_qualifier_token(tok->kind) || tok->kind == TK_Enum ||
@@ -4941,14 +5004,29 @@ bool is_next_token_type_token(Parser *parser) {
   return is_token_type_token(parser, parser_peek_token(parser));
 }
 
+Statement* parse_compound_stmt(Parser*);
+
 // This only exists so we can dispatch to either a cast expression or a normal
 // expression surrounded by parenthesis since we need to know if the contents
 // after the LPar is a type or not.
-Expr *parse_cast_or_paren_expr(Parser *parser) {
+Expr* parse_cast_or_paren_or_stmt_expr(Parser* parser) {
   size_t line = parser_peek_token(parser)->line;
   size_t col = parser_peek_token(parser)->col;
 
   parser_consume_token(parser, TK_LPar);
+
+  // https://gcc.gnu.org/onlinedocs/gcc/Statement-Exprs.html
+  //
+  // ({ ... }) is an expression statement provided as a GCC extension.
+  if (next_token_is(parser, TK_LCurlyBrace)) {
+    Statement* stmt = parse_compound_stmt(parser);
+    StmtExpr* se = malloc(sizeof(StmtExpr));
+    stmt_expr_construct(se, (CompoundStmt*)stmt);
+    se->expr.line = line;
+    se->expr.col = col;
+    parser_consume_token(parser, TK_RPar);
+    return &se->expr;
+  }
 
   if (!is_next_token_type_token(parser)) {
     Expr *expr = parse_parentheses_expr_tail(parser);
@@ -4977,7 +5055,7 @@ Expr *parse_cast_expr(Parser *parser) {
   const Token *tok = parser_peek_token(parser);
 
   if (tok->kind == TK_LPar) {
-    Expr* e = parse_cast_or_paren_expr(parser);
+    Expr* e = parse_cast_or_paren_or_stmt_expr(parser);
     assert(e->line && e->col);
     return e;
   }
@@ -5419,6 +5497,13 @@ Expr *parse_assignment_expr(Parser *parser) {
 //
 // Operator precedence: https://www.lysator.liu.se/c/ANSI-C-grammar-y.html
 Expr *parse_expr(Parser *parser) {
+  // https://gcc.gnu.org/onlinedocs/gcc/Alternate-Keywords.html
+  //
+  // Writing __extension__ before an expression prevents warnings about
+  // extensions within that expression.
+  if (next_token_is(parser, TK_Extension))
+    parser_consume_token(parser, TK_Extension);
+
   size_t line = parser_peek_token(parser)->line;
   size_t col = parser_peek_token(parser)->col;
 
@@ -5476,8 +5561,6 @@ Node *parse_typedef(Parser *parser) {
   return &td->node;
 }
 
-Statement *parse_compound_stmt(Parser *);
-
 Statement *parse_expr_statement(Parser *parser) {
   Expr *expr = parse_expr(parser);
   parser_consume_token(parser, TK_Semicolon);
@@ -5525,7 +5608,13 @@ Statement *parse_statement(Parser *parser) {
 
     parser_consume_token(parser, TK_RPar);
 
-    Statement *body = parse_statement(parser);
+    Statement* body = NULL;
+    if (next_token_is(parser, TK_Semicolon)) {
+      // Empty if stmt body.
+      parser_consume_token(parser, TK_Semicolon);
+    } else {
+      body = parse_statement(parser);
+    }
 
     IfStmt *ifstmt = malloc(sizeof(IfStmt));
     if_stmt_construct(ifstmt, cond, body);
@@ -7024,6 +7113,8 @@ const Type *sema_get_type_of_binop_expr(Sema *sema, const BinOp *expr,
                       // promotion.
     case BOK_RShift:
       return lhs_ty;
+    case BOK_Comma:
+      return rhs_ty;
     default:
       printf("TODO: Implement get type for binop kind %d on %zu:%zu\n",
              expr->op, expr->expr.line, expr->expr.col);
@@ -7071,6 +7162,7 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
                                          const TreeMap *local_ctx) {
   switch (expr->vtable->kind) {
     case EK_String:
+    case EK_PrettyFunction:
       return &sema->str_ty.type;
     case EK_SizeOf:
     case EK_AlignOf:
@@ -7152,6 +7244,21 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       printf("Attempting to index a type that isn't a pointer or array: %d\n",
              base_ty->vtable->kind);
       __builtin_trap();
+    }
+    case EK_StmtExpr: {
+      const StmtExpr* stmt_expr = (const StmtExpr*)expr;
+
+      // If you use some other kind of statement last within the braces, the
+      // construct has type void, and thus effectively no value.
+      if (!stmt_expr->stmt)
+        return &sema->bt_Void.type;
+
+      Statement* last = *(Statement**)vector_back(&stmt_expr->stmt->body);
+      if (last->vtable->kind != SK_ExprStmt)
+        return &sema->bt_Void.type;
+
+      Expr* expr = ((ExprStmt*)last)->expr;
+      return sema_get_type_of_expr_in_ctx(sema, expr, local_ctx);
     }
     default:
       printf(
@@ -7901,9 +8008,10 @@ LLVMTypeRef get_llvm_type(Compiler *compiler, const Type *type) {
   }
 }
 
-LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
-                          const Expr *expr, TreeMap *local_ctx,
-                          TreeMap *local_allocas);
+LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
+                          const Expr* expr, TreeMap* local_ctx,
+                          TreeMap* local_allocas, LLVMBasicBlockRef break_bb,
+                          LLVMBasicBlockRef cont_bb);
 
 LLVMTypeRef get_llvm_type_of_expr_global_ctx(Compiler *compiler,
                                              const Expr *expr);
@@ -8100,9 +8208,10 @@ static bool should_use_icmp(LLVMTypeRef type) {
 }
 
 // NOTE: This always returns an i1.
-LLVMValueRef compile_to_bool(Compiler *compiler, LLVMBuilderRef builder,
-                             const Expr *expr, TreeMap *local_ctx,
-                             TreeMap *local_allocas) {
+LLVMValueRef compile_to_bool(Compiler* compiler, LLVMBuilderRef builder,
+                             const Expr* expr, TreeMap* local_ctx,
+                             TreeMap* local_allocas, LLVMBasicBlockRef break_bb,
+                             LLVMBasicBlockRef cont_bb) {
   const Type *type =
       sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
 
@@ -8115,8 +8224,8 @@ LLVMValueRef compile_to_bool(Compiler *compiler, LLVMBuilderRef builder,
     case TK_EnumType:
     case TK_ArrayType: {
       // Easiest (but not always correct) way is to compare against zero.
-      LLVMValueRef val =
-          compile_expr(compiler, builder, expr, local_ctx, local_allocas);
+      LLVMValueRef val = compile_expr(compiler, builder, expr, local_ctx,
+                                      local_allocas, break_bb, cont_bb);
       LLVMTypeRef type = LLVMTypeOf(val);
       LLVMValueRef zero = LLVMConstNull(type);
       if (should_use_icmp(type)) {
@@ -8135,20 +8244,24 @@ LLVMValueRef compile_to_bool(Compiler *compiler, LLVMBuilderRef builder,
   }
 }
 
-LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
-                                const Expr *expr, TreeMap *local_ctx,
-                                TreeMap *local_allocas);
+LLVMValueRef compile_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
+                                const Expr* expr, TreeMap* local_ctx,
+                                TreeMap* local_allocas,
+                                LLVMBasicBlockRef break_bb,
+                                LLVMBasicBlockRef cont_bb);
 
 LLVMTypeRef get_llvm_type_of_expr(Compiler *compiler, const Expr *expr,
                                   TreeMap *local_ctx);
 
-LLVMValueRef compile_unop_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
-                                     const UnOp *expr, TreeMap *local_ctx,
-                                     TreeMap *local_allocas) {
+LLVMValueRef compile_unop_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
+                                     const UnOp* expr, TreeMap* local_ctx,
+                                     TreeMap* local_allocas,
+                                     LLVMBasicBlockRef break_bb,
+                                     LLVMBasicBlockRef cont_bb) {
   switch (expr->op) {
     case UOK_Deref: {
       return compile_expr(compiler, builder, expr->subexpr, local_ctx,
-                          local_allocas);
+                          local_allocas, break_bb, cont_bb);
     }
     default:
       printf("TODO: Implement compile_unop_lvalue_ptr for this op %d\n",
@@ -8157,22 +8270,25 @@ LLVMValueRef compile_unop_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
   }
 }
 
-LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
-                          const UnOp *expr, TreeMap *local_ctx,
-                          TreeMap *local_allocas) {
+LLVMValueRef compile_unop(Compiler* compiler, LLVMBuilderRef builder,
+                          const UnOp* expr, TreeMap* local_ctx,
+                          TreeMap* local_allocas, LLVMBasicBlockRef break_bb,
+                          LLVMBasicBlockRef cont_bb) {
   switch (expr->op) {
     case UOK_Not: {
       // Result is always an i1.
-      LLVMValueRef to_bool = compile_to_bool(compiler, builder, expr->subexpr,
-                                             local_ctx, local_allocas);
+      LLVMValueRef to_bool =
+          compile_to_bool(compiler, builder, expr->subexpr, local_ctx,
+                          local_allocas, break_bb, cont_bb);
       LLVMValueRef zero = LLVMConstNull(LLVMInt1Type());
       LLVMValueRef res =
           LLVMBuildICmp(builder, LLVMIntEQ, to_bool, zero, "not");
       return LLVMBuildZExt(builder, res, LLVMInt8Type(), "");
     }
     case UOK_BitNot: {
-      LLVMValueRef val = compile_expr(compiler, builder, expr->subexpr,
-                                      local_ctx, local_allocas);
+      LLVMValueRef val =
+          compile_expr(compiler, builder, expr->subexpr, local_ctx,
+                       local_allocas, break_bb, cont_bb);
       LLVMValueRef ones = LLVMConstAllOnes(LLVMTypeOf(val));
       return LLVMBuildXor(builder, val, ones, "");
     }
@@ -8182,8 +8298,9 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
     case UOK_PostInc: {
       bool is_pre = expr->op == UOK_PreInc || expr->op == UOK_PreDec;
       bool is_inc = expr->op == UOK_PreInc || expr->op == UOK_PostInc;
-      LLVMValueRef ptr = compile_lvalue_ptr(compiler, builder, expr->subexpr,
-                                            local_ctx, local_allocas);
+      LLVMValueRef ptr =
+          compile_lvalue_ptr(compiler, builder, expr->subexpr, local_ctx,
+                             local_allocas, break_bb, cont_bb);
       LLVMTypeRef llvm_type =
           get_llvm_type_of_expr(compiler, expr->subexpr, local_ctx);
       LLVMValueRef val = LLVMBuildLoad2(builder, llvm_type, ptr, "");
@@ -8194,19 +8311,21 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
       return is_pre ? postop : val;
     }
     case UOK_Negate: {
-      LLVMValueRef val = compile_expr(compiler, builder, expr->subexpr,
-                                      local_ctx, local_allocas);
+      LLVMValueRef val =
+          compile_expr(compiler, builder, expr->subexpr, local_ctx,
+                       local_allocas, break_bb, cont_bb);
       LLVMValueRef zero = LLVMConstNull(LLVMTypeOf(val));
       return LLVMBuildSub(builder, zero, val, "");
     }
     case UOK_AddrOf:
       return compile_lvalue_ptr(compiler, builder, expr->subexpr, local_ctx,
-                                local_allocas);
+                                local_allocas, break_bb, cont_bb);
     case UOK_Deref: {
       LLVMTypeRef llvm_ty =
           get_llvm_type_of_expr(compiler, &expr->expr, local_ctx);
-      LLVMValueRef ptr = compile_expr(compiler, builder, expr->subexpr,
-                                      local_ctx, local_allocas);
+      LLVMValueRef ptr =
+          compile_expr(compiler, builder, expr->subexpr, local_ctx,
+                       local_allocas, break_bb, cont_bb);
       return LLVMBuildLoad2(builder, llvm_ty, ptr, "");
     }
     default:
@@ -8215,18 +8334,20 @@ LLVMValueRef compile_unop(Compiler *compiler, LLVMBuilderRef builder,
   }
 }
 
-LLVMValueRef compile_implicit_cast(Compiler *compiler, LLVMBuilderRef builder,
-                                   const Expr *from, const Type *to,
-                                   TreeMap *local_ctx, TreeMap *local_allocas) {
+LLVMValueRef compile_implicit_cast(Compiler* compiler, LLVMBuilderRef builder,
+                                   const Expr* from, const Type* to,
+                                   TreeMap* local_ctx, TreeMap* local_allocas,
+                                   LLVMBasicBlockRef break_bb,
+                                   LLVMBasicBlockRef cont_bb) {
   to = sema_resolve_maybe_named_type(compiler->sema, to);
   if (is_builtin_type(to, BTK_Bool)) {
-    LLVMValueRef res =
-        compile_to_bool(compiler, builder, from, local_ctx, local_allocas);
+    LLVMValueRef res = compile_to_bool(compiler, builder, from, local_ctx,
+                                       local_allocas, break_bb, cont_bb);
     return LLVMBuildZExt(builder, res, LLVMInt8Type(), "");
   }
 
-  LLVMValueRef llvm_from =
-      compile_expr(compiler, builder, from, local_ctx, local_allocas);
+  LLVMValueRef llvm_from = compile_expr(compiler, builder, from, local_ctx,
+                                        local_allocas, break_bb, cont_bb);
 
   const Type *from_ty =
       sema_get_type_of_expr_in_ctx(compiler->sema, from, local_ctx);
@@ -8277,9 +8398,18 @@ LLVMValueRef compile_implicit_cast(Compiler *compiler, LLVMBuilderRef builder,
     }
   }
 
+  // If type-name is void, then expression is evaluated for its side-effects and
+  // its returned value is discarded, same as when expression is used on its
+  // own, as an expression statement.
+  if (is_builtin_type(to, BTK_Void))
+    return compile_expr(compiler, builder, from, local_ctx, local_allocas,
+                        break_bb, cont_bb);
+
   printf("TODO: Handle this implicit cast\n");
   LLVMDumpValue(llvm_from);
+  printf("\n");
   LLVMDumpType(llvm_to_ty);
+  printf("\n");
   __builtin_trap();
 }
 
@@ -8307,14 +8437,16 @@ LLVMValueRef build_alloca_at_func_start(LLVMBuilderRef builder,
   return alloca;
 }
 
-LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
-                                 const Conditional *expr, TreeMap *local_ctx,
-                                 TreeMap *local_allocas) {
+LLVMValueRef compile_conditional(Compiler* compiler, LLVMBuilderRef builder,
+                                 const Conditional* expr, TreeMap* local_ctx,
+                                 TreeMap* local_allocas,
+                                 LLVMBasicBlockRef break_bb,
+                                 LLVMBasicBlockRef cont_bb) {
   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
   LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
 
-  LLVMValueRef cond =
-      compile_to_bool(compiler, builder, expr->cond, local_ctx, local_allocas);
+  LLVMValueRef cond = compile_to_bool(compiler, builder, expr->cond, local_ctx,
+                                      local_allocas, break_bb, cont_bb);
 
   assert(LLVMGetTypeKind(LLVMTypeOf(cond)) == LLVMIntegerTypeKind);
   assert(LLVMGetIntTypeWidth(LLVMTypeOf(cond)) == 1);
@@ -8329,8 +8461,9 @@ LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
 
   // Emit if BB.
   LLVMPositionBuilderAtEnd(builder, ifbb);
-  LLVMValueRef true_expr = compile_expr(compiler, builder, expr->true_expr,
-                                        local_ctx, local_allocas);
+  LLVMValueRef true_expr =
+      compile_expr(compiler, builder, expr->true_expr, local_ctx, local_allocas,
+                   break_bb, cont_bb);
   LLVMBuildBr(builder, mergebb);
   ifbb = LLVMGetInsertBlock(builder);  // Codegen of 'if' can change the current
                                        // block, update ifbb for the PHI.
@@ -8338,8 +8471,9 @@ LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
   // Emit potential else BB.
   LLVMAppendExistingBasicBlock(fn, elsebb);
   LLVMPositionBuilderAtEnd(builder, elsebb);
-  LLVMValueRef false_expr = compile_expr(compiler, builder, expr->false_expr,
-                                         local_ctx, local_allocas);
+  LLVMValueRef false_expr =
+      compile_expr(compiler, builder, expr->false_expr, local_ctx,
+                   local_allocas, break_bb, cont_bb);
   LLVMBuildBr(builder, mergebb);
   elsebb =
       LLVMGetInsertBlock(builder);  // Codegen of 'else' can change the current
@@ -8359,16 +8493,18 @@ LLVMValueRef compile_conditional(Compiler *compiler, LLVMBuilderRef builder,
   return phi;
 }
 
-LLVMValueRef compile_logical_binop(Compiler *compiler, LLVMBuilderRef builder,
-                                   const Expr *lhs, const Expr *rhs,
-                                   BinOpKind op, TreeMap *local_ctx,
-                                   TreeMap *local_allocas) {
+LLVMValueRef compile_logical_binop(Compiler* compiler, LLVMBuilderRef builder,
+                                   const Expr* lhs, const Expr* rhs,
+                                   BinOpKind op, TreeMap* local_ctx,
+                                   TreeMap* local_allocas,
+                                   LLVMBasicBlockRef break_bb,
+                                   LLVMBasicBlockRef cont_bb) {
   // Account for short-circuit evaluation.
   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
   LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
 
-  LLVMValueRef lhs_val =
-      compile_to_bool(compiler, builder, lhs, local_ctx, local_allocas);
+  LLVMValueRef lhs_val = compile_to_bool(compiler, builder, lhs, local_ctx,
+                                         local_allocas, break_bb, cont_bb);
   LLVMBasicBlockRef current_bb = LLVMGetInsertBlock(builder);
 
   LLVMBasicBlockRef eval_rhs_bb =
@@ -8391,8 +8527,8 @@ LLVMValueRef compile_logical_binop(Compiler *compiler, LLVMBuilderRef builder,
 
   // BB for evaluating RHS.
   LLVMPositionBuilderAtEnd(builder, eval_rhs_bb);
-  LLVMValueRef rhs_val =
-      compile_to_bool(compiler, builder, rhs, local_ctx, local_allocas);
+  LLVMValueRef rhs_val = compile_to_bool(compiler, builder, rhs, local_ctx,
+                                         local_allocas, break_bb, cont_bb);
   rhs_val = LLVMBuildZExt(builder, rhs_val, LLVMInt8Type(), "");
   LLVMBuildBr(builder, res_bb);
   eval_rhs_bb = LLVMGetInsertBlock(builder);
@@ -8416,9 +8552,10 @@ LLVMValueRef compile_logical_binop(Compiler *compiler, LLVMBuilderRef builder,
   return phi;
 }
 
-LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
-                           const BinOp *expr, TreeMap *local_ctx,
-                           TreeMap *local_allocas) {
+LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
+                           const BinOp* expr, TreeMap* local_ctx,
+                           TreeMap* local_allocas, LLVMBasicBlockRef break_bb,
+                           LLVMBasicBlockRef cont_bb) {
   const Type *lhs_ty =
       sema_get_type_of_expr_in_ctx(compiler->sema, expr->lhs, local_ctx);
   const Type *rhs_ty =
@@ -8441,9 +8578,10 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
         sema_get_pointee(compiler->sema, maybe_ptr_ty, local_ctx);
     LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, pointee_ty);
     LLVMValueRef llvm_base =
-        compile_expr(compiler, builder, maybe_ptr, local_ctx, local_allocas);
-    LLVMValueRef llvm_offset =
-        compile_expr(compiler, builder, offset, local_ctx, local_allocas);
+        compile_expr(compiler, builder, maybe_ptr, local_ctx, local_allocas,
+                     break_bb, cont_bb);
+    LLVMValueRef llvm_offset = compile_expr(
+        compiler, builder, offset, local_ctx, local_allocas, break_bb, cont_bb);
     LLVMValueRef offsets[] = {llvm_offset};
     LLVMValueRef gep =
         LLVMBuildGEP2(builder, llvm_base_ty, llvm_base, offsets, 1, "");
@@ -8464,12 +8602,13 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
   const Type *common_ty;
   if (is_logical_binop(expr->op)) {
     return compile_logical_binop(compiler, builder, expr->lhs, expr->rhs,
-                                 expr->op, local_ctx, local_allocas);
+                                 expr->op, local_ctx, local_allocas, break_bb,
+                                 cont_bb);
   } else if (is_assign_binop(expr->op)) {
     rhs = compile_implicit_cast(compiler, builder, expr->rhs, lhs_ty, local_ctx,
-                                local_allocas);
+                                local_allocas, break_bb, cont_bb);
     lhs = compile_lvalue_ptr(compiler, builder, expr->lhs, local_ctx,
-                             local_allocas);
+                             local_allocas, break_bb, cont_bb);
   } else if (expr->op == BOK_Eq || expr->op == BOK_Ne) {
     if (sema_is_pointer_type(compiler->sema, lhs_ty, local_ctx) &&
         sema_is_pointer_type(compiler->sema, rhs_ty, local_ctx)) {
@@ -8479,21 +8618,24 @@ LLVMValueRef compile_binop(Compiler *compiler, LLVMBuilderRef builder,
                                                   rhs_ty, local_ctx);
     }
     lhs = compile_implicit_cast(compiler, builder, expr->lhs, common_ty,
-                                local_ctx, local_allocas);
+                                local_ctx, local_allocas, break_bb, cont_bb);
     rhs = compile_implicit_cast(compiler, builder, expr->rhs, common_ty,
-                                local_ctx, local_allocas);
+                                local_ctx, local_allocas, break_bb, cont_bb);
   } else {
     common_ty = sema_get_common_arithmetic_type(compiler->sema, lhs_ty, rhs_ty,
                                                 local_ctx);
     lhs = compile_implicit_cast(compiler, builder, expr->lhs, common_ty,
-                                local_ctx, local_allocas);
+                                local_ctx, local_allocas, break_bb, cont_bb);
     rhs = compile_implicit_cast(compiler, builder, expr->rhs, common_ty,
-                                local_ctx, local_allocas);
+                                local_ctx, local_allocas, break_bb, cont_bb);
   }
 
   LLVMValueRef res;
 
   switch (expr->op) {
+    case BOK_Comma:
+      res = rhs;
+      break;
     case BOK_Lt: {
       LLVMIntPredicate op =
           sema_is_unsigned_integral_type(compiler->sema, common_ty)
@@ -8631,9 +8773,11 @@ LLVMTypeRef get_llvm_type_of_expr_global_ctx(Compiler *compiler,
 // Returns a vector of LLVMValueRefs.
 // `args` is a vector of Expr* (the same as `Call::args`).
 // `func_args` is a vector of FunctionArg (same as `FunctionType::pos_args`).
-vector compile_call_args(Compiler *compiler, LLVMBuilderRef builder,
-                         const vector *args, const vector *func_args,
-                         TreeMap *local_ctx, TreeMap *local_allocas) {
+vector compile_call_args(Compiler* compiler, LLVMBuilderRef builder,
+                         const vector* args, const vector* func_args,
+                         TreeMap* local_ctx, TreeMap* local_allocas,
+                         LLVMBasicBlockRef break_bb,
+                         LLVMBasicBlockRef cont_bb) {
   vector llvm_args;
   vector_construct(&llvm_args, sizeof(LLVMValueRef), alignof(LLVMValueRef));
   for (size_t i = 0; i < args->size; ++i) {
@@ -8642,14 +8786,16 @@ vector compile_call_args(Compiler *compiler, LLVMBuilderRef builder,
 
     if (i < func_args->size) {
       const FunctionArg *func_arg_ty = vector_at(func_args, i);
-      *storage = compile_implicit_cast(
-          compiler, builder, arg, func_arg_ty->type, local_ctx, local_allocas);
+      *storage =
+          compile_implicit_cast(compiler, builder, arg, func_arg_ty->type,
+                                local_ctx, local_allocas, break_bb, cont_bb);
     } else {
       // This should be a varargs function.
       const Type *arg_ty =
           sema_get_type_of_expr_in_ctx(compiler->sema, arg, local_ctx);
-      *storage = compile_implicit_cast(compiler, builder, arg, arg_ty,
-                                       local_ctx, local_allocas);
+      *storage =
+          compile_implicit_cast(compiler, builder, arg, arg_ty, local_ctx,
+                                local_allocas, break_bb, cont_bb);
     }
   }
   return llvm_args;
@@ -8669,14 +8815,35 @@ LLVMValueRef call_llvm_debugtrap(Compiler *compiler, LLVMBuilderRef builder) {
                         /*Args=*/NULL, /*NumArgs=*/0, "");
 }
 
-LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
-                          const Expr *expr, TreeMap *local_ctx,
-                          TreeMap *local_allocas) {
+void compile_compound_statement(Compiler* compiler, LLVMBuilderRef builder,
+                                const CompoundStmt* compound,
+                                TreeMap* local_ctx, TreeMap* local_allocas,
+                                LLVMBasicBlockRef break_bb,
+                                LLVMBasicBlockRef cont_bb,
+                                LLVMValueRef* last_expr);
+
+// Compile an expression and return it.
+//
+// The only time this function returns NULL is for a StmtExpr which can evaluate
+// to void. All other cases should return a valid LLVMValueRef.
+//
+// BasicBlocks are propagated soley for proper handling of statement expressions
+// which still need to respect semantics for `break` and `continue`.
+LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
+                          const Expr* expr, TreeMap* local_ctx,
+                          TreeMap* local_allocas, LLVMBasicBlockRef break_bb,
+                          LLVMBasicBlockRef cont_bb) {
   LLVMTypeRef type = get_llvm_type_of_expr(compiler, expr, local_ctx);
   switch (expr->vtable->kind) {
     case EK_String: {
       const StringLiteral *s = (const StringLiteral *)expr;
       return LLVMBuildGlobalStringPtr(builder, s->val, "");
+    }
+    case EK_PrettyFunction: {
+      LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+      size_t size;
+      return LLVMBuildGlobalStringPtr(builder, LLVMGetValueName2(fn, &size),
+                                      "");
     }
     case EK_Int: {
       const Int *i = (const Int *)expr;
@@ -8705,11 +8872,11 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
       return LLVMConstInt(type, res.result.ull, /*IsSigned=*/0);
     }
     case EK_UnOp:
-      return compile_unop(compiler, builder, (const UnOp *)expr, local_ctx,
-                          local_allocas);
+      return compile_unop(compiler, builder, (const UnOp*)expr, local_ctx,
+                          local_allocas, break_bb, cont_bb);
     case EK_BinOp:
-      return compile_binop(compiler, builder, (const BinOp *)expr, local_ctx,
-                           local_allocas);
+      return compile_binop(compiler, builder, (const BinOp*)expr, local_ctx,
+                           local_allocas, break_bb, cont_bb);
     case EK_DeclRef: {
       const DeclRef *decl = (const DeclRef *)expr;
 
@@ -8735,8 +8902,8 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
         __builtin_trap();
       }
 
-      val =
-          compile_lvalue_ptr(compiler, builder, expr, local_ctx, local_allocas);
+      val = compile_lvalue_ptr(compiler, builder, expr, local_ctx,
+                               local_allocas, break_bb, cont_bb);
 
       if (sema_is_array_type(compiler->sema, decl_ty, local_ctx))
         return val;
@@ -8757,11 +8924,12 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
           sema_get_function(compiler->sema, ty, local_ctx);
       LLVMTypeRef llvm_func_ty = get_llvm_type(compiler, &func_ty->type);
       LLVMValueRef llvm_func =
-          compile_expr(compiler, builder, call->base, local_ctx, local_allocas);
+          compile_expr(compiler, builder, call->base, local_ctx, local_allocas,
+                       break_bb, cont_bb);
 
       vector llvm_args =
           compile_call_args(compiler, builder, &call->args, &func_ty->pos_args,
-                            local_ctx, local_allocas);
+                            local_ctx, local_allocas, break_bb, cont_bb);
 
       LLVMValueRef res =
           LLVMBuildCall2(builder, llvm_func_ty, llvm_func, llvm_args.data,
@@ -8792,7 +8960,7 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
       LLVMValueRef ptr;
       if (access->is_arrow) {
         ptr = compile_expr(compiler, builder, access->base, local_ctx,
-                           local_allocas);
+                           local_allocas, break_bb, cont_bb);
         LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
         LLVMValueRef llvm_offset =
             LLVMConstInt(LLVMInt32Type(), offset, /*signed=*/0);
@@ -8800,7 +8968,7 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
         ptr = LLVMBuildGEP2(builder, llvm_base_ty, ptr, offsets, 2, "");
       } else {
         ptr = compile_lvalue_ptr(compiler, builder, expr, local_ctx,
-                                 local_allocas);
+                                 local_allocas, break_bb, cont_bb);
       }
       return LLVMBuildLoad2(builder, get_llvm_type(compiler, member->type), ptr,
                             "");
@@ -8808,19 +8976,30 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
     case EK_Conditional: {
       const Conditional *conditional = (const Conditional *)expr;
       return compile_conditional(compiler, builder, conditional, local_ctx,
-                                 local_allocas);
+                                 local_allocas, break_bb, cont_bb);
     }
     case EK_Cast: {
       const Cast *cast = (const Cast *)expr;
       return compile_implicit_cast(compiler, builder, cast->base, cast->to,
-                                   local_ctx, local_allocas);
+                                   local_ctx, local_allocas, break_bb, cont_bb);
     }
     case EK_Index: {
-      LLVMValueRef ptr =
-          compile_lvalue_ptr(compiler, builder, expr, local_ctx, local_allocas);
+      LLVMValueRef ptr = compile_lvalue_ptr(compiler, builder, expr, local_ctx,
+                                            local_allocas, break_bb, cont_bb);
       const Type *ty =
           sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
       return LLVMBuildLoad2(builder, get_llvm_type(compiler, ty), ptr, "");
+    }
+    case EK_StmtExpr: {
+      const StmtExpr* stmt_expr = (const StmtExpr*)expr;
+      if (!stmt_expr->stmt)
+        return NULL;
+
+      assert(stmt_expr->stmt->body.size > 0);
+      LLVMValueRef expr = NULL;
+      compile_compound_statement(compiler, builder, stmt_expr->stmt, local_ctx,
+                                 local_allocas, break_bb, cont_bb, &expr);
+      return expr;
     }
     default:
       printf("TODO: Implement compile_expr for this expr %d\n",
@@ -8829,10 +9008,10 @@ LLVMValueRef compile_expr(Compiler *compiler, LLVMBuilderRef builder,
   }
 }
 
-void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
-                       const Statement *stmt, TreeMap *local_ctx,
-                       TreeMap *local_allocas, LLVMBasicBlockRef,
-                       LLVMBasicBlockRef);
+void compile_statement(Compiler* compiler, LLVMBuilderRef builder,
+                       const Statement* stmt, TreeMap* local_ctx,
+                       TreeMap* local_allocas, LLVMBasicBlockRef break_bb,
+                       LLVMBasicBlockRef cont_bb, LLVMValueRef* last_expr);
 
 void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
                           const IfStmt *stmt, TreeMap *local_ctx,
@@ -8840,8 +9019,8 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
                           LLVMBasicBlockRef cont_bb) {
   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
   LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
-  LLVMValueRef cond =
-      compile_to_bool(compiler, builder, stmt->cond, local_ctx, local_allocas);
+  LLVMValueRef cond = compile_to_bool(compiler, builder, stmt->cond, local_ctx,
+                                      local_allocas, break_bb, cont_bb);
 
   assert(LLVMGetTypeKind(LLVMTypeOf(cond)) == LLVMIntegerTypeKind);
   assert(LLVMGetIntTypeWidth(LLVMTypeOf(cond)) == 1);
@@ -8857,7 +9036,7 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
   // Emit if BB.
   LLVMPositionBuilderAtEnd(builder, ifbb);
 
-  {
+  if (stmt->body) {
     TreeMap local_ctx_cpy;
     TreeMap local_allocas_cpy;
     string_tree_map_construct(&local_ctx_cpy);
@@ -8866,7 +9045,8 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
     tree_map_clone(&local_allocas_cpy, local_allocas);
 
     compile_statement(compiler, builder, stmt->body, &local_ctx_cpy,
-                      &local_allocas_cpy, break_bb, cont_bb);
+                      &local_allocas_cpy, break_bb, cont_bb,
+                      /*last_expr=*/NULL);
 
     tree_map_destroy(&local_ctx_cpy);
     tree_map_destroy(&local_allocas_cpy);
@@ -8893,7 +9073,7 @@ void compile_if_statement(Compiler *compiler, LLVMBuilderRef builder,
       tree_map_clone(&local_allocas_cpy, local_allocas);
 
       compile_statement(compiler, builder, stmt->else_stmt, local_ctx,
-                        local_allocas, break_bb, cont_bb);
+                        local_allocas, break_bb, cont_bb, /*last_expr=*/NULL);
 
       tree_map_destroy(&local_ctx_cpy);
       tree_map_destroy(&local_allocas_cpy);
@@ -8946,7 +9126,8 @@ void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
   // Emit the initializer if any.
   if (stmt->init) {
     compile_statement(compiler, builder, stmt->init, &local_ctx_cpy,
-                      &local_allocas_cpy, break_bb, cont_bb);
+                      &local_allocas_cpy, break_bb, cont_bb,
+                      /*last_expr=*/NULL);
   }
 
   LLVMBasicBlockRef for_start =
@@ -8959,8 +9140,9 @@ void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
 
   // Check the condition if any.
   if (stmt->cond) {
-    LLVMValueRef cond = compile_to_bool(compiler, builder, stmt->cond,
-                                        &local_ctx_cpy, &local_allocas_cpy);
+    LLVMValueRef cond =
+        compile_to_bool(compiler, builder, stmt->cond, &local_ctx_cpy,
+                        &local_allocas_cpy, break_bb, cont_bb);
     LLVMBasicBlockRef for_body = LLVMCreateBasicBlockInContext(ctx, "for_body");
     LLVMBuildCondBr(builder, cond, for_body, for_end);
 
@@ -8971,7 +9153,8 @@ void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
   // Now emit the body.
   if (stmt->body) {
     compile_statement(compiler, builder, stmt->body, &local_ctx_cpy,
-                      &local_allocas_cpy, for_end, for_iter);
+                      &local_allocas_cpy, for_end, for_iter,
+                      /*last_expr=*/NULL);
   }
 
   // Branch to the iterator.
@@ -8984,7 +9167,7 @@ void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
   // Then do the iter.
   if (stmt->iter) {
     compile_expr(compiler, builder, stmt->iter, &local_ctx_cpy,
-                 &local_allocas_cpy);
+                 &local_allocas_cpy, break_bb, cont_bb);
   }
 
   // And branch back to the start.
@@ -9008,8 +9191,8 @@ void compile_switch_statement(Compiler *compiler, LLVMBuilderRef builder,
   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
   LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
 
-  LLVMValueRef check =
-      compile_expr(compiler, builder, stmt->cond, local_ctx, local_allocas);
+  LLVMValueRef check = compile_expr(compiler, builder, stmt->cond, local_ctx,
+                                    local_allocas, break_bb, cont_bb);
 
   LLVMBasicBlockRef end_bb = LLVMCreateBasicBlockInContext(ctx, "switch_end");
 
@@ -9026,7 +9209,7 @@ void compile_switch_statement(Compiler *compiler, LLVMBuilderRef builder,
 
     LLVMValueRef case_val =
         compile_implicit_cast(compiler, builder, switch_case->cond, common_ty,
-                              local_ctx, local_allocas);
+                              local_ctx, local_allocas, break_bb, cont_bb);
     LLVMValueRef cond = LLVMBuildICmp(builder, LLVMIntEQ, check, case_val, "");
     should_fallthrough = LLVMBuildOr(builder, cond, should_fallthrough, "");
     LLVMBuildCondBr(builder, should_fallthrough, case_bb, next_bb);
@@ -9037,7 +9220,7 @@ void compile_switch_statement(Compiler *compiler, LLVMBuilderRef builder,
     for (size_t j = 0; j < switch_case->stmts.size; ++j) {
       Statement **case_stmt = vector_at(&switch_case->stmts, j);
       compile_statement(compiler, builder, *case_stmt, local_ctx, local_allocas,
-                        end_bb, cont_bb);
+                        end_bb, cont_bb, /*last_expr=*/NULL);
 
       if ((last_stmt_terminates = last_instruction_is_terminator(builder)))
         break;
@@ -9055,7 +9238,7 @@ void compile_switch_statement(Compiler *compiler, LLVMBuilderRef builder,
     for (size_t i = 0; i < stmt->default_stmts->size; ++i) {
       Statement **default_stmt = vector_at(stmt->default_stmts, i);
       compile_statement(compiler, builder, *default_stmt, local_ctx,
-                        local_allocas, end_bb, cont_bb);
+                        local_allocas, end_bb, cont_bb, /*last_expr=*/NULL);
 
       if (last_instruction_is_terminator(builder))
         break;
@@ -9069,15 +9252,51 @@ void compile_switch_statement(Compiler *compiler, LLVMBuilderRef builder,
   LLVMPositionBuilderAtEnd(builder, end_bb);
 }
 
-void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
-                       const Statement *stmt, TreeMap *local_ctx,
-                       TreeMap *local_allocas, LLVMBasicBlockRef break_bb,
-                       LLVMBasicBlockRef cont_bb) {
+// Compile a compound statement. If the body is not empty and the last statement
+// is an expression statement and `last_expr` is provided, set `last_expr` to
+// the resulting LLVMValueRef that expression compiles to.
+void compile_compound_statement(Compiler* compiler, LLVMBuilderRef builder,
+                                const CompoundStmt* compound,
+                                TreeMap* local_ctx, TreeMap* local_allocas,
+                                LLVMBasicBlockRef break_bb,
+                                LLVMBasicBlockRef cont_bb,
+                                LLVMValueRef* last_expr) {
+  TreeMap local_ctx_cpy;
+  TreeMap local_allocas_cpy;
+  string_tree_map_construct(&local_ctx_cpy);
+  string_tree_map_construct(&local_allocas_cpy);
+  tree_map_clone(&local_ctx_cpy, local_ctx);
+  tree_map_clone(&local_allocas_cpy, local_allocas);
+
+  for (size_t i = 0; i < compound->body.size; ++i) {
+    Statement* stmt = *(Statement**)vector_at(&compound->body, i);
+    compile_statement(compiler, builder, stmt, &local_ctx_cpy,
+                      &local_allocas_cpy, break_bb, cont_bb, last_expr);
+    if (last_instruction_is_terminator(builder))
+      break;
+  }
+
+  tree_map_destroy(&local_ctx_cpy);
+  tree_map_destroy(&local_allocas_cpy);
+  return;
+}
+
+// Compile a compound statement. If the statement is an expression statement and
+// `last_expr` is provided, set `last_expr` to the resulting LLVMValueRef that
+// expression compiles to.
+void compile_statement(Compiler* compiler, LLVMBuilderRef builder,
+                       const Statement* stmt, TreeMap* local_ctx,
+                       TreeMap* local_allocas, LLVMBasicBlockRef break_bb,
+                       LLVMBasicBlockRef cont_bb, LLVMValueRef* last_expr) {
   switch (stmt->vtable->kind) {
-    case SK_ExprStmt:
-      compile_expr(compiler, builder, ((const ExprStmt *)stmt)->expr, local_ctx,
-                   local_allocas);
+    case SK_ExprStmt: {
+      LLVMValueRef expr =
+          compile_expr(compiler, builder, ((const ExprStmt*)stmt)->expr,
+                       local_ctx, local_allocas, break_bb, cont_bb);
+      if (last_expr)
+        *last_expr = expr;
       return;
+    }
     case SK_IfStmt:
       return compile_if_statement(compiler, builder, (const IfStmt *)stmt,
                                   local_ctx, local_allocas, break_bb, cont_bb);
@@ -9090,8 +9309,8 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
         LLVMBuildRetVoid(builder);
         return;
       }
-      LLVMValueRef val =
-          compile_expr(compiler, builder, ret->expr, local_ctx, local_allocas);
+      LLVMValueRef val = compile_expr(compiler, builder, ret->expr, local_ctx,
+                                      local_allocas, break_bb, cont_bb);
 
       // TODO: There should be an ImplicitCast AST node that we can parser over
       // rather than doing this here.
@@ -9112,27 +9331,10 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
       LLVMBuildBr(builder, break_bb);
       return;
     }
-    case SK_CompoundStmt: {
-      TreeMap local_ctx_cpy;
-      TreeMap local_allocas_cpy;
-      string_tree_map_construct(&local_ctx_cpy);
-      string_tree_map_construct(&local_allocas_cpy);
-      tree_map_clone(&local_ctx_cpy, local_ctx);
-      tree_map_clone(&local_allocas_cpy, local_allocas);
-
-      const CompoundStmt *compound = (const CompoundStmt *)stmt;
-      for (size_t i = 0; i < compound->body.size; ++i) {
-        Statement *stmt = *(Statement **)vector_at(&compound->body, i);
-        compile_statement(compiler, builder, stmt, &local_ctx_cpy,
-                          &local_allocas_cpy, break_bb, cont_bb);
-        if (last_instruction_is_terminator(builder))
-          break;
-      }
-
-      tree_map_destroy(&local_ctx_cpy);
-      tree_map_destroy(&local_allocas_cpy);
-      return;
-    }
+    case SK_CompoundStmt:
+      return compile_compound_statement(
+          compiler, builder, (const CompoundStmt*)stmt, local_ctx,
+          local_allocas, break_bb, cont_bb, /*last_expr=*/NULL);
     case SK_Declaration: {
       const Declaration *decl = (const Declaration *)stmt;
 
@@ -9196,8 +9398,9 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
 
           for (size_t i = 0; i < init->elems.size; ++i) {
             const InitializerListElem *elem = vector_at(&init->elems, i);
-            LLVMValueRef val = compile_expr(compiler, builder, elem->expr,
-                                            local_ctx, local_allocas);
+            LLVMValueRef val =
+                compile_expr(compiler, builder, elem->expr, local_ctx,
+                             local_allocas, break_bb, cont_bb);
 
             // TODO: Handle designated initializer names.
 
@@ -9217,9 +9420,9 @@ void compile_statement(Compiler *compiler, LLVMBuilderRef builder,
             LLVMBuildStore(builder, val, gep);
           }
         } else {
-          LLVMValueRef init =
-              compile_implicit_cast(compiler, builder, decl->initializer,
-                                    decl->type, local_ctx, local_allocas);
+          LLVMValueRef init = compile_implicit_cast(
+              compiler, builder, decl->initializer, decl->type, local_ctx,
+              local_allocas, break_bb, cont_bb);
           LLVMBuildStore(builder, init, alloca);
         }
       }
@@ -9315,7 +9518,8 @@ void compile_function_definition(Compiler *compiler,
   }
 
   compile_statement(compiler, builder, &f->body->base, &local_ctx,
-                    &local_allocas, NULL, NULL);
+                    &local_allocas, /*break_bb=*/NULL, /*cont_bb=*/NULL,
+                    /*last_expr=*/NULL);
 
   if (!last_instruction_is_terminator(builder)) {
     if (is_void_type(func_ty->return_type)) {
@@ -9338,9 +9542,11 @@ void compile_function_definition(Compiler *compiler,
   }
 }
 
-LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
-                                const Expr *expr, TreeMap *local_ctx,
-                                TreeMap *local_allocas) {
+LLVMValueRef compile_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
+                                const Expr* expr, TreeMap* local_ctx,
+                                TreeMap* local_allocas,
+                                LLVMBasicBlockRef break_bb,
+                                LLVMBasicBlockRef cont_bb) {
   switch (expr->vtable->kind) {
     case EK_DeclRef: {
       const DeclRef *decl = (const DeclRef *)expr;
@@ -9371,10 +9577,11 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
       LLVMValueRef base_llvm;
       if (access->is_arrow) {
         base_llvm = compile_expr(compiler, builder, access->base, local_ctx,
-                                 local_allocas);
+                                 local_allocas, break_bb, cont_bb);
       } else {
-        base_llvm = compile_lvalue_ptr(compiler, builder, access->base,
-                                       local_ctx, local_allocas);
+        base_llvm =
+            compile_lvalue_ptr(compiler, builder, access->base, local_ctx,
+                               local_allocas, break_bb, cont_bb);
       }
 
       LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
@@ -9386,8 +9593,9 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
       return gep;
     }
     case EK_UnOp:
-      return compile_unop_lvalue_ptr(compiler, builder, (const UnOp *)expr,
-                                     local_ctx, local_allocas);
+      return compile_unop_lvalue_ptr(compiler, builder, (const UnOp*)expr,
+                                     local_ctx, local_allocas, break_bb,
+                                     cont_bb);
     case EK_Cast: {
       const Cast *cast = (const Cast *)expr;
       const Type *src_ty =
@@ -9397,7 +9605,7 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
       LLVMTypeRef llvm_dst_ty = get_llvm_type(compiler, dst_ty);
       if (LLVMGetTypeKind(llvm_src_ty) == LLVMGetTypeKind(llvm_dst_ty))
         return compile_lvalue_ptr(compiler, builder, cast->base, local_ctx,
-                                  local_allocas);
+                                  local_allocas, break_bb, cont_bb);
 
       printf("Unhandled lvalue ptr cast from %d to %d\n",
              LLVMGetTypeKind(llvm_src_ty), LLVMGetTypeKind(llvm_dst_ty));
@@ -9409,11 +9617,11 @@ LLVMValueRef compile_lvalue_ptr(Compiler *compiler, LLVMBuilderRef builder,
       const Type *base_ty =
           sema_get_type_of_expr_in_ctx(compiler->sema, base, local_ctx);
 
-      LLVMValueRef idx =
-          compile_expr(compiler, builder, index->idx, local_ctx, local_allocas);
+      LLVMValueRef idx = compile_expr(compiler, builder, index->idx, local_ctx,
+                                      local_allocas, break_bb, cont_bb);
 
-      LLVMValueRef base_ptr =
-          compile_expr(compiler, builder, base, local_ctx, local_allocas);
+      LLVMValueRef base_ptr = compile_expr(compiler, builder, base, local_ctx,
+                                           local_allocas, break_bb, cont_bb);
 
       assert(LLVMGetTypeKind(LLVMTypeOf(base_ptr)) == LLVMPointerTypeKind);
 
