@@ -2,19 +2,9 @@
 #include <ctype.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-// IO functions
-int printf(const char *, ...);
-
-// File functions
-// Normally each of these would operate on FILE pointers, but for ABI purposes
-// we can use void* here.
-void *fopen(const char *, const char *);
-int fclose(void *);
-int fgetc(void *);
-int feof(void *);
 
 // LLVM does not actually have a way of providing the CHAR_BIT for the arch.
 // Clang unconditionally sets it to 8.
@@ -1256,6 +1246,7 @@ typedef enum {
   TK_Double,
   TK_Complex,
   TK_Float128,
+  TK_BuiltinVAList,
   TK_Void,
   TK_Bool,
   TK_BuiltinTypesLast = TK_Bool,
@@ -1888,6 +1879,8 @@ Token lex(Lexer *lexer) {
     tok.kind = TK_Asm;
   } else if (string_equals(&tok.chars, "__inline")) {
     tok.kind = TK_Inline;
+  } else if (string_equals(&tok.chars, "__builtin_va_list")) {
+    tok.kind = TK_BuiltinVAList;
   } else if (string_equals(&tok.chars, "typedef")) {
     tok.kind = TK_Typedef;
   } else if (string_equals(&tok.chars, "struct")) {
@@ -2059,6 +2052,7 @@ typedef enum {
   BTK_ComplexLongDouble,
   BTK_Void,
   BTK_Bool,
+  BTK_BuiltinVAList,
 } BuiltinTypeKind;
 
 void builtin_type_destroy(Type *) {}
@@ -3629,6 +3623,7 @@ struct TypeSpecifier {
   unsigned int struct_ : 1;
   unsigned int enum_ : 1;
   unsigned int union_ : 1;
+  unsigned int builtin_va_list_ : 1;
 };
 
 Type* parse_specifiers_and_qualifiers_and_storage(Parser* parser,
@@ -3695,6 +3690,9 @@ Type* parse_specifiers_and_qualifiers_and_storage(Parser* parser,
       case TK_Long:
         spec.long_++;
         assert(spec.long_ < 3);
+        break;
+      case TK_BuiltinVAList:
+        spec.builtin_va_list_ = 1;
         break;
       case TK_Float:
         spec.float_ = 1;
@@ -3852,6 +3850,8 @@ Type* parse_specifiers_and_qualifiers_and_storage(Parser* parser,
     kind = BTK_Bool;
   } else if (spec.void_) {
     kind = BTK_Void;
+  } else if (spec.builtin_va_list_) {
+    kind = BTK_BuiltinVAList;
   } else {
     const Token *tok = parser_peek_token(parser);
     printf(
@@ -7344,6 +7344,8 @@ static size_t builtin_type_get_size(const BuiltinType *bt) {
       return sizeof(_Complex double);
     case BTK_ComplexLongDouble:
       return sizeof(_Complex long double);
+    case BTK_BuiltinVAList:
+      return sizeof(__builtin_va_list);
     case BTK_Void:
       printf("Attempting to get sizeof void\n");
       __builtin_trap();
@@ -7391,6 +7393,8 @@ static size_t builtin_type_get_align(const BuiltinType *bt) {
       return alignof(_Complex double);
     case BTK_ComplexLongDouble:
       return alignof(_Complex long double);
+    case BTK_BuiltinVAList:
+      return alignof(__builtin_va_list);
     case BTK_Void:
       printf("Attempting to get alignof void\n");
       __builtin_trap();
@@ -7999,6 +8003,27 @@ LLVMTypeRef get_llvm_builtin_type(Compiler *compiler, const BuiltinType *bt) {
       LLVMTypeRef elems[] = {LLVMFP128TypeInContext(ctx),
                              LLVMFP128TypeInContext(ctx)};
       return LLVMStructType(elems, /*ElementCount=*/2, /*Packed=*/0);
+    }
+    case BTK_BuiltinVAList: {
+      // TODO: This is a target-dependent type. It should have different
+      // implementations per target.
+      //
+      // https://refspecs.linuxbase.org/elf/x86_64-abi-0.21.pdf
+      //
+      // On x86-64, this is
+      //
+      //   typedef struct {
+      //     unsigned int gp_offset;
+      //     unsigned int fp_offset;
+      //     void *overflow_arg_area;
+      //     void *reg_save_area;
+      //   } va_list[1];
+      //
+      LLVMTypeRef ui =
+          get_llvm_builtin_type(compiler, &compiler->sema->bt_UnsignedInt);
+      LLVMTypeRef vp = get_opaque_ptr(compiler);
+      LLVMTypeRef elems[] = {ui, ui, vp, vp};
+      return LLVMStructType(elems, /*ElementCount=*/4, /*Packed=*/0);
     }
   }
 }
