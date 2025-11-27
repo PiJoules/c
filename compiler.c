@@ -1,5 +1,11 @@
 #include <assert.h>
 #include <ctype.h>
+#include <llvm-c/Analysis.h>
+#include <llvm-c/Core.h>
+#include <llvm-c/DebugInfo.h>
+#include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
+#include <llvm-c/Types.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,482 +22,6 @@
 // This is probably fine since AFAICT, upstream clang doesn't have any backends
 // where a byte is not 8 bits. If there was, that would be pretty interesting.
 static const int kCharBit = 8;
-
-// LLVM API
-typedef struct LLVMOpaqueType *LLVMTypeRef;
-typedef int LLVMBool;
-typedef struct LLVMOpaqueContext *LLVMContextRef;
-typedef struct LLVMOpaqueModule *LLVMModuleRef;
-typedef struct LLVMTarget *LLVMTargetRef;
-typedef struct LLVMOpaqueTargetMachine *LLVMTargetMachineRef;
-typedef struct LLVMOpaqueTargetData *LLVMTargetDataRef;
-typedef struct LLVMOpaqueValue *LLVMValueRef;
-typedef struct LLVMOpaqueBasicBlock *LLVMBasicBlockRef;
-typedef struct LLVMOpaqueBuilder *LLVMBuilderRef;
-
-LLVMModuleRef LLVMModuleCreateWithName(const char *ModuleID);
-const char *LLVMGetDataLayoutStr(LLVMModuleRef M);
-
-typedef enum {
-  LLVMAbortProcessAction, /* verifier will print to stderr and abort() */
-  LLVMPrintMessageAction, /* verifier will print to stderr and return 1 */
-  LLVMReturnStatusAction  /* verifier will just return 1 */
-} LLVMVerifierFailureAction;
-LLVMBool LLVMVerifyModule(LLVMModuleRef M, LLVMVerifierFailureAction Action,
-                          char **OutMessage);
-LLVMBool LLVMVerifyFunction(LLVMValueRef Fn, LLVMVerifierFailureAction Action);
-LLVMBool LLVMIsConstant(LLVMValueRef Val);
-void LLVMDumpValue(LLVMValueRef Val);
-void LLVMDumpType(LLVMTypeRef Val);
-void LLVMDumpModule(LLVMModuleRef M);
-void LLVMDisposeModule(LLVMModuleRef M);
-void LLVMDisposeTargetData(LLVMTargetDataRef TD);
-void LLVMDisposeTargetMachine(LLVMTargetMachineRef T);
-void LLVMDeleteBasicBlock(LLVMBasicBlockRef BB);
-void LLVMDisposeBuilder(LLVMBuilderRef Builder);
-LLVMBool LLVMPrintModuleToFile(LLVMModuleRef M, const char *Filename,
-                               char **ErrorMessage);
-
-typedef enum { LLVMAssemblyFile, LLVMObjectFile } LLVMCodeGenFileType;
-LLVMBool LLVMTargetMachineEmitToFile(LLVMTargetMachineRef T, LLVMModuleRef M,
-                                     const char *Filename,
-                                     LLVMCodeGenFileType codegen,
-                                     char **ErrorMessage);
-
-LLVMValueRef LLVMAddGlobal(LLVMModuleRef M, LLVMTypeRef Ty, const char *Name);
-void LLVMSetInitializer(LLVMValueRef GlobalVar, LLVMValueRef ConstantVal);
-LLVMValueRef LLVMAddFunction(LLVMModuleRef M, const char *Name,
-                             LLVMTypeRef FuncTy);
-LLVMValueRef LLVMGetNamedFunction(LLVMModuleRef M, const char *Name);
-LLVMValueRef LLVMGetNamedGlobal(LLVMModuleRef M, const char *Name);
-char *LLVMPrintModuleToString(LLVMModuleRef M);
-char *LLVMPrintValueToString(LLVMValueRef Val);
-void LLVMDisposeMessage(char *Message);
-LLVMBool LLVMTypeIsSized(LLVMTypeRef Ty);
-LLVMTypeRef LLVMVoidType(void);
-LLVMTypeRef LLVMInt1Type();
-LLVMTypeRef LLVMInt8Type();
-LLVMTypeRef LLVMInt16Type();
-LLVMTypeRef LLVMInt32Type();
-LLVMTypeRef LLVMIntType(unsigned NumBits);
-LLVMTypeRef LLVMFloatTypeInContext(LLVMContextRef C);
-LLVMTypeRef LLVMDoubleTypeInContext(LLVMContextRef C);
-LLVMTypeRef LLVMFP128TypeInContext(LLVMContextRef C);
-LLVMTypeRef LLVMGetReturnType(LLVMTypeRef FunctionTy);
-void *LLVMStructCreateNamed(void *C, const char *Name);
-LLVMTypeRef LLVMStructType(LLVMTypeRef *ElementTypes, unsigned ElementCount,
-                           LLVMBool Packed);
-void *LLVMGetTypeByName(void *M, const char *Name);
-void LLVMStructSetBody(LLVMTypeRef StructTy, LLVMTypeRef *ElementTypes,
-                       unsigned ElementCount, LLVMBool Packed);
-LLVMTypeRef LLVMPointerTypeInContext(LLVMContextRef C, unsigned AddressSpace);
-LLVMTypeRef LLVMArrayType(LLVMTypeRef ElementType, unsigned ElementCount);
-LLVMTypeRef LLVMFunctionType(LLVMTypeRef ReturnType, LLVMTypeRef *ParamTypes,
-                             unsigned ParamCount, LLVMBool IsVarArg);
-LLVMTypeRef LLVMPointerType(LLVMTypeRef ElementType, unsigned AddressSpace);
-char *LLVMPrintTypeToString(LLVMTypeRef Val);
-
-LLVMBasicBlockRef LLVMGetEntryBasicBlock(LLVMValueRef Fn);
-LLVMBasicBlockRef LLVMAppendBasicBlock(LLVMValueRef Fn, const char *Name);
-LLVMBuilderRef LLVMCreateBuilder(void);
-void LLVMPositionBuilderAtEnd(LLVMBuilderRef Builder, LLVMBasicBlockRef Block);
-void LLVMPositionBuilder(LLVMBuilderRef Builder, LLVMBasicBlockRef Block,
-                         LLVMValueRef Instr);
-LLVMValueRef LLVMConstInt(LLVMTypeRef IntTy, unsigned long long N,
-                          LLVMBool SignExtend);
-unsigned long long LLVMConstIntGetZExtValue(LLVMValueRef ConstantVal);
-LLVMBasicBlockRef LLVMAppendBasicBlockInContext(LLVMContextRef C,
-                                                LLVMValueRef Fn,
-                                                const char *Name);
-LLVMBasicBlockRef LLVMCreateBasicBlockInContext(LLVMContextRef C,
-                                                const char *Name);
-LLVMContextRef LLVMGetBuilderContext(LLVMBuilderRef Builder);
-LLVMBasicBlockRef LLVMGetInsertBlock(LLVMBuilderRef Builder);
-LLVMValueRef LLVMGetBasicBlockParent(LLVMBasicBlockRef BB);
-LLVMValueRef LLVMBuildCondBr(LLVMBuilderRef, LLVMValueRef If,
-                             LLVMBasicBlockRef Then, LLVMBasicBlockRef Else);
-void LLVMPositionBuilderAtEnd(LLVMBuilderRef Builder, LLVMBasicBlockRef Block);
-LLVMValueRef LLVMBuildBr(LLVMBuilderRef, LLVMBasicBlockRef Dest);
-LLVMContextRef LLVMGetValueContext(LLVMValueRef Val);
-LLVMContextRef LLVMGetModuleContext(LLVMModuleRef M);
-void LLVMAppendExistingBasicBlock(LLVMValueRef Fn, LLVMBasicBlockRef BB);
-LLVMTypeRef LLVMTypeOf(LLVMValueRef Val);
-LLVMValueRef LLVMConstNull(LLVMTypeRef Ty);
-LLVMValueRef LLVMConstAllOnes(LLVMTypeRef Ty);
-LLVMValueRef LLVMGetParam(LLVMValueRef Fn, unsigned Index);
-void LLVMSetValueName2(LLVMValueRef Val, const char *Name, size_t NameLen);
-const char* LLVMGetValueName2(LLVMValueRef Val, size_t* Length);
-LLVMValueRef LLVMBuildAlloca(LLVMBuilderRef, LLVMTypeRef Ty, const char *Name);
-LLVMValueRef LLVMBuildStore(LLVMBuilderRef, LLVMValueRef Val, LLVMValueRef Ptr);
-LLVMValueRef LLVMBuildLoad2(LLVMBuilderRef, LLVMTypeRef Ty,
-                            LLVMValueRef PointerVal, const char *Name);
-LLVMValueRef LLVMBuildCall2(LLVMBuilderRef, LLVMTypeRef, LLVMValueRef Fn,
-                            LLVMValueRef *Args, unsigned NumArgs,
-                            const char *Name);
-LLVMValueRef LLVMBuildUnreachable(LLVMBuilderRef);
-unsigned LLVMLookupIntrinsicID(const char *Name, size_t NameLen);
-LLVMValueRef LLVMGetIntrinsicDeclaration(LLVMModuleRef Mod, unsigned ID,
-                                         LLVMTypeRef *ParamTypes,
-                                         size_t ParamCount);
-LLVMTypeRef LLVMIntrinsicGetType(LLVMContextRef Ctx, unsigned ID,
-                                 LLVMTypeRef *ParamTypes, size_t ParamCount);
-LLVMValueRef LLVMBuildExtractValue(LLVMBuilderRef, LLVMValueRef AggVal,
-                                   unsigned Index, const char *Name);
-LLVMValueRef LLVMBuildRetVoid(LLVMBuilderRef);
-LLVMValueRef LLVMBuildRet(LLVMBuilderRef, LLVMValueRef V);
-LLVMValueRef LLVMConstIntToPtr(LLVMValueRef ConstantVal, LLVMTypeRef ToType);
-LLVMValueRef LLVMConstPtrToInt(LLVMValueRef ConstantVal, LLVMTypeRef ToType);
-LLVMValueRef LLVMBuildPtrToInt(LLVMBuilderRef, LLVMValueRef Val,
-                               LLVMTypeRef DestTy, const char *Name);
-LLVMValueRef LLVMBuildIntToPtr(LLVMBuilderRef, LLVMValueRef Val,
-                               LLVMTypeRef DestTy, const char *Name);
-LLVMValueRef LLVMBuildMul(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
-                          const char *Name);
-LLVMValueRef LLVMBuildAdd(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
-                          const char *Name);
-LLVMValueRef LLVMBuildSub(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
-                          const char *Name);
-LLVMValueRef LLVMBuildAnd(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
-                          const char *Name);
-LLVMValueRef LLVMBuildOr(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
-                         const char *Name);
-LLVMValueRef LLVMBuildTrunc(LLVMBuilderRef, LLVMValueRef Val,
-                            LLVMTypeRef DestTy, const char *Name);
-LLVMValueRef LLVMBuildZExt(LLVMBuilderRef, LLVMValueRef Val, LLVMTypeRef DestTy,
-                           const char *Name);
-LLVMValueRef LLVMBuildSExt(LLVMBuilderRef, LLVMValueRef Val, LLVMTypeRef DestTy,
-                           const char *Name);
-LLVMValueRef LLVMBuildGlobalStringPtr(LLVMBuilderRef B, const char *Str,
-                                      const char *Name);
-LLVMValueRef LLVMBuildXor(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
-                          const char *Name);
-LLVMValueRef LLVMBuildGEP2(LLVMBuilderRef B, LLVMTypeRef Ty,
-                           LLVMValueRef Pointer, LLVMValueRef *Indices,
-                           unsigned NumIndices, const char *Name);
-LLVMValueRef LLVMBuildPhi(LLVMBuilderRef, LLVMTypeRef Ty, const char *Name);
-void LLVMAddIncoming(LLVMValueRef PhiNode, LLVMValueRef *IncomingValues,
-                     LLVMBasicBlockRef *IncomingBlocks, unsigned Count);
-LLVMValueRef LLVMBuildURem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
-                           const char *Name);
-LLVMValueRef LLVMBuildSRem(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
-                           const char *Name);
-LLVMValueRef LLVMBuildShl(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
-                          const char *Name);
-LLVMValueRef LLVMBuildAShr(LLVMBuilderRef, LLVMValueRef LHS, LLVMValueRef RHS,
-                           const char* Name);
-LLVMValueRef LLVMGetLastInstruction(LLVMBasicBlockRef BB);
-LLVMValueRef LLVMGetFirstInstruction(LLVMBasicBlockRef BB);
-LLVMValueRef LLVMConstStruct(LLVMValueRef *ConstantVals, unsigned Count,
-                             LLVMBool Packed);
-LLVMValueRef LLVMBuildMemSet(LLVMBuilderRef B, LLVMValueRef Ptr,
-                             LLVMValueRef Val, LLVMValueRef Len,
-                             unsigned Align);
-
-typedef enum {
-  LLVMArgumentValueKind,
-  LLVMBasicBlockValueKind,
-  LLVMMemoryUseValueKind,
-  LLVMMemoryDefValueKind,
-  LLVMMemoryPhiValueKind,
-
-  LLVMFunctionValueKind,
-  LLVMGlobalAliasValueKind,
-  LLVMGlobalIFuncValueKind,
-  LLVMGlobalVariableValueKind,
-  LLVMBlockAddressValueKind,
-  LLVMConstantExprValueKind,
-  LLVMConstantArrayValueKind,
-  LLVMConstantStructValueKind,
-  LLVMConstantVectorValueKind,
-
-  LLVMUndefValueValueKind,
-  LLVMConstantAggregateZeroValueKind,
-  LLVMConstantDataArrayValueKind,
-  LLVMConstantDataVectorValueKind,
-  LLVMConstantIntValueKind,
-  LLVMConstantFPValueKind,
-  LLVMConstantPointerNullValueKind,
-  LLVMConstantTokenNoneValueKind,
-
-  LLVMMetadataAsValueValueKind,
-  LLVMInlineAsmValueKind,
-
-  LLVMInstructionValueKind,
-  LLVMPoisonValueValueKind,
-  LLVMConstantTargetNoneValueKind,
-  LLVMConstantPtrAuthValueKind,
-} LLVMValueKind;
-LLVMValueKind LLVMGetValueKind(LLVMValueRef Val);
-
-LLVMValueRef LLVMIsATerminatorInst(LLVMValueRef Inst);
-
-typedef enum {
-  LLVMIntEQ = 32, /**< equal */
-  LLVMIntNE,      /**< not equal */
-  LLVMIntUGT,     /**< unsigned greater than */
-  LLVMIntUGE,     /**< unsigned greater or equal */
-  LLVMIntULT,     /**< unsigned less than */
-  LLVMIntULE,     /**< unsigned less or equal */
-  LLVMIntSGT,     /**< signed greater than */
-  LLVMIntSGE,     /**< signed greater or equal */
-  LLVMIntSLT,     /**< signed less than */
-  LLVMIntSLE      /**< signed less or equal */
-} LLVMIntPredicate;
-
-typedef enum {
-  LLVMRealPredicateFalse, /**< Always false (always folded) */
-  LLVMRealOEQ,            /**< True if ordered and equal */
-  LLVMRealOGT,            /**< True if ordered and greater than */
-  LLVMRealOGE,            /**< True if ordered and greater than or equal */
-  LLVMRealOLT,            /**< True if ordered and less than */
-  LLVMRealOLE,            /**< True if ordered and less than or equal */
-  LLVMRealONE,            /**< True if ordered and operands are unequal */
-  LLVMRealORD,            /**< True if ordered (no nans) */
-  LLVMRealUNO,            /**< True if unordered: isnan(X) | isnan(Y) */
-  LLVMRealUEQ,            /**< True if unordered or equal */
-  LLVMRealUGT,            /**< True if unordered or greater than */
-  LLVMRealUGE,            /**< True if unordered, greater than, or equal */
-  LLVMRealULT,            /**< True if unordered or less than */
-  LLVMRealULE,            /**< True if unordered, less than, or equal */
-  LLVMRealUNE,            /**< True if unordered or not equal */
-  LLVMRealPredicateTrue   /**< Always true (always folded) */
-} LLVMRealPredicate;
-LLVMValueRef LLVMBuildICmp(LLVMBuilderRef, LLVMIntPredicate Op,
-                           LLVMValueRef LHS, LLVMValueRef RHS,
-                           const char *Name);
-LLVMValueRef LLVMBuildFCmp(LLVMBuilderRef, LLVMRealPredicate Op,
-                           LLVMValueRef LHS, LLVMValueRef RHS,
-                           const char *Name);
-
-typedef enum {
-  LLVMVoidTypeKind = 0,     /**< type with no size */
-  LLVMHalfTypeKind = 1,     /**< 16 bit floating point type */
-  LLVMFloatTypeKind = 2,    /**< 32 bit floating point type */
-  LLVMDoubleTypeKind = 3,   /**< 64 bit floating point type */
-  LLVMX86_FP80TypeKind = 4, /**< 80 bit floating point type (X87) */
-  LLVMFP128TypeKind = 5, /**< 128 bit floating point type (112-bit mantissa)*/
-  LLVMPPC_FP128TypeKind = 6, /**< 128 bit floating point type (two 64-bits) */
-  LLVMLabelTypeKind = 7,     /**< Labels */
-  LLVMIntegerTypeKind = 8,   /**< Arbitrary bit width integers */
-  LLVMFunctionTypeKind = 9,  /**< Functions */
-  LLVMStructTypeKind = 10,   /**< Structures */
-  LLVMArrayTypeKind = 11,    /**< Arrays */
-  LLVMPointerTypeKind = 12,  /**< Pointers */
-  LLVMVectorTypeKind = 13,   /**< Fixed width SIMD vector type */
-  LLVMMetadataTypeKind = 14, /**< Metadata */
-                             /* 15 previously used by LLVMX86_MMXTypeKind */
-  LLVMTokenTypeKind = 16,    /**< Tokens */
-  LLVMScalableVectorTypeKind = 17, /**< Scalable SIMD vector type */
-  LLVMBFloatTypeKind = 18,         /**< 16 bit brain floating point type */
-  LLVMX86_AMXTypeKind = 19,        /**< X86 AMX */
-  LLVMTargetExtTypeKind = 20,      /**< Target extension type */
-} LLVMTypeKind;
-LLVMTypeKind LLVMGetTypeKind(LLVMTypeRef Ty);
-unsigned LLVMGetIntTypeWidth(LLVMTypeRef IntegerTy);
-
-void LLVMInitializeX86TargetInfo();
-void LLVMInitializeX86Target();
-void LLVMInitializeX86TargetMC();
-void LLVMInitializeX86AsmParser();
-void LLVMInitializeX86AsmPrinter();
-
-typedef enum {
-  LLVMCodeGenLevelNone,
-  LLVMCodeGenLevelLess,
-  LLVMCodeGenLevelDefault,
-  LLVMCodeGenLevelAggressive
-} LLVMCodeGenOptLevel;
-
-typedef enum {
-  LLVMRelocDefault,
-  LLVMRelocStatic,
-  LLVMRelocPIC,
-  LLVMRelocDynamicNoPic,
-  LLVMRelocROPI,
-  LLVMRelocRWPI,
-  LLVMRelocROPI_RWPI
-} LLVMRelocMode;
-
-typedef enum {
-  LLVMCodeModelDefault,
-  LLVMCodeModelJITDefault,
-  LLVMCodeModelTiny,
-  LLVMCodeModelSmall,
-  LLVMCodeModelKernel,
-  LLVMCodeModelMedium,
-  LLVMCodeModelLarge
-} LLVMCodeModel;
-
-char *LLVMGetDefaultTargetTriple(void);
-LLVMBool LLVMGetTargetFromTriple(const char *Triple, LLVMTargetRef *T,
-                                 char **ErrorMessage);
-char *LLVMGetHostCPUName(void);
-char *LLVMGetHostCPUFeatures(void);
-LLVMTargetMachineRef LLVMCreateTargetMachine(
-    LLVMTargetRef T, const char *Triple, const char *CPU, const char *Features,
-    LLVMCodeGenOptLevel Level, LLVMRelocMode Reloc, LLVMCodeModel CodeModel);
-LLVMTargetDataRef LLVMCreateTargetDataLayout(LLVMTargetMachineRef T);
-void LLVMSetModuleDataLayout(LLVMModuleRef M, LLVMTargetDataRef DL);
-unsigned LLVMPointerSize(LLVMTargetDataRef TD);
-LLVMTargetDataRef LLVMGetModuleDataLayout(LLVMModuleRef M);
-
-typedef struct LLVMOpaqueDIBuilder *LLVMDIBuilderRef;
-LLVMDIBuilderRef LLVMCreateDIBuilder(LLVMModuleRef M);
-void LLVMDisposeDIBuilder(LLVMDIBuilderRef Builder);
-typedef struct LLVMOpaqueMetadata *LLVMMetadataRef;
-typedef enum {
-  LLVMDIFlagZero = 0,
-  LLVMDIFlagPrivate = 1,
-  LLVMDIFlagProtected = 2,
-  LLVMDIFlagPublic = 3,
-  LLVMDIFlagFwdDecl = 1 << 2,
-  LLVMDIFlagAppleBlock = 1 << 3,
-  LLVMDIFlagReservedBit4 = 1 << 4,
-  LLVMDIFlagVirtual = 1 << 5,
-  LLVMDIFlagArtificial = 1 << 6,
-  LLVMDIFlagExplicit = 1 << 7,
-  LLVMDIFlagPrototyped = 1 << 8,
-  LLVMDIFlagObjcClassComplete = 1 << 9,
-  LLVMDIFlagObjectPointer = 1 << 10,
-  LLVMDIFlagVector = 1 << 11,
-  LLVMDIFlagStaticMember = 1 << 12,
-  LLVMDIFlagLValueReference = 1 << 13,
-  LLVMDIFlagRValueReference = 1 << 14,
-  LLVMDIFlagReserved = 1 << 15,
-  LLVMDIFlagSingleInheritance = 1 << 16,
-  LLVMDIFlagMultipleInheritance = 2 << 16,
-  LLVMDIFlagVirtualInheritance = 3 << 16,
-  LLVMDIFlagIntroducedVirtual = 1 << 18,
-  LLVMDIFlagBitField = 1 << 19,
-  LLVMDIFlagNoReturn = 1 << 20,
-  LLVMDIFlagTypePassByValue = 1 << 22,
-  LLVMDIFlagTypePassByReference = 1 << 23,
-  LLVMDIFlagEnumClass = 1 << 24,
-  LLVMDIFlagFixedEnum = LLVMDIFlagEnumClass,  // Deprecated.
-  LLVMDIFlagThunk = 1 << 25,
-  LLVMDIFlagNonTrivial = 1 << 26,
-  LLVMDIFlagBigEndian = 1 << 27,
-  LLVMDIFlagLittleEndian = 1 << 28,
-  LLVMDIFlagIndirectVirtualBase = (1 << 2) | (1 << 5),
-  LLVMDIFlagAccessibility =
-      LLVMDIFlagPrivate | LLVMDIFlagProtected | LLVMDIFlagPublic,
-  LLVMDIFlagPtrToMemberRep = LLVMDIFlagSingleInheritance |
-                             LLVMDIFlagMultipleInheritance |
-                             LLVMDIFlagVirtualInheritance
-} LLVMDIFlags;
-typedef enum {
-  LLVMDWARFSourceLanguageC89,
-  LLVMDWARFSourceLanguageC,
-  LLVMDWARFSourceLanguageAda83,
-  LLVMDWARFSourceLanguageC_plus_plus,
-  LLVMDWARFSourceLanguageCobol74,
-  LLVMDWARFSourceLanguageCobol85,
-  LLVMDWARFSourceLanguageFortran77,
-  LLVMDWARFSourceLanguageFortran90,
-  LLVMDWARFSourceLanguagePascal83,
-  LLVMDWARFSourceLanguageModula2,
-  // New in DWARF v3:
-  LLVMDWARFSourceLanguageJava,
-  LLVMDWARFSourceLanguageC99,
-  LLVMDWARFSourceLanguageAda95,
-  LLVMDWARFSourceLanguageFortran95,
-  LLVMDWARFSourceLanguagePLI,
-  LLVMDWARFSourceLanguageObjC,
-  LLVMDWARFSourceLanguageObjC_plus_plus,
-  LLVMDWARFSourceLanguageUPC,
-  LLVMDWARFSourceLanguageD,
-  // New in DWARF v4:
-  LLVMDWARFSourceLanguagePython,
-  // New in DWARF v5:
-  LLVMDWARFSourceLanguageOpenCL,
-  LLVMDWARFSourceLanguageGo,
-  LLVMDWARFSourceLanguageModula3,
-  LLVMDWARFSourceLanguageHaskell,
-  LLVMDWARFSourceLanguageC_plus_plus_03,
-  LLVMDWARFSourceLanguageC_plus_plus_11,
-  LLVMDWARFSourceLanguageOCaml,
-  LLVMDWARFSourceLanguageRust,
-  LLVMDWARFSourceLanguageC11,
-  LLVMDWARFSourceLanguageSwift,
-  LLVMDWARFSourceLanguageJulia,
-  LLVMDWARFSourceLanguageDylan,
-  LLVMDWARFSourceLanguageC_plus_plus_14,
-  LLVMDWARFSourceLanguageFortran03,
-  LLVMDWARFSourceLanguageFortran08,
-  LLVMDWARFSourceLanguageRenderScript,
-  LLVMDWARFSourceLanguageBLISS,
-  LLVMDWARFSourceLanguageKotlin,
-  LLVMDWARFSourceLanguageZig,
-  LLVMDWARFSourceLanguageCrystal,
-  LLVMDWARFSourceLanguageC_plus_plus_17,
-  LLVMDWARFSourceLanguageC_plus_plus_20,
-  LLVMDWARFSourceLanguageC17,
-  LLVMDWARFSourceLanguageFortran18,
-  LLVMDWARFSourceLanguageAda2005,
-  LLVMDWARFSourceLanguageAda2012,
-  LLVMDWARFSourceLanguageHIP,
-  LLVMDWARFSourceLanguageAssembly,
-  LLVMDWARFSourceLanguageC_sharp,
-  LLVMDWARFSourceLanguageMojo,
-  LLVMDWARFSourceLanguageGLSL,
-  LLVMDWARFSourceLanguageGLSL_ES,
-  LLVMDWARFSourceLanguageHLSL,
-  LLVMDWARFSourceLanguageOpenCL_CPP,
-  LLVMDWARFSourceLanguageCPP_for_OpenCL,
-  LLVMDWARFSourceLanguageSYCL,
-  LLVMDWARFSourceLanguageRuby,
-  LLVMDWARFSourceLanguageMove,
-  LLVMDWARFSourceLanguageHylo,
-  LLVMDWARFSourceLanguageMetal,
-
-  // Vendor extensions:
-  LLVMDWARFSourceLanguageMips_Assembler,
-  LLVMDWARFSourceLanguageGOOGLE_RenderScript,
-  LLVMDWARFSourceLanguageBORLAND_Delphi
-} LLVMDWARFSourceLanguage;
-typedef enum {
-  LLVMDWARFEmissionNone = 0,
-  LLVMDWARFEmissionFull,
-  LLVMDWARFEmissionLineTablesOnly
-} LLVMDWARFEmissionKind;
-LLVMMetadataRef LLVMDIBuilderCreateUnspecifiedType(LLVMDIBuilderRef Builder,
-                                                   const char* Name,
-                                                   size_t NameLen);
-LLVMMetadataRef LLVMDIBuilderCreateFunction(
-    LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, const char *Name,
-    size_t NameLen, const char *LinkageName, size_t LinkageNameLen,
-    LLVMMetadataRef File, unsigned LineNo, LLVMMetadataRef Ty,
-    LLVMBool IsLocalToUnit, LLVMBool IsDefinition, unsigned ScopeLine,
-    LLVMDIFlags Flags, LLVMBool IsOptimized);
-LLVMMetadataRef LLVMDIBuilderCreateCompileUnit(
-    LLVMDIBuilderRef Builder, LLVMDWARFSourceLanguage Lang,
-    LLVMMetadataRef FileRef, const char *Producer, size_t ProducerLen,
-    LLVMBool isOptimized, const char *Flags, size_t FlagsLen,
-    unsigned RuntimeVer, const char *SplitName, size_t SplitNameLen,
-    LLVMDWARFEmissionKind Kind, unsigned DWOId, LLVMBool SplitDebugInlining,
-    LLVMBool DebugInfoForProfiling, const char *SysRoot, size_t SysRootLen,
-    const char *SDK, size_t SDKLen);
-LLVMMetadataRef LLVMDIBuilderCreateFile(LLVMDIBuilderRef Builder,
-                                        const char *Filename,
-                                        size_t FilenameLen,
-                                        const char *Directory,
-                                        size_t DirectoryLen);
-LLVMMetadataRef LLVMDIScopeGetFile(LLVMMetadataRef Scope);
-LLVMMetadataRef LLVMGetSubprogram(LLVMValueRef Func);
-void LLVMSetSubprogram(LLVMValueRef Func, LLVMMetadataRef SP);
-LLVMMetadataRef LLVMDIBuilderCreateDebugLocation(LLVMContextRef Ctx,
-                                                 unsigned Line, unsigned Column,
-                                                 LLVMMetadataRef Scope,
-                                                 LLVMMetadataRef InlinedAt);
-void LLVMInstructionSetDebugLoc(LLVMValueRef Inst, LLVMMetadataRef Loc);
-void LLVMDIBuilderFinalize(LLVMDIBuilderRef Builder);
-void LLVMDIBuilderFinalizeSubprogram(LLVMDIBuilderRef Builder,
-                                     LLVMMetadataRef Subprogram);
-void LLVMSetCurrentDebugLocation2(LLVMBuilderRef Builder, LLVMMetadataRef Loc);
-LLVMMetadataRef LLVMDIBuilderCreateSubroutineType(
-    LLVMDIBuilderRef Builder, LLVMMetadataRef File,
-    LLVMMetadataRef* ParameterTypes, unsigned NumParameterTypes,
-    LLVMDIFlags Flags);
 
 ///
 /// Start Vector Implementation
@@ -1330,6 +860,7 @@ typedef enum {
   TK_Extension,
   TK_Asm,
   TK_Inline,
+  TK_Pragma,
 
   TK_PrettyFunction,
   TK_Identifier,
@@ -1350,6 +881,7 @@ typedef enum {
   TK_Colon,         // :
   TK_Comma,         // ,
   TK_Question,      // ?
+  TK_Hash,          // #
 
   TK_Dot,       // .
   TK_Ellipsis,  // ...
@@ -1795,6 +1327,9 @@ Token lex(Lexer *lexer) {
     case '?':
       tok.kind = TK_Question;
       return tok;
+    case '#':
+      tok.kind = TK_Hash;
+      return tok;
     case '~':
       tok.kind = TK_BitNot;
       return tok;
@@ -1877,8 +1412,11 @@ Token lex(Lexer *lexer) {
   } else if (string_equals(&tok.chars, "__asm__") ||
              string_equals(&tok.chars, "asm")) {
     tok.kind = TK_Asm;
-  } else if (string_equals(&tok.chars, "__inline")) {
+  } else if (string_equals(&tok.chars, "__inline") ||
+             string_equals(&tok.chars, "inline")) {
     tok.kind = TK_Inline;
+  } else if (string_equals(&tok.chars, "pragma")) {
+    tok.kind = TK_Pragma;
   } else if (string_equals(&tok.chars, "__builtin_va_list")) {
     tok.kind = TK_BuiltinVAList;
   } else if (string_equals(&tok.chars, "typedef")) {
@@ -3131,6 +2669,38 @@ void switch_stmt_destroy(Statement *stmt) {
   }
 }
 
+void while_stmt_destroy(Statement*);
+
+const StatementVtable WhileStmtVtable = {
+    .kind = SK_WhileStmt,
+    .dtor = while_stmt_destroy,
+};
+
+struct WhileStmt {
+  Statement base;
+  Expr* cond;
+  Statement* body;  // Optional.
+};
+typedef struct WhileStmt WhileStmt;
+
+void while_stmt_construct(WhileStmt* stmt, Expr* cond, Statement* body) {
+  statement_construct(&stmt->base, &WhileStmtVtable);
+  stmt->cond = cond;
+  assert(cond);
+  stmt->body = body;
+}
+
+void while_stmt_destroy(Statement* stmt) {
+  WhileStmt* while_stmt = (WhileStmt*)stmt;
+  expr_destroy(while_stmt->cond);
+  free(while_stmt->cond);
+
+  if (while_stmt->body) {
+    statement_destroy(while_stmt->body);
+    free(while_stmt->body);
+  }
+}
+
 void for_stmt_destroy(Statement *);
 
 const StatementVtable ForStmtVtable = {
@@ -3261,19 +2831,26 @@ const NodeVtable StructDeclarationVtable = {
 
 typedef struct {
   Node node;
-  StructType type;
+  StructType* type;
 } StructDeclaration;
+
+void struct_declaration_construct_from_type(StructDeclaration* decl,
+                                            StructType* type) {
+  node_construct(&decl->node, &StructDeclarationVtable);
+  decl->type = type;
+}
 
 void struct_declaration_construct(StructDeclaration *decl, char *name,
                                   vector *members) {
   node_construct(&decl->node, &StructDeclarationVtable);
-  assert(name);  // The name for a struct declaration is mandatory.
-  struct_type_construct(&decl->type, name, members);
+  decl->type = malloc(sizeof(StructType));
+  struct_type_construct(decl->type, name, members);
 }
 
 void struct_declaration_destroy(Node *node) {
   StructDeclaration *decl = (StructDeclaration *)node;
-  type_destroy(&decl->type.type);
+  type_destroy(&decl->type->type);
+  free(decl->type);
 }
 
 void enum_declaration_destroy(Node*);
@@ -3285,18 +2862,26 @@ const NodeVtable EnumDeclarationVtable = {
 
 typedef struct {
   Node node;
-  EnumType type;
+  EnumType* type;
 } EnumDeclaration;
+
+void enum_declaration_construct_from_type(EnumDeclaration* decl,
+                                          EnumType* type) {
+  node_construct(&decl->node, &EnumDeclarationVtable);
+  decl->type = type;
+}
 
 void enum_declaration_construct(EnumDeclaration* decl, char* name,
                                 vector* members) {
   node_construct(&decl->node, &EnumDeclarationVtable);
-  enum_type_construct(&decl->type, name, members);
+  decl->type = malloc(sizeof(EnumType));
+  enum_type_construct(decl->type, name, members);
 }
 
 void enum_declaration_destroy(Node* node) {
   EnumDeclaration* decl = (EnumDeclaration*)node;
-  type_destroy(&decl->type.type);
+  type_destroy(&decl->type->type);
+  free(decl->type);
 }
 
 void union_declaration_destroy(Node*);
@@ -3308,18 +2893,26 @@ const NodeVtable UnionDeclarationVtable = {
 
 typedef struct {
   Node node;
-  UnionType type;
+  UnionType* type;
 } UnionDeclaration;
+
+void union_declaration_construct_from_type(UnionDeclaration* decl,
+                                           UnionType* type) {
+  node_construct(&decl->node, &UnionDeclarationVtable);
+  decl->type = type;
+}
 
 void union_declaration_construct(UnionDeclaration* decl, char* name,
                                  vector* members) {
   node_construct(&decl->node, &UnionDeclarationVtable);
-  union_type_construct(&decl->type, name, members);
+  decl->type = malloc(sizeof(UnionType));
+  union_type_construct(decl->type, name, members);
 }
 
 void union_declaration_destroy(Node* node) {
   UnionDeclaration* decl = (UnionDeclaration*)node;
-  type_destroy(&decl->type.type);
+  type_destroy(&decl->type->type);
+  free(decl->type);
 }
 
 void function_definition_destroy(Node *);
@@ -3455,6 +3048,28 @@ void parser_consume_asm_label(Parser* parser) {
     }
 
     token_destroy(&tok);
+  }
+}
+
+void parser_consume_pragma(Parser* parser) {
+  size_t line = parser_peek_token(parser)->line;
+  parser_consume_token(parser, TK_Hash);
+
+  assert(parser_peek_token(parser)->line == line &&
+         "# and pragma must be on same line");
+  parser_consume_token(parser, TK_Pragma);
+
+  // Pragmas take token strings which generally end at the end of a line,
+  // also accounting for escaped newlines. For now, we can just collect
+  // tokens until we see the next line.
+  //
+  // TODO: Even if this is for consumptions, we need to account for escaped
+  // newlines.
+  while (1) {
+    const Token* peek = parser_peek_token(parser);
+    if (peek->line != line)
+      break;
+    parser_skip_next_token(parser);
   }
 }
 
@@ -4035,6 +3650,10 @@ Type *parse_declarator(Parser *parser, Type *type, char **name,
   return parse_declarator_maybe_type_suffix(parser, type, type_usage_addr);
 }
 
+Type* parse_type_for_declaration_impl(Parser* parser, char** name,
+                                      FoundStorageClasses* storage,
+                                      Type* base_type);
+
 // <SPECIFIER/QUALIFIER MIX> <DECLARATOR>
 // DECLARATOR = <POINTER/QUALIFIER MIX> (nested declarators) (parens or sq
 // braces)
@@ -4049,8 +3668,14 @@ Type *parse_type_for_declaration(Parser *parser, char **name,
   // TODO: Handle inlines?
   Type* type = parse_specifiers_and_qualifiers_and_storage(
       parser, storage, /*found_inline=*/NULL);
-  type = maybe_parse_pointers_and_qualifiers(parser, type,
-                                             /*type_usage_addr=*/NULL);
+  return parse_type_for_declaration_impl(parser, name, storage, type);
+}
+
+Type* parse_type_for_declaration_impl(Parser* parser, char** name,
+                                      FoundStorageClasses* storage,
+                                      Type* base_type) {
+  Type* type = maybe_parse_pointers_and_qualifiers(parser, base_type,
+                                                   /*type_usage_addr=*/NULL);
   Type* ret = parse_declarator(parser, type, name, /*type_usage_addr=*/NULL);
 
   // https://gcc.gnu.org/onlinedocs/gcc/Asm-Labels.html
@@ -5560,6 +5185,7 @@ Node *parse_static_assert(Parser *parser) {
   Expr *expr = parse_expr(parser);
 
   parser_consume_token(parser, TK_RPar);
+  parser_consume_token(parser, TK_Semicolon);
 
   StaticAssert *sa = malloc(sizeof(StaticAssert));
   static_assert_construct(sa, expr);
@@ -5579,8 +5205,10 @@ Node *parse_typedef(Parser *parser) {
   td->type = parse_type_for_declaration(parser, &td->name, /*storage=*/NULL);
 
   // We don't care about the value.
-  assert(!parser_has_named_type(parser, td->name));
+  assert(!parser_has_named_type(parser, td->name) && "Duplicate named typedef");
   parser_define_named_type(parser, td->name);
+
+  parser_consume_token(parser, TK_Semicolon);
 
   return &td->node;
 }
@@ -5649,6 +5277,27 @@ Statement *parse_statement(Parser *parser) {
     }
 
     return &ifstmt->base;
+  }
+
+  if (peek->kind == TK_While) {
+    parser_consume_token(parser, TK_While);
+    parser_consume_token(parser, TK_LPar);
+
+    Expr* cond = parse_expr(parser);
+
+    parser_consume_token(parser, TK_RPar);
+
+    Statement* body = NULL;
+    if (next_token_is(parser, TK_Semicolon)) {
+      // Empty while stmt body.
+      parser_consume_token(parser, TK_Semicolon);
+    } else {
+      body = parse_statement(parser);
+    }
+
+    WhileStmt* while_stmt = malloc(sizeof(WhileStmt));
+    while_stmt_construct(while_stmt, cond, body);
+    return &while_stmt->base;
   }
 
   if (peek->kind == TK_Return) {
@@ -5846,16 +5495,48 @@ Statement *parse_compound_stmt(Parser *parser) {
   return &cmpd->base;
 }
 
-Node *parse_global_variable_or_function_definition(Parser *parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+// This disambiguates between a top-level tagged type declaration vs a global
+// variable declaration.
+Node* parse_top_level_type_decl(Parser* parser) {
+  const Token* peek = parser_peek_token(parser);
+  assert(is_token_type_token(parser, peek) ||
+         is_storage_class_specifier_token(peek->kind));
 
-  char *name = NULL;
   FoundStorageClasses storage = {};
-  Type *type = parse_type_for_declaration(parser, &name, &storage);
-  if (!name) {
-    printf("No name for global on %zu:%zu\n", line, col);
+  // TODO: Handle inlines?
+  Type* type = parse_specifiers_and_qualifiers_and_storage(
+      parser, &storage, /*found_inline=*/NULL);
+
+  // If the next token is a semicolon, then we know for a fact this is a tagged
+  // type declaration.
+  if (next_token_is(parser, TK_Semicolon)) {
+    parser_skip_next_token(parser);
+    switch (type->vtable->kind) {
+      case TK_UnionType: {
+        UnionDeclaration* decl = malloc(sizeof(UnionDeclaration));
+        union_declaration_construct_from_type(decl, (UnionType*)type);
+        return &decl->node;
+      }
+      case TK_EnumType: {
+        EnumDeclaration* decl = malloc(sizeof(EnumDeclaration));
+        enum_declaration_construct_from_type(decl, (EnumType*)type);
+        return &decl->node;
+      }
+      case TK_StructType: {
+        StructDeclaration* decl = malloc(sizeof(StructDeclaration));
+        struct_declaration_construct_from_type(decl, (StructType*)type);
+        return &decl->node;
+      }
+      default:
+        printf("Expected a ';' for the end of a tagged type declaration");
+        __builtin_trap();
+    }
   }
+
+  // Otherwise, continue parsing as if this were a type for a variable
+  // declaration.
+  char* name = NULL;
+  type = parse_type_for_declaration_impl(parser, &name, &storage, type);
   assert(name);
 
   if (storage.auto_) {
@@ -5896,6 +5577,8 @@ Node *parse_global_variable_or_function_definition(Parser *parser) {
   }
 
   free(name);
+
+  parser_consume_token(parser, TK_Semicolon);
 
   return &gv->node;
 }
@@ -5946,7 +5629,14 @@ Node *parse_top_level_decl(Parser *parser) {
     token = parser_peek_token(parser);
   }
 
-  Node *node;
+  // Module-level pragmas.
+  while (token->kind == TK_Hash) {
+    // TODO: Eventually handle it.
+    parser_consume_pragma(parser);
+    token = parser_peek_token(parser);
+  }
+
+  Node* node = NULL;
   switch (token->kind) {
     case TK_Typedef:
       node = parse_typedef(parser);
@@ -5954,28 +5644,15 @@ Node *parse_top_level_decl(Parser *parser) {
     case TK_StaticAssert:
       node = parse_static_assert(parser);
       break;
-    case TK_Struct:
-      node = parse_struct_declaration(parser);
-      break;
-    case TK_Union:
-      node = parse_union_declaration(parser);
-      break;
-    case TK_Enum:
-      node = parse_enum_declaration(parser);
-      break;
     default:
       if (is_token_type_token(parser, token) ||
-          is_storage_class_specifier_token(token->kind))
-        node = parse_global_variable_or_function_definition(parser);
-      else
-        node = NULL;
+          is_storage_class_specifier_token(token->kind)) {
+        node = parse_top_level_type_decl(parser);
+      }
   }
 
-  if (node) {
-    if (node->vtable->kind != NK_FunctionDefinition)
-      parser_consume_token(parser, TK_Semicolon);
+  if (node)
     return node;
-  }
 
   printf("%zu:%zu: parse_top_level_decl: Unhandled token (%d): '%s'\n",
          token->line, token->col, token->kind, token->chars.data);
@@ -6823,7 +6500,7 @@ void sema_handle_struct_declaration_impl(Sema *sema, StructType *struct_ty) {
 }
 
 void sema_handle_struct_declaration(Sema *sema, StructDeclaration *decl) {
-  sema_handle_struct_declaration_impl(sema, &decl->type);
+  sema_handle_struct_declaration_impl(sema, decl->type);
 }
 
 void sema_handle_union_declaration_impl(Sema* sema, UnionType* union_ty) {
@@ -6845,7 +6522,7 @@ void sema_handle_union_declaration_impl(Sema* sema, UnionType* union_ty) {
 }
 
 void sema_handle_union_declaration(Sema* sema, UnionDeclaration* decl) {
-  sema_handle_union_declaration_impl(sema, &decl->type);
+  sema_handle_union_declaration_impl(sema, decl->type);
 }
 
 void sema_handle_enum_declaration_impl(Sema* sema, EnumType* enum_ty) {
@@ -6893,7 +6570,7 @@ void sema_handle_enum_declaration_impl(Sema* sema, EnumType* enum_ty) {
 }
 
 void sema_handle_enum_declaration(Sema* sema, EnumDeclaration* decl) {
-  sema_handle_enum_declaration_impl(sema, &decl->type);
+  sema_handle_enum_declaration_impl(sema, decl->type);
 }
 
 void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
@@ -9231,6 +8908,58 @@ void compile_for_statement(Compiler *compiler, LLVMBuilderRef builder,
   tree_map_destroy(&local_allocas_cpy);
 }
 
+void compile_while_statement(Compiler* compiler, LLVMBuilderRef builder,
+                             const WhileStmt* stmt, TreeMap* local_ctx,
+                             TreeMap* local_allocas, LLVMBasicBlockRef break_bb,
+                             LLVMBasicBlockRef cont_bb) {
+  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
+  LLVMContextRef ctx = LLVMGetModuleContext(compiler->mod);
+
+  // Scope local to the loop.
+  TreeMap local_ctx_cpy;
+  TreeMap local_allocas_cpy;
+  string_tree_map_construct(&local_ctx_cpy);
+  string_tree_map_construct(&local_allocas_cpy);
+  tree_map_clone(&local_ctx_cpy, local_ctx);
+  tree_map_clone(&local_allocas_cpy, local_allocas);
+
+  LLVMBasicBlockRef while_start =
+      LLVMAppendBasicBlockInContext(ctx, fn, "while_start");
+  LLVMBuildBr(builder, while_start);
+  LLVMPositionBuilderAtEnd(builder, while_start);
+
+  LLVMBasicBlockRef while_end = LLVMCreateBasicBlockInContext(ctx, "while_end");
+
+  // Check the condition.
+  LLVMValueRef cond =
+      compile_to_bool(compiler, builder, stmt->cond, &local_ctx_cpy,
+                      &local_allocas_cpy, break_bb, cont_bb);
+  LLVMBasicBlockRef while_body =
+      LLVMCreateBasicBlockInContext(ctx, "while_body");
+  LLVMBuildCondBr(builder, cond, while_body, while_end);
+
+  LLVMAppendExistingBasicBlock(fn, while_body);
+  LLVMPositionBuilderAtEnd(builder, while_body);
+
+  // Now emit the body.
+  if (stmt->body) {
+    compile_statement(compiler, builder, stmt->body, &local_ctx_cpy,
+                      &local_allocas_cpy, while_end, while_start,
+                      /*last_expr=*/NULL);
+  }
+
+  // And branch back to the start.
+  if (!last_instruction_is_terminator(builder))
+    LLVMBuildBr(builder, while_start);
+
+  // End of while loop.
+  LLVMAppendExistingBasicBlock(fn, while_end);
+  LLVMPositionBuilderAtEnd(builder, while_end);
+
+  tree_map_destroy(&local_ctx_cpy);
+  tree_map_destroy(&local_allocas_cpy);
+}
+
 // TODO: This should just be a switch instruction!!!
 void compile_switch_statement(Compiler *compiler, LLVMBuilderRef builder,
                               const SwitchStmt *stmt, TreeMap *local_ctx,
@@ -9349,6 +9078,10 @@ void compile_statement(Compiler* compiler, LLVMBuilderRef builder,
     case SK_IfStmt:
       return compile_if_statement(compiler, builder, (const IfStmt *)stmt,
                                   local_ctx, local_allocas, break_bb, cont_bb);
+    case SK_WhileStmt:
+      return compile_while_statement(compiler, builder, (const WhileStmt*)stmt,
+                                     local_ctx, local_allocas, break_bb,
+                                     cont_bb);
     case SK_ForStmt:
       return compile_for_statement(compiler, builder, (const ForStmt *)stmt,
                                    local_ctx, local_allocas, break_bb, cont_bb);
