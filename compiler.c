@@ -11,6 +11,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define _XSTR(s) _STR(s)
+#define _STR(s) #s
+
+#define ASSERT_MSG(cond, fmt, ...)                                             \
+  {                                                                            \
+    if (!(cond)) {                                                             \
+      fprintf(stderr, "%s:%d: %s: Assertion `%s` failed: " fmt "\n", __FILE__, \
+              __LINE__, __PRETTY_FUNCTION__,                                   \
+              _XSTR(cond) __VA_OPT__(, ) __VA_ARGS__);                         \
+      abort();                                                                 \
+    }                                                                          \
+  }
+
+#define UNREACHABLE_MSG(fmt, ...)                                      \
+  {                                                                    \
+    fprintf(stderr, "%s:%d: %s: Hit unreachable statement: " fmt "\n", \
+            __FILE__, __LINE__,                                        \
+            __PRETTY_FUNCTION__ __VA_OPT__(, ) __VA_ARGS__);           \
+    abort();                                                           \
+  }
 
 // LLVM does not actually have a way of providing the CHAR_BIT for the arch.
 // Clang unconditionally sets it to 8.
@@ -234,6 +258,18 @@ void tree_map_destroy(TreeMap *map) {
   map->key = NULL;
 }
 
+typedef void (*TreeMapCallback)(const void* key, void* value, void* arg);
+void tree_map_iterate(TreeMap* map, TreeMapCallback cb, void* arg) {
+  if (map->left)
+    tree_map_iterate(map->left, cb, arg);
+
+  if (map->right)
+    tree_map_iterate(map->right, cb, arg);
+
+  if (map->key)
+    cb(map->key, map->value, arg);
+}
+
 void tree_map_set(TreeMap *map, const void *key, void *val) {
   if (map->key == NULL) {
     map->key = map->key_ctor(key);
@@ -263,7 +299,7 @@ void tree_map_set(TreeMap *map, const void *key, void *val) {
 
 // Get a value from the map corresponding to a key. If the value was found,
 // return true and set the value in `val`. Otherwise, return false.
-bool tree_map_get(const TreeMap *map, const void *key, void **val) {
+bool tree_map_get(const TreeMap* map, const void* key, void* val) {
   if (map->key == NULL)
     return false;
 
@@ -278,7 +314,7 @@ bool tree_map_get(const TreeMap *map, const void *key, void **val) {
     return tree_map_get(map->right, key, val);
   } else {
     if (val)
-      *val = map->value;
+      *(void**)val = map->value;
     return true;
   }
 }
@@ -528,6 +564,25 @@ bool string_equals(const string *s, const char *s2) {
   return strcmp(s->data, s2) == 0;
 }
 
+char string_pop_front(string* s) {
+  assert(s->size > 0);
+  char front = s->data[0];
+  memmove(s->data, s->data + 1,
+          s->size);  // This also moves the null terminator.
+  s->size--;
+  return front;
+}
+
+void string_assign(string* this, const string* other) {
+  string_clear(this);
+  string_append(this, other->data);
+}
+
+char string_back(const string* this) {
+  assert(this->size > 0);
+  return this->data[this->size - 1];
+}
+
 ///
 /// End String Implementation
 ///
@@ -641,6 +696,28 @@ static void TestStringClear() {
   string_destroy(&s);
 }
 
+static void TestStringPopFront() {
+  string s;
+  string_construct(&s);
+
+  string_append(&s, "abc");
+  assert(s.size == 3);
+
+  assert(string_pop_front(&s) == 'a');
+  assert(s.size == 2);
+  assert(string_equals(&s, "bc"));
+
+  assert(string_pop_front(&s) == 'b');
+  assert(s.size == 1);
+  assert(string_equals(&s, "c"));
+
+  assert(string_pop_front(&s) == 'c');
+  assert(s.size == 0);
+  assert(string_equals(&s, ""));
+
+  string_destroy(&s);
+}
+
 static void RunStringTests() {
   TestStringConstruction();
   TestStringCapacityReservation();
@@ -648,10 +725,63 @@ static void RunStringTests() {
   TestStringAppendChar();
   TestStringResizing();
   TestStringClear();
+  TestStringPopFront();
 }
 
 ///
 /// End String tests
+///
+
+///
+/// Start Path Implementation
+///
+
+const char kPathSeparator = '/';
+
+typedef struct {
+  string path_;
+} Path;
+
+void path_construct(Path* path, string* other) {
+  string_construct(&path->path_);
+  string_assign(&path->path_, other);
+}
+
+void path_destroy(Path* path) { string_destroy(&path->path_); }
+
+bool path_is_abs(const Path* this) {
+  // FIXME: Only works on *nix systems.
+  return this->path_.data[0] == '/';
+}
+
+bool path_exists(const Path* this) {
+  return access(this->path_.data, F_OK) == 0;
+}
+
+void path_append(Path* this, const Path* other) {
+  // Do not append an absolute path to anything.
+  assert(!path_is_abs(other));
+
+  if (string_back(&this->path_) != kPathSeparator)
+    string_append_char(&this->path_, kPathSeparator);
+
+  string_append(&this->path_, other->path_.data);
+}
+
+bool path_is_file(const Path* this) {
+  struct stat path_stat;
+  stat(this->path_.data, &path_stat);
+  return S_ISREG(path_stat.st_mode);
+}
+
+bool path_is_dir(const Path* this) {
+  struct stat path_stat;
+  stat(this->path_.data, &path_stat);
+  return S_ISDIR(path_stat.st_mode);
+}
+
+///
+/// End Path Implementation
 ///
 
 ///
@@ -697,6 +827,7 @@ typedef struct {
 void file_input_stream_construct(FileInputStream *fis, const char *input) {
   input_stream_construct(&fis->base, &FileInputStreamVtable);
   fis->input_file = fopen(input, "r");
+  assert(fis->input_file && "Opening input file failed");
 }
 
 void file_input_stream_destroy(InputStream *is) {
@@ -754,6 +885,169 @@ int string_input_stream_read(InputStream *is) {
 bool string_input_stream_eof(InputStream *is) {
   StringInputStream *sis = (StringInputStream *)is;
   return sis->pos_ >= sis->len_;
+}
+
+void preprocessor_input_stream_destroy(InputStream*);
+int preprocessor_input_stream_read(InputStream*);
+bool preprocessor_input_stream_eof(InputStream*);
+
+const InputStreamVtable PreprocessorInputStreamVtable = {
+    .dtor = preprocessor_input_stream_destroy,
+    .read = preprocessor_input_stream_read,
+    .eof = preprocessor_input_stream_eof,
+};
+
+struct PreprocessorInputStream {
+  InputStream base;
+
+  InputStream* input_;
+
+  // This is a buffer used for saving chars when handling directives. This needs
+  // to have a persistent state in the event we read `#pragma` which isn't
+  // handled by the preprocessor directly and needs to be handled by the
+  // compiler proper.
+  string saved_directive_chars;
+
+  // If we hit an `include` which we would expand, this nested stream will
+  // represent a stream to that included file.
+  struct PreprocessorInputStream* included_stream_;
+};
+typedef struct PreprocessorInputStream PreprocessorInputStream;
+
+void preprocessor_input_stream_construct(PreprocessorInputStream* pp,
+                                         InputStream* input) {
+  input_stream_construct(&pp->base, &PreprocessorInputStreamVtable);
+  pp->input_ = input;
+  assert(input);
+  string_construct(&pp->saved_directive_chars);
+  pp->included_stream_ = NULL;
+}
+
+void preprocessor_input_stream_destroy(InputStream* input) {
+  PreprocessorInputStream* pp = (PreprocessorInputStream*)input;
+  input_stream_destroy(pp->input_);
+  free(pp->input_);
+  string_destroy(&pp->saved_directive_chars);
+
+  if (pp->included_stream_) {
+    input_stream_destroy(&pp->included_stream_->base);
+    free(pp->included_stream_);
+  }
+}
+
+static bool is_eof(int c) { return c < 0; }
+
+int preprocessor_input_stream_read(InputStream* input) {
+  PreprocessorInputStream* pp = (PreprocessorInputStream*)input;
+
+  if (pp->saved_directive_chars.size > 0) {
+    // FIXME: We should be adding an implicit cast in the AST so we don't need
+    // to explicitly cast here.
+    return (int)string_pop_front(&pp->saved_directive_chars);
+  }
+
+  if (!pp->included_stream_) {
+    // Handle preprocessor expansions.
+    int c = input_stream_read(pp->input_);
+
+    // Take into account string literals where we cannot treat `# <directive>`
+    // with normal directive-handlign logic.
+    if (c == '"' || c == '\'') {
+      char starting_char = (char)c;
+      string_append_char(&pp->saved_directive_chars, starting_char);
+
+      // Keep reading chars until the closing char, accounting for escaped
+      // chars.
+      while (1) {
+        c = input_stream_read(pp->input_);
+        string_append_char(&pp->saved_directive_chars, (char)c);
+
+        if (c == '\\') {
+          c = input_stream_read(pp->input_);
+          string_append_char(&pp->saved_directive_chars, (char)c);
+        } else if (c == starting_char) {
+          break;
+        }
+      }
+
+      return (int)string_pop_front(&pp->saved_directive_chars);
+    }
+
+    if (c != '#')
+      return c;
+
+    // Need to save it in case this is a #pragma.
+    string_append_char(&pp->saved_directive_chars, '#');
+
+    // Skip WS.
+    while (isspace(c = input_stream_read(pp->input_))) {
+      assert(!is_eof(c));
+      string_append_char(&pp->saved_directive_chars, (char)c);
+    }
+    assert(!is_eof(c));
+
+    string directive;
+    string_construct(&directive);
+    string_append_char(&directive, (char)c);
+    string_append_char(&pp->saved_directive_chars, (char)c);
+
+    while (isalpha(c = input_stream_read(pp->input_))) {
+      string_append_char(&directive, (char)c);
+      string_append_char(&pp->saved_directive_chars, (char)c);
+    }
+
+    if (string_equals(&directive, "include")) {
+      // Found a `#include`. Read either <path> or "path".
+      while (isspace(c)) c = input_stream_read(pp->input_);
+
+      assert(c == '<' || c == '"');
+      int closing_c = c == '<' ? '>' : '"';
+
+      string include_path;
+      string_construct(&include_path);
+
+      // Now read the path. Note the path can have spaces in it.
+      while ((c = input_stream_read(pp->input_)) != closing_c) {
+        assert(!is_eof(c));
+        string_append_char(&include_path, (char)c);
+      }
+
+      // Open the file and assign it to a new nested preprocessor.
+      FileInputStream* include_file = malloc(sizeof(FileInputStream));
+      file_input_stream_construct(include_file, include_path.data);
+      pp->included_stream_ = malloc(sizeof(PreprocessorInputStream));
+      preprocessor_input_stream_construct(pp->included_stream_,
+                                          &include_file->base);
+
+      string_destroy(&include_path);
+    } else if (string_equals(&directive, "pragma")) {
+      // #pragmas are the one exception where the preprocessor doesn't handle
+      // them, so we need to save the characters for passing them to the
+      // compiler proper for handling.
+      //
+      // Just add the last read char back to `saved_directive_chars` so it can
+      // eventually be popped later.
+      assert(!is_eof(c));
+      string_append_char(&pp->saved_directive_chars, (char)c);
+      string_destroy(&directive);
+      return (int)string_pop_front(&pp->saved_directive_chars);
+    } else {
+      UNREACHABLE_MSG("TODO: Handle preprocessor directive '%s'",
+                      directive.data);
+    }
+
+    string_destroy(&directive);
+    string_clear(&pp->saved_directive_chars);
+  }
+
+  return input_stream_read(&pp->included_stream_->base);
+}
+
+bool preprocessor_input_stream_eof(InputStream* input) {
+  PreprocessorInputStream* pp = (PreprocessorInputStream*)input;
+  if (pp->included_stream_)
+    return input_stream_eof(&pp->included_stream_->base);
+  return input_stream_eof(pp->input_);
 }
 
 ///
@@ -922,8 +1216,6 @@ typedef struct {
   size_t col_;
 } Lexer;
 
-static bool is_eof(int c) { return c < 0; }
-
 void lexer_construct(Lexer *lexer, InputStream *input) {
   lexer->input = input;
   lexer->lookahead = 0;
@@ -1019,7 +1311,7 @@ static bool is_kw_char(int c) { return c == '_' || isalnum(c); }
 // unless it's EOF.
 void skip_ws(Lexer *lexer) {
   int c;
-  for (;;) {
+  while (true) {
     c = lexer_peek_char(lexer);
     if (is_eof(c))
       return;
@@ -1055,8 +1347,7 @@ char handle_escape_char(int c) {
     case '"':
       return '"';
     default:
-      printf("Unhandled escape character '%c'\n", c);
-      __builtin_trap();
+      UNREACHABLE_MSG("Unhandled escape character '%c'\n", c);
   }
 }
 
@@ -1067,7 +1358,7 @@ Token lex(Lexer *lexer) {
   tok.kind = TK_Eof;  // Default value
 
   int c;
-  for (;;) {
+  while (true) {
     skip_ws(lexer);
 
     if (is_eof(lexer_peek_char(lexer))) {
@@ -1095,7 +1386,7 @@ Token lex(Lexer *lexer) {
 
       if (lexer_peek_char(lexer) == '*') {
         // This is a comment. Consume all characters until the final `*/`.
-        for (;;) {
+        while (true) {
           if (lexer_get_char(lexer) == '*') {
             if (lexer_peek_then_consume_char(lexer, '/'))
               break;
@@ -1119,11 +1410,9 @@ Token lex(Lexer *lexer) {
   // Handle elipsis.
   if (c == '.') {
     if (lexer_peek_then_consume_char(lexer, '.')) {
-      if (!lexer_peek_then_consume_char(lexer, '.')) {
-        printf("%zu:%zu: Expected 3 '.' for elipses but found 2.", tok.line,
-               tok.col);
-        __builtin_trap();
-      }
+      ASSERT_MSG(lexer_peek_then_consume_char(lexer, '.'),
+                 "%zu:%zu: Expected 3 '.' for elipses but found 2.", tok.line,
+                 tok.col);
       string_append(&tok.chars, "..");
       tok.kind = TK_Ellipsis;
     } else {
@@ -1257,10 +1546,7 @@ Token lex(Lexer *lexer) {
     // TODO: Handle escape chars.
     for (; !lexer_peek_then_consume_char(lexer, '"');) {
       int c = lexer_get_char(lexer);
-      if (is_eof(c)) {
-        printf("Got EOF before finishing string parsing\n");
-        __builtin_trap();
-      }
+      ASSERT_MSG(!is_eof(c), "Got EOF before finishing string parsing");
 
       if (c == '\\')
         c = handle_escape_char(lexer_get_char(lexer));
@@ -1283,10 +1569,8 @@ Token lex(Lexer *lexer) {
 
     string_append_char(&tok.chars, (char)c);
 
-    if (!lexer_peek_then_consume_char(lexer, '\'')) {
-      printf("%zu:%zu: Expected `'` for ending char.\n", tok.line, tok.col);
-      __builtin_trap();
-    }
+    ASSERT_MSG(lexer_peek_then_consume_char(lexer, '\''),
+               "%zu:%zu: Expected `'` for ending char.\n", tok.line, tok.col);
 
     string_append_char(&tok.chars, '\'');
     return tok;
@@ -1341,7 +1625,7 @@ Token lex(Lexer *lexer) {
 
     if (lexer_peek_char(lexer) == 'x' || lexer_peek_char(lexer) == 'X') {
       string_append_char(&tok.chars, (char)lexer_get_char(lexer));
-      for (;;) {
+      while (true) {
         char c = (char)lexer_peek_char(lexer);
         if (isdigit(c) || ('a' <= c && c <= 'f') || ('A' <= c && c <= 'F'))
           string_append_char(&tok.chars, (char)lexer_get_char(lexer));
@@ -1683,7 +1967,7 @@ unsigned get_integral_rank(const BuiltinType *bt) {
     case BTK_UnsignedLongLong:
       return 5;
     default:
-      __builtin_trap();
+      UNREACHABLE_MSG("Unhandled builtin type kind %d", bt->kind);
   }
 }
 
@@ -1792,10 +2076,7 @@ void struct_type_dump(const Type *type) {
 
 const Member* struct_get_member(const StructType* st, const char* name,
                                 size_t* offset) {
-  if (!st->members) {
-    printf("No members in struct '%s'\n", st->name);
-    __builtin_trap();
-  }
+  ASSERT_MSG(st->members, "No members in struct '%s'", st->name);
 
   for (size_t i = 0; i < st->members->size; ++i) {
     const Member* member = vector_at(st->members, i);
@@ -1806,8 +2087,13 @@ const Member* struct_get_member(const StructType* st, const char* name,
     }
   }
 
-  printf("No member named '%s'\n", name);
-  __builtin_trap();
+  UNREACHABLE_MSG("No member named '%s'", name);
+}
+
+const Member* struct_get_nth_member(const StructType* st, size_t n) {
+  assert(st->members);
+  assert(st->members->size > n);
+  return vector_at(st->members, n);
 }
 
 void union_type_destroy(Type*);
@@ -1886,8 +2172,7 @@ const Member* union_get_member(const UnionType* ut, const char* name,
     }
   }
 
-  printf("No member named '%s'\n", name);
-  __builtin_trap();
+  UNREACHABLE_MSG("No member named '%s'", name);
 }
 
 void enum_type_destroy(Type *);
@@ -2203,11 +2488,9 @@ bool parser_has_named_type(const Parser *parser, const char *name) {
 }
 
 static void expect_token(const Token *tok, TokenKind expected) {
-  if (tok->kind != expected) {
-    printf("%zu:%zu: Expected token %d but found %d: '%s'\n", tok->line,
-           tok->col, expected, tok->kind, tok->chars.data);
-    __builtin_trap();
-  }
+  ASSERT_MSG(tok->kind == expected,
+             "%zu:%zu: Expected token %d but found %d: '%s'", tok->line,
+             tok->col, expected, tok->kind, tok->chars.data);
 }
 
 // Callers of this should destroy the token.
@@ -2244,11 +2527,9 @@ void parser_skip_next_token(Parser *parser) {
 
 void parser_consume_token(Parser *parser, TokenKind kind) {
   Token next = parser_pop_token(parser);
-  if (next.kind != kind) {
-    printf("%zu:%zu: Expected token kind %d but found %d: '%s'\n", next.line,
-           next.col, kind, next.kind, next.chars.data);
-    __builtin_trap();
-  }
+  ASSERT_MSG(next.kind == kind,
+             "%zu:%zu: Expected token kind %d but found %d: '%s'", next.line,
+             next.col, kind, next.kind, next.chars.data);
   token_destroy(&next);
 }
 
@@ -2954,7 +3235,7 @@ Qualifiers parse_maybe_qualifiers(Parser *parser, bool *found) {
   Qualifiers quals = 0;
   if (found)
     *found = true;
-  for (;;) {
+  while (true) {
     switch (parser_peek_token(parser)->kind) {
       case TK_Const:
         quals |= kConstMask;
@@ -3469,11 +3750,9 @@ Type* parse_specifiers_and_qualifiers_and_storage(Parser* parser,
     kind = BTK_BuiltinVAList;
   } else {
     const Token *tok = parser_peek_token(parser);
-    printf(
-        "%zu:%zu: parse_specifiers_and_qualifiers: Unhandled token (%d): "
-        "'%s'\n",
+    UNREACHABLE_MSG(
+        "%zu:%zu: parse_specifiers_and_qualifiers: Unhandled token (%d): '%s'",
         tok->line, tok->col, tok->kind, tok->chars.data);
-    __builtin_trap();
   }
 
   BuiltinType *bt = malloc(sizeof(BuiltinType));
@@ -3547,14 +3826,12 @@ Type *parse_function_suffix(Parser *parser, Type *outer_ty,
       parser_consume_token(parser, TK_Ellipsis);
       has_var_args = true;
 
-      if (!next_token_is(parser, TK_RPar)) {
-        const Token *peek = parser_peek_token(parser);
-        printf(
-            "%zu:%zu: parse_function_suffix: '...' must be the last in the "
-            "parameter list; instead found '%s'.",
-            peek->line, peek->col, peek->chars.data);
-        __builtin_trap();
-      }
+      const Token* peek = parser_peek_token(parser);
+      ASSERT_MSG(
+          next_token_is(parser, TK_RPar),
+          "%zu:%zu: parse_function_suffix: '...' must be the last in the "
+          "parameter list; instead found '%s'.",
+          peek->line, peek->col, peek->chars.data);
       continue;
     }
 
@@ -3911,16 +4188,6 @@ bool is_logical_binop(BinOpKind kind) {
 
 bool is_assign_binop(BinOpKind kind) {
   return BOK_AssignFirst <= kind && kind <= BOK_AssignLast;
-}
-
-bool can_be_used_for_ptr_arithmetic(BinOpKind kind) {
-  switch (kind) {
-    case BOK_Add:
-    case BOK_Sub:
-      return true;  // TODO: Add more cases here.
-    default:
-      return false;
-  }
 }
 
 void binop_destroy(Expr *expr);
@@ -4284,9 +4551,8 @@ Expr *parse_primary_expr(Parser *parser) {
     return &init->expr;
   }
 
-  printf("%zu:%zu: parse_primary_expr: Unhandled token (%d): '%s'\n", tok->line,
-         tok->col, tok->kind, tok->chars.data);
-  __builtin_trap();
+  UNREACHABLE_MSG("%zu:%zu: parse_primary_expr: Unhandled token (%d): '%s'\n",
+                  tok->line, tok->col, tok->kind, tok->chars.data);
   return NULL;
 }
 
@@ -4385,7 +4651,7 @@ vector parse_argument_list(Parser *parser) {
   vector v;
   vector_construct(&v, sizeof(Expr *), alignof(Expr *));
 
-  for (;;) {
+  while (true) {
     // https://gcc.gnu.org/onlinedocs/gcc/Alternate-Keywords.html
     //
     // Writing __extension__ before an expression prevents warnings about
@@ -5242,11 +5508,9 @@ Statement *parse_declaration(Parser *parser) {
   return &decl->base;
 }
 
-// This consumes any trailing semicolons when needed.
-Statement *parse_statement(Parser *parser) {
-  for (; next_token_is(parser, TK_Semicolon);)
-    parser_consume_token(parser, TK_Semicolon);
+Statement* parse_statement(Parser* parser);
 
+Statement* parse_statement_impl(Parser* parser) {
   const Token *peek = parser_peek_token(parser);
 
   if (peek->kind == TK_LCurlyBrace)
@@ -5331,7 +5595,7 @@ Statement *parse_statement(Parser *parser) {
 
     vector *default_stmts = NULL;
 
-    for (;;) {
+    while (true) {
       if (next_token_is(parser, TK_RCurlyBrace))
         break;
 
@@ -5347,9 +5611,8 @@ Statement *parse_statement(Parser *parser) {
           // warn on missing fallthroughs.
           parser_consume_token(parser, TK_Identifier);
         } else {
-          printf("%zu:%zu: Unknown attribute '%s'\n", attr->line, attr->col,
-                 attr->chars.data);
-          __builtin_trap();
+          UNREACHABLE_MSG("%zu:%zu: Unknown attribute '%s'", attr->line,
+                          attr->col, attr->chars.data);
         }
 
         parser_consume_token(parser, TK_RSquareBrace);
@@ -5395,8 +5658,7 @@ Statement *parse_statement(Parser *parser) {
         }
       } else {
         const Token *peek = parser_peek_token(parser);
-        printf("Neither case nor default: '%s'\n", peek->chars.data);
-        __builtin_trap();
+        UNREACHABLE_MSG("Neither case nor default: '%s'", peek->chars.data);
       }
     }
     parser_consume_token(parser, TK_RCurlyBrace);
@@ -5476,14 +5738,23 @@ Statement *parse_statement(Parser *parser) {
   return parse_expr_statement(parser);
 }
 
+// This consumes any trailing semicolons when needed.
+Statement* parse_statement(Parser* parser) {
+  Statement* stmt = parse_statement_impl(parser);
+
+  while (next_token_is(parser, TK_Semicolon))
+    parser_consume_token(parser, TK_Semicolon);
+
+  return stmt;
+}
+
 Statement *parse_compound_stmt(Parser *parser) {
   parser_consume_token(parser, TK_LCurlyBrace);
 
   vector body;
   vector_construct(&body, sizeof(Statement *), alignof(Statement *));
 
-  const Token *peek;
-  for (; (peek = parser_peek_token(parser))->kind != TK_RCurlyBrace;) {
+  while (!next_token_is(parser, TK_RCurlyBrace)) {
     Statement **storage = vector_append_storage(&body);
     *storage = parse_statement(parser);
   }
@@ -5528,8 +5799,8 @@ Node* parse_top_level_type_decl(Parser* parser) {
         return &decl->node;
       }
       default:
-        printf("Expected a ';' for the end of a tagged type declaration");
-        __builtin_trap();
+        UNREACHABLE_MSG(
+            "Expected a ';' for the end of a tagged type declaration");
     }
   }
 
@@ -5539,12 +5810,9 @@ Node* parse_top_level_type_decl(Parser* parser) {
   type = parse_type_for_declaration_impl(parser, &name, &storage, type);
   assert(name);
 
-  if (storage.auto_) {
-    const Token *tok = parser_peek_token(parser);
-    printf("%zu:%zu: 'auto' can only be used at block scope\n", tok->line,
-           tok->col);
-    __builtin_trap();
-  }
+  const Token* tok = parser_peek_token(parser);
+  ASSERT_MSG(!storage.auto_, "%zu:%zu: 'auto' can only be used at block scope",
+             tok->line, tok->col);
 
   if (type->vtable->kind == TK_FunctionType &&
       next_token_is(parser, TK_LCurlyBrace)) {
@@ -5574,6 +5842,17 @@ Node* parse_top_level_type_decl(Parser* parser) {
     parser_consume_token(parser, TK_Assign);
     Expr *init = parse_expr(parser);
     gv->initializer = init;
+
+    // If the type is an array type which is unsized, infer the size from the
+    // expression.
+    if (is_array_type(type)) {
+      ArrayType* arr_ty = (ArrayType*)type;
+      if (!arr_ty->size && init->vtable->kind == EK_InitializerList) {
+        const InitializerList* il = (const InitializerList*)init;
+        arr_ty->size = (Expr*)malloc(sizeof(Int));
+        int_construct((Int*)arr_ty->size, il->elems.size, BTK_Int);
+      }
+    }
   }
 
   free(name);
@@ -5654,9 +5933,8 @@ Node *parse_top_level_decl(Parser *parser) {
   if (node)
     return node;
 
-  printf("%zu:%zu: parse_top_level_decl: Unhandled token (%d): '%s'\n",
-         token->line, token->col, token->kind, token->chars.data);
-  __builtin_trap();
+  UNREACHABLE_MSG("%zu:%zu: parse_top_level_decl: Unhandled token (%d): '%s'\n",
+                  token->line, token->col, token->kind, token->chars.data);
   return NULL;
 }
 
@@ -6085,10 +6363,8 @@ uint64_t result_to_u64(const ConstExprResult *res) {
 const Type *sema_resolve_named_type_from_name(const Sema *sema,
                                               const char *name) {
   void *found;
-  if (!tree_map_get(&sema->typedef_types, name, &found)) {
-    printf("Unknown type '%s'\n", name);
-    __builtin_trap();
-  }
+  ASSERT_MSG(tree_map_get(&sema->typedef_types, name, &found),
+             "Unknown type '%s'", name);
   Type *res = found;
   assert(res->vtable->kind != TK_NamedType &&
          "All typedef types should be flattened to an unnamed type when being "
@@ -6112,10 +6388,8 @@ const StructType *sema_resolve_struct_type(const Sema *sema,
     return st;
 
   void *found;
-  if (!tree_map_get(&sema->struct_types, st->name, &found)) {
-    printf("No struct named '%s'\n", st->name);
-    __builtin_trap();
-  }
+  ASSERT_MSG(tree_map_get(&sema->struct_types, st->name, &found),
+             "No struct named '%s'", st->name);
 
   return found;
 }
@@ -6126,10 +6400,8 @@ const UnionType* sema_resolve_union_type(const Sema* sema,
     return ut;
 
   void* found;
-  if (!tree_map_get(&sema->union_types, ut->name, &found)) {
-    printf("No union named '%s'\n", ut->name);
-    __builtin_trap();
-  }
+  ASSERT_MSG(tree_map_get(&sema->union_types, ut->name, &found),
+             "No union named '%s'", ut->name);
 
   return found;
 }
@@ -6181,6 +6453,14 @@ bool sema_is_struct_type(const Sema *sema, const Type *type,
                          const TreeMap *local_ctx) {
   type = sema_resolve_maybe_named_type(sema, type);
   return type->vtable->kind == TK_StructType;
+}
+
+const StructType* sema_get_struct_type(const Sema* sema, const Type* type,
+                                       const TreeMap* local_ctx) {
+  type = sema_resolve_maybe_named_type(sema, type);
+  if (type->vtable->kind == TK_StructType)
+    return (const StructType*)type;
+  return NULL;
 }
 
 // TODO: Pass fewer args around.
@@ -6356,8 +6636,8 @@ bool sema_types_are_compatible_impl(Sema *sema, const Type *lhs,
     }
     case TK_NamedType:
     case TK_ReplacementSentinelType:
-      printf("This type should not be handled here.\n");
-      __builtin_trap();
+      UNREACHABLE_MSG("This type should not be handled here: %d",
+                      lhs->vtable->kind);
   }
 
   return true;
@@ -6373,16 +6653,13 @@ bool sema_types_are_compatible_ignore_quals(Sema *sema, const Type *lhs,
 }
 
 bool sema_can_implicit_cast_to(Sema *sema, const Type *from, const Type *to) {
-  printf("TODO: Unhandled implicit cast\n");
-  __builtin_trap();
+  UNREACHABLE_MSG("TODO: Unhandled implicit cast");
 }
 
 static void assert_types_are_compatible(Sema *sema, const char *name,
                                         const Type *original, const Type *new) {
-  if (!sema_types_are_compatible(sema, original, new)) {
-    printf("redefinition of '%s' with a different type\n", name);
-    __builtin_trap();
-  }
+  ASSERT_MSG(sema_types_are_compatible(sema, original, new),
+             "redefinition of '%s' with a different type", name);
 }
 
 void verify_function_type(Sema *sema, const FunctionType *func_ty) {
@@ -6412,19 +6689,13 @@ void sema_handle_function_definition(Sema *sema, FunctionDefinition *f) {
 
   // This global was declared prior.
   Node *found = val;
-  if (found->vtable->kind == NK_FunctionDefinition) {
-    // Function re-definition.
-    printf("Redefinition of function '%s'\n", f->name);
-    __builtin_trap();
-  }
+  ASSERT_MSG(found->vtable->kind != NK_FunctionDefinition,
+             "Redefinition of function '%s'", f->name);
 
   // This must be a global variable.
   assert(found->vtable->kind == NK_GlobalVariable);
   GlobalVariable *gv = val;
-  if (gv->initializer) {
-    printf("Redefinition of function '%s'\n", f->name);
-    __builtin_trap();
-  }
+  ASSERT_MSG(!gv->initializer, "Redefinition of function '%s'", f->name);
 
   assert_types_are_compatible(sema, gv->name, gv->type, f->type);
 }
@@ -6447,13 +6718,10 @@ void sema_handle_global_variable(Sema *sema, GlobalVariable *gv) {
     assert_types_are_compatible(sema, gv->name, found->type, gv->type);
 
     // Ensure we don't have multiple definitions.
-    if (found->initializer && gv->initializer) {
-      printf(
-          "sema_handle_global_variable: redefinition of '%s' with a "
-          "different value\n",
-          gv->name);
-      __builtin_trap();
-    }
+    ASSERT_MSG(!(found->initializer && gv->initializer),
+               "sema_handle_global_variable: redefinition of '%s' with a "
+               "different value",
+               gv->name);
 
     if (!found->initializer && gv->initializer) {
       // Save the one with the definition.
@@ -6472,10 +6740,7 @@ void sema_handle_global_variable(Sema *sema, GlobalVariable *gv) {
 
   // The new global variable must be a re-declaration since we can only
   // have one function definition.
-  if (gv->initializer) {
-    printf("Redefinition of function '%s'\n", gv->name);
-    __builtin_trap();
-  }
+  ASSERT_MSG(!gv->initializer, "Redefinition of function '%s'", gv->name);
 }
 
 void sema_handle_struct_declaration_impl(Sema *sema, StructType *struct_ty) {
@@ -6490,10 +6755,8 @@ void sema_handle_struct_declaration_impl(Sema *sema, StructType *struct_ty) {
   void *found;
   if (tree_map_get(&sema->struct_types, struct_ty->name, &found)) {
     StructType *found_struct = found;
-    if (found_struct->members) {
-      printf("Duplicate struct definition '%s'\n", struct_ty->name);
-      __builtin_trap();
-    }
+    ASSERT_MSG(!found_struct->members, "Duplicate struct definition '%s'",
+               struct_ty->name);
   }
 
   tree_map_set(&sema->struct_types, struct_ty->name, struct_ty);
@@ -6533,10 +6796,8 @@ void sema_handle_enum_declaration_impl(Sema* sema, EnumType* enum_ty) {
     void *found;
     if (tree_map_get(&sema->enum_types, enum_ty->name, &found)) {
       EnumType *found_enum = found;
-      if (found_enum->members) {
-        printf("Duplicate enum definition '%s'\n", enum_ty->name);
-        __builtin_trap();
-      }
+      ASSERT_MSG(!found_enum->members, "Duplicate enum definition '%s'",
+                 enum_ty->name);
     }
 
     tree_map_set(&sema->enum_types, enum_ty->name, enum_ty);
@@ -6552,7 +6813,7 @@ void sema_handle_enum_declaration_impl(Sema* sema, EnumType* enum_ty) {
       ConstExprResult res = sema_eval_expr(sema, member->value);
       switch (res.result_kind) {
         case RK_Boolean:
-          __builtin_trap();
+          UNREACHABLE_MSG("TODO: Can a bool be assigned to an enum member?");
         case RK_Int:
           val = res.result.i;
           break;
@@ -6574,10 +6835,8 @@ void sema_handle_enum_declaration(Sema* sema, EnumDeclaration* decl) {
 }
 
 void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
-  if (tree_map_get(&sema->typedef_types, name, NULL)) {
-    printf("sema_add_typedef_type: typedef for '%s' already exists\n", name);
-    __builtin_trap();
-  }
+  ASSERT_MSG(!tree_map_get(&sema->typedef_types, name, NULL),
+             "typedef for '%s' already exists", name);
 
   if (type->vtable->kind == TK_StructType) {
     StructType *struct_ty = (StructType *)type;
@@ -6600,10 +6859,8 @@ void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
     case TK_NamedType: {
       const NamedType *nt = (const NamedType *)type;
       void *found;
-      if (!tree_map_get(&sema->typedef_types, nt->name, &found)) {
-        printf("Unknown type '%s'\n", nt->name);
-        __builtin_trap();
-      }
+      ASSERT_MSG(tree_map_get(&sema->typedef_types, nt->name, &found),
+                 "Unknown type '%s'", nt->name);
 
       // NOTE: This effectively flattens the type tree and we lose information
       // regarding one typedef aliasing to another typedef.
@@ -6614,8 +6871,7 @@ void sema_add_typedef_type(Sema *sema, const char *name, Type *type) {
       break;
     }
     case TK_ReplacementSentinelType:
-      printf("Replacement sentinel type should not be used\n");
-      __builtin_trap();
+      UNREACHABLE_MSG("Replacement sentinel type should not be used");
       break;
   }
 }
@@ -6653,12 +6909,11 @@ const Type *sema_get_type_of_unop_expr(Sema *sema, const UnOp *expr,
       if (sema_is_array_type(sema, sub_type, local_ctx))
         return sema_get_array_type(sema, sub_type, local_ctx)->elem_type;
 
-      printf("Attempting to dereference type that is not a pointer or array\n");
-      __builtin_trap();
+      UNREACHABLE_MSG(
+          "Attempting to dereference type that is not a pointer or array");
     }
     default:
-      printf("TODO: Implement get type for unop kind %d\n", expr->op);
-      __builtin_trap();
+      UNREACHABLE_MSG("TODO: Implement get type for unop kind %d", expr->op);
   }
 }
 
@@ -6687,8 +6942,7 @@ const Type *sema_get_corresponding_unsigned_type(const Sema *sema,
     case BTK_LongLong:
       return &sema->bt_UnsignedLongLong.type;
     default:
-      printf("Non-signed integral type\n");
-      __builtin_trap();
+      UNREACHABLE_MSG("Non-signed integral type: %d", bt->kind);
   }
 }
 
@@ -6765,8 +7019,8 @@ const Type *sema_get_common_arithmetic_type_of_exprs(Sema *sema,
   return sema_get_common_arithmetic_type(sema, lhs_ty, rhs_ty, local_ctx);
 }
 
-const Type *sema_get_type_of_binop_expr(Sema *sema, const BinOp *expr,
-                                        const TreeMap *local_ctx) {
+const Type* sema_get_result_type_of_binop_expr(Sema* sema, const BinOp* expr,
+                                               const TreeMap* local_ctx) {
   const Type *lhs_ty = sema_get_type_of_expr_in_ctx(sema, expr->lhs, local_ctx);
   const Type *rhs_ty = sema_get_type_of_expr_in_ctx(sema, expr->rhs, local_ctx);
 
@@ -6817,9 +7071,8 @@ const Type *sema_get_type_of_binop_expr(Sema *sema, const BinOp *expr,
     case BOK_Comma:
       return rhs_ty;
     default:
-      printf("TODO: Implement get type for binop kind %d on %zu:%zu\n",
-             expr->op, expr->expr.line, expr->expr.col);
-      __builtin_trap();
+      UNREACHABLE_MSG("TODO: Implement get type for binop kind %d on %zu:%zu",
+                      expr->op, expr->expr.line, expr->expr.col);
   }
 }
 
@@ -6897,15 +7150,15 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
         }
       }
 
-      printf("Unknown symbol '%s'\n", decl->name);
-      __builtin_trap();
+      UNREACHABLE_MSG("Unknown symbol '%s'", decl->name);
     }
     case EK_FunctionParam:
       return ((const FunctionParam *)expr)->type;
     case EK_UnOp:
       return sema_get_type_of_unop_expr(sema, (const UnOp *)expr, local_ctx);
     case EK_BinOp:
-      return sema_get_type_of_binop_expr(sema, (const BinOp *)expr, local_ctx);
+      return sema_get_result_type_of_binop_expr(sema, (const BinOp*)expr,
+                                                local_ctx);
     case EK_Call: {
       const Call *call = (const Call *)expr;
       const Type *ty =
@@ -6942,9 +7195,9 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       if (base_ty->vtable->kind == TK_ArrayType)
         return sema_get_array_type(sema, base_ty, local_ctx)->elem_type;
 
-      printf("Attempting to index a type that isn't a pointer or array: %d\n",
-             base_ty->vtable->kind);
-      __builtin_trap();
+      UNREACHABLE_MSG(
+          "Attempting to index a type that isn't a pointer or array: %d",
+          base_ty->vtable->kind);
     }
     case EK_StmtExpr: {
       const StmtExpr* stmt_expr = (const StmtExpr*)expr;
@@ -6961,12 +7214,16 @@ const Type *sema_get_type_of_expr_in_ctx(Sema *sema, const Expr *expr,
       Expr* expr = ((ExprStmt*)last)->expr;
       return sema_get_type_of_expr_in_ctx(sema, expr, local_ctx);
     }
+    case EK_InitializerList:
+      UNREACHABLE_MSG(
+          "Initializer lists do not have types. They are a syntactic construct "
+          "used for initializing aggregate types. Callers of this function "
+          "should not call this function with an InitializerList. They should "
+          "have custom logic for handling them.");
     default:
-      printf(
-          "TODO: Implement sema_get_type_of_expr_in_ctx for this expression "
-          "%d\n",
+      UNREACHABLE_MSG(
+          "TODO: Implement sema_get_type_of_expr_in_ctx for this expression %d",
           expr->vtable->kind);
-      __builtin_trap();
   }
 }
 
@@ -7024,8 +7281,7 @@ static size_t builtin_type_get_size(const BuiltinType *bt) {
     case BTK_BuiltinVAList:
       return sizeof(__builtin_va_list);
     case BTK_Void:
-      printf("Attempting to get sizeof void\n");
-      __builtin_trap();
+      UNREACHABLE_MSG("Attempting to get sizeof void");
   }
 }
 
@@ -7073,8 +7329,7 @@ static size_t builtin_type_get_align(const BuiltinType *bt) {
     case BTK_BuiltinVAList:
       return alignof(__builtin_va_list);
     case BTK_Void:
-      printf("Attempting to get alignof void\n");
-      __builtin_trap();
+      UNREACHABLE_MSG("Attempting to get alignof void");
   }
 }
 
@@ -7105,10 +7360,8 @@ size_t sema_eval_alignof_type(Sema *sema, const Type *type) {
     case TK_NamedType: {
       const NamedType *nt = (const NamedType *)type;
       void *found;
-      if (!tree_map_get(&sema->typedef_types, nt->name, &found)) {
-        printf("Unknown type '%s'\n", nt->name);
-        __builtin_trap();
-      }
+      ASSERT_MSG(tree_map_get(&sema->typedef_types, nt->name, &found),
+                 "Unknown type '%s'", nt->name);
       return sema_eval_alignof_type(sema, (const Type *)found);
     }
     case TK_EnumType:
@@ -7117,8 +7370,7 @@ size_t sema_eval_alignof_type(Sema *sema, const Type *type) {
     case TK_ArrayType:
       return sema_eval_alignof_array(sema, (const ArrayType *)type);
     case TK_FunctionType:
-      printf("Cannot take alignof function type!\n");
-      __builtin_trap();
+      UNREACHABLE_MSG("Cannot take alignof function type!");
     case TK_StructType: {
       const StructType *struct_ty =
           sema_resolve_struct_type(sema, (const StructType *)type);
@@ -7130,30 +7382,29 @@ size_t sema_eval_alignof_type(Sema *sema, const Type *type) {
       return sema_eval_alignof_members(sema, union_ty->members);
     }
     case TK_ReplacementSentinelType:
-      printf("Replacement sentinel type should not be used\n");
-      __builtin_trap();
-      break;
+      UNREACHABLE_MSG("Replacement sentinel type should not be used");
   }
 }
 
 size_t sema_eval_sizeof_struct_type(Sema *sema, const StructType *type) {
   type = sema_resolve_struct_type(sema, type);
-  if (!type->members) {
-    assert(type->name);
-    printf("Taking sizeof incomplete struct type '%s'\n", type->name);
-    __builtin_trap();
-  }
+  ASSERT_MSG(type->members, "Taking sizeof incomplete struct type '%s'",
+             type->name);
 
   size_t size = 0;
+  size_t max_align = 0;
   for (size_t i = 0; i < type->members->size; ++i) {
     // TODO: Account for bitfields.
     const Member* member = vector_at(type->members, i);
     const Type *member_ty = member->type;
     size_t align = sema_eval_alignof_type(sema, member_ty);
+    if (align > max_align)
+      max_align = align;
     if (size % align != 0)
       size = align_up(size, align);
     size += sema_eval_sizeof_type(sema, member_ty);
   }
+  size = align_up(size, max_align);
   return size;
 }
 
@@ -7194,10 +7445,8 @@ size_t sema_eval_sizeof_type(Sema *sema, const Type *type) {
     case TK_NamedType: {
       const NamedType *nt = (const NamedType *)type;
       void *found;
-      if (!tree_map_get(&sema->typedef_types, nt->name, &found)) {
-        printf("Unknown type '%s'\n", nt->name);
-        __builtin_trap();
-      }
+      ASSERT_MSG(tree_map_get(&sema->typedef_types, nt->name, &found),
+                 "Unknown type '%s'\n", nt->name);
       return sema_eval_sizeof_type(sema, (const Type *)found);
     }
     case TK_EnumType:
@@ -7206,16 +7455,13 @@ size_t sema_eval_sizeof_type(Sema *sema, const Type *type) {
     case TK_ArrayType:
       return sema_eval_sizeof_array(sema, (const ArrayType *)type);
     case TK_FunctionType:
-      printf("Cannot take sizeof function type!\n");
-      __builtin_trap();
+      UNREACHABLE_MSG("Cannot take sizeof function type!");
     case TK_StructType:
       return sema_eval_sizeof_struct_type(sema, (const StructType *)type);
     case TK_UnionType:
       return sema_eval_sizeof_union_type(sema, (const UnionType*)type);
     case TK_ReplacementSentinelType:
-      printf("Replacement sentinel type should not be used\n");
-      __builtin_trap();
-      break;
+      UNREACHABLE_MSG("Replacement sentinel type should not be used");
   }
 }
 
@@ -7284,8 +7530,15 @@ size_t sema_eval_sizeof_array(Sema *sema, const ArrayType *arr) {
   size_t elem_size = sema_eval_sizeof_type(sema, arr->elem_type);
   assert(arr->size);
   ConstExprResult num_elems = sema_eval_expr(sema, arr->size);
-  assert(num_elems.result_kind == RK_UnsignedLongLong);
-  return elem_size * num_elems.result.ull;
+  switch (num_elems.result_kind) {
+    case RK_UnsignedLongLong:
+      return elem_size * num_elems.result.ull;
+    case RK_Int:
+      assert(num_elems.result.i >= 0);
+      return elem_size * (size_t)num_elems.result.i;
+    default:
+      UNREACHABLE_MSG("Bool number of array elements?");
+  }
 }
 
 size_t sema_eval_alignof_array(Sema *sema, const ArrayType *arr) {
@@ -7303,11 +7556,44 @@ ConstExprResult sema_eval_binop(Sema *sema, const BinOp *expr) {
       res.result.b = compare_constexpr_result_types(&lhs, &rhs) == 0;
       return res;
     }
+    case BOK_Add: {
+      assert(lhs.result_kind == rhs.result_kind);
+      ConstExprResult res;
+      res.result_kind = lhs.result_kind;
+      switch (lhs.result_kind) {
+        case RK_Boolean:
+          UNREACHABLE_MSG("TODO: Handle adding bools");
+        case RK_Int:
+          res.result.i = lhs.result.i + rhs.result.i;
+          break;
+        case RK_UnsignedLongLong:
+          res.result.ull = lhs.result.ull + rhs.result.ull;
+          break;
+      }
+      return res;
+    }
+    case BOK_Div: {
+      assert(lhs.result_kind == rhs.result_kind);
+      ConstExprResult res;
+      res.result_kind = lhs.result_kind;
+      switch (lhs.result_kind) {
+        case RK_Boolean:
+          UNREACHABLE_MSG("Dividing bools");
+        case RK_Int:
+          assert(rhs.result.i);
+          res.result.i = lhs.result.i / rhs.result.i;
+          break;
+        case RK_UnsignedLongLong:
+          assert(rhs.result.ull);
+          res.result.ull = lhs.result.ull / rhs.result.ull;
+          break;
+      }
+      return res;
+    }
     case BOK_LShift:
       switch (lhs.result_kind) {
         case RK_Boolean:
-          printf("Cannot shift boolean\n");
-          __builtin_trap();
+          UNREACHABLE_MSG("Cannot shift boolean");
         case RK_Int:
           assert(sizeof(int) * 8 > result_to_u64(&rhs));
           lhs.result.i <<= result_to_u64(&rhs);
@@ -7321,8 +7607,7 @@ ConstExprResult sema_eval_binop(Sema *sema, const BinOp *expr) {
     case BOK_RShift:
       switch (lhs.result_kind) {
         case RK_Boolean:
-          printf("Cannot shift boolean\n");
-          __builtin_trap();
+          UNREACHABLE_MSG("Cannot shift boolean");
         case RK_Int:
           assert(sizeof(int) * 8 > result_to_u64(&rhs));
           lhs.result.i >>= result_to_u64(&rhs);
@@ -7351,9 +7636,8 @@ ConstExprResult sema_eval_binop(Sema *sema, const BinOp *expr) {
       assert(lhs.result_kind == rhs.result_kind);
       switch (lhs.result_kind) {
         case RK_Boolean:
-          printf("TODO: Check if booleans can be compared %zu:%zu\n",
-                 expr->expr.line, expr->expr.col);
-          __builtin_trap();
+          UNREACHABLE_MSG("TODO: Check if booleans can be compared %zu:%zu",
+                          expr->expr.line, expr->expr.col);
         case RK_Int:
           lhs.result.b = lhs.result.i < rhs.result.i;
           lhs.result_kind = RK_Boolean;
@@ -7365,11 +7649,9 @@ ConstExprResult sema_eval_binop(Sema *sema, const BinOp *expr) {
       }
     }
     default:
-      printf(
-          "TODO: Implement constant evaluation for the remaining binops %d\n",
+      UNREACHABLE_MSG(
+          "TODO: Implement constant evaluation for the remaining binops %d",
           expr->op);
-      __builtin_trap();
-      break;
   }
 }
 
@@ -7422,8 +7704,7 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
         case UOK_Negate:
           switch (sub_res.result_kind) {
             case RK_Boolean:
-              printf("Cannot negate boolean\n");
-              __builtin_trap();
+              UNREACHABLE_MSG("Cannot negate boolean");
             case RK_Int:
               sub_res.result.i = -sub_res.result.i;
               return sub_res;
@@ -7433,9 +7714,8 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
           }
           break;
         default:
-          printf("TODO: Handle constexpr eval for other unop kinds %d\n",
-                 unop->op);
-          __builtin_trap();
+          UNREACHABLE_MSG("TODO: Handle constexpr eval for other unop kinds %d",
+                          unop->op);
       }
     }
     case EK_DeclRef: {
@@ -7455,8 +7735,7 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
         return sema_eval_expr(sema, gv->initializer);
       }
 
-      printf("Unknown global '%s'\n", decl->name);
-      __builtin_trap();
+      UNREACHABLE_MSG("Unknown global '%s'", decl->name);
     }
     case EK_Conditional: {
       const Conditional* conditional = (const Conditional*)expr;
@@ -7466,12 +7745,10 @@ ConstExprResult sema_eval_expr(Sema *sema, const Expr *expr) {
                                                     : conditional->false_expr);
     }
     default:
-      printf(
+      UNREACHABLE_MSG(
           "TODO: Implement constant evaluation for the remaining "
-          "expressions (%d)\n",
+          "expressions (%d)",
           expr->vtable->kind);
-      __builtin_trap();
-      break;
   }
 }
 
@@ -7491,8 +7768,7 @@ void sema_verify_static_assert_condition(Sema *sema, const Expr *cond) {
         return;
       break;
   }
-  printf("static_assert failed\n");
-  __builtin_trap();
+  UNREACHABLE_MSG("static_assert failed");
 }
 
 ///
@@ -7653,6 +7929,7 @@ LLVMTypeRef get_llvm_builtin_type(Compiler *compiler, const BuiltinType *bt) {
     case BTK_LongLong:
     case BTK_UnsignedLongLong: {
       size_t size = builtin_type_get_size(bt);
+      assert(size);
       return LLVMIntType((unsigned)(size * kCharBit));
     }
     case BTK_Float:
@@ -7729,8 +8006,7 @@ LLVMTypeRef get_llvm_type(Compiler *compiler, const Type *type) {
     case TK_FunctionType:
       return get_llvm_function_type(compiler, (const FunctionType *)type);
     case TK_ReplacementSentinelType:
-      printf("This type should not be handled here.\n");
-      __builtin_trap();
+      UNREACHABLE_MSG("This type should not be handled here.");
   }
 }
 
@@ -7789,6 +8065,26 @@ LLVMValueRef compile_constant_expr(Compiler *compiler, const Expr *expr,
       LLVMTypeRef llvm_type = get_llvm_type_of_expr_global_ctx(compiler, expr);
       return LLVMConstInt(llvm_type, res.result.ull, /*IsSigned=*/0);
     }
+    case EK_String: {
+      const StringLiteral* s = (const StringLiteral*)expr;
+      LLVMValueRef seq = LLVMConstString(s->val, (unsigned)strlen(s->val),
+                                         /*DontNullTerminate=*/false);
+      if (is_array_type(to_ty))
+        return seq;
+
+      // Need to construct a string pointer manually.
+      LLVMValueRef glob = LLVMAddGlobal(compiler->mod, LLVMTypeOf(seq), "");
+      LLVMSetInitializer(glob, seq);
+      return glob;
+    }
+    case EK_Char: {
+      const Type* type = sema_get_type_of_expr(compiler->sema, expr);
+      assert(type->vtable->kind == TK_BuiltinType);
+      bool is_signed = !is_unsigned_integral_type(type);
+      LLVMTypeRef llvm_type = get_llvm_type_of_expr_global_ctx(compiler, expr);
+      return LLVMConstInt(llvm_type, (unsigned)((const Char*)expr)->val,
+                          is_signed);
+    }
     case EK_Int: {
       const Type *type = sema_get_type_of_expr(compiler->sema, expr);
       assert(type->vtable->kind == TK_BuiltinType);
@@ -7822,25 +8118,45 @@ LLVMValueRef compile_constant_expr(Compiler *compiler, const Expr *expr,
       if (is_integral_type(from_ty) && is_pointer_type(to_ty))
         return LLVMConstIntToPtr(from, get_llvm_type(compiler, to_ty));
 
-      printf("TODO: Unhandled constant cast conversion\n");
-      __builtin_trap();
+      UNREACHABLE_MSG("TODO: Unhandled constant cast conversion");
     }
     case EK_InitializerList: {
       const InitializerList *init = (const InitializerList *)expr;
-      LLVMValueRef *constants = malloc(sizeof(LLVMValueRef) * init->elems.size);
-      for (size_t i = 0; i < init->elems.size; ++i) {
-        const InitializerListElem *elem = vector_at(&init->elems, i);
-        const Type *elem_ty = sema_get_type_of_expr(compiler->sema, elem->expr);
-        constants[i] =
-            maybe_compile_constant_implicit_cast(compiler, elem->expr, elem_ty);
-      }
 
       LLVMValueRef res;
       TreeMap dummy_ctx;  // TODO: Have global version of sema_is_array_type.
       string_tree_map_construct(&dummy_ctx);
-      if (sema_is_array_type(compiler->sema, to_ty, &dummy_ctx)) {
-        printf("TODO: Handle this\n");
-        __builtin_trap();
+      bool is_array_ty = sema_is_array_type(compiler->sema, to_ty, &dummy_ctx);
+
+      LLVMValueRef *constants = malloc(sizeof(LLVMValueRef) * init->elems.size);
+      for (size_t i = 0; i < init->elems.size; ++i) {
+        const InitializerListElem *elem = vector_at(&init->elems, i);
+        if (elem->expr->vtable->kind == EK_InitializerList) {
+          if (is_array_ty) {
+            const ArrayType* arr_ty =
+                sema_get_array_type(compiler->sema, to_ty, &dummy_ctx);
+            constants[i] = maybe_compile_constant_implicit_cast(
+                compiler, elem->expr, arr_ty->elem_type);
+          } else {
+            const StructType* struct_ty =
+                sema_get_struct_type(compiler->sema, to_ty, &dummy_ctx);
+            const Member* member_ty = struct_get_nth_member(struct_ty, i);
+            constants[i] = maybe_compile_constant_implicit_cast(
+                compiler, elem->expr, member_ty->type);
+          }
+        } else {
+          const Type* elem_ty =
+              sema_get_type_of_expr(compiler->sema, elem->expr);
+          constants[i] = maybe_compile_constant_implicit_cast(
+              compiler, elem->expr, elem_ty);
+        }
+      }
+
+      if (is_array_ty) {
+        const ArrayType* arr_ty =
+            sema_get_array_type(compiler->sema, to_ty, &dummy_ctx);
+        res = LLVMConstArray(get_llvm_type(compiler, arr_ty->elem_type),
+                             constants, (unsigned)init->elems.size);
       } else {
         assert(sema_is_struct_type(compiler->sema, to_ty, &dummy_ctx));
         res = LLVMConstStruct(constants, (unsigned)init->elems.size,
@@ -7856,17 +8172,15 @@ LLVMValueRef compile_constant_expr(Compiler *compiler, const Expr *expr,
         case UOK_AddrOf:
           return compile_constant_expr(compiler, unop->subexpr, to_ty);
         default:
-          printf(
-              "TODO: Implement IR constant expr evaluation for unop expr op "
-              "%d\n",
+          UNREACHABLE_MSG(
+              "TODO: Implement IR constant expr evaluation for unop expr op %d",
               unop->op);
-          __builtin_trap();
       }
     }
     default:
-      printf("TODO: Implement IR constant expr evaluation for expr kind %d\n",
-             expr->vtable->kind);
-      __builtin_trap();
+      UNREACHABLE_MSG(
+          "TODO: Implement IR constant expr evaluation for expr kind %d",
+          expr->vtable->kind);
   }
 }
 
@@ -7901,26 +8215,23 @@ LLVMValueRef maybe_compile_constant_implicit_cast(Compiler *compiler,
 
   if (is_integral_type(from_ty) && is_integral_type(to_ty)) {
     unsigned long long from_val = LLVMConstIntGetZExtValue(from);
-    // size_t from_size = builtin_type_get_size((const BuiltinType *)from_ty);
-    // size_t to_size = builtin_type_get_size((const BuiltinType *)to_ty);
     LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, to_ty);
     bool is_signed = !is_unsigned_integral_type(to_ty);
     return LLVMConstInt(llvm_to_ty, from_val, is_signed);
   }
 
-  printf(
+  UNREACHABLE_MSG(
       "TODO: Unhandled implicit constant cast conversion:\n"
       "lhs: %d %d (%s) %p\n"
       "rhs: %d %d (%s) %p\n",
       from_ty->vtable->kind, from_ty->qualifiers,
       (from_ty->vtable->kind == TK_StructType
-           ? ((const StructType *)from_ty)->name
+           ? ((const StructType*)from_ty)->name
            : ""),
       from_ty, to_ty->vtable->kind, to_ty->qualifiers,
-      (to_ty->vtable->kind == TK_StructType ? ((const StructType *)to_ty)->name
+      (to_ty->vtable->kind == TK_StructType ? ((const StructType*)to_ty)->name
                                             : ""),
       to_ty);
-  __builtin_trap();
 }
 
 static bool should_use_icmp(LLVMTypeRef type) {
@@ -7965,8 +8276,8 @@ LLVMValueRef compile_to_bool(Compiler* compiler, LLVMBuilderRef builder,
     case TK_NamedType:
     case TK_FunctionType:
     case TK_ReplacementSentinelType:
-      printf("Cannot convert this type to bool %d\n", type->vtable->kind);
-      __builtin_trap();
+      UNREACHABLE_MSG("Cannot convert this type to bool %d",
+                      type->vtable->kind);
   }
 }
 
@@ -7990,10 +8301,20 @@ LLVMValueRef compile_unop_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
                           local_allocas, break_bb, cont_bb);
     }
     default:
-      printf("TODO: Implement compile_unop_lvalue_ptr for this op %d\n",
-             expr->op);
-      __builtin_trap();
+      UNREACHABLE_MSG("TODO: Implement compile_unop_lvalue_ptr for this op %d",
+                      expr->op);
   }
+}
+
+unsigned get_llvm_pointer_size(const Compiler* compiler) {
+  LLVMTargetDataRef data_layout = LLVMGetModuleDataLayout(compiler->mod);
+  unsigned size = LLVMPointerSize(data_layout) * kCharBit;
+  assert(size);
+  return size;
+}
+
+LLVMTypeRef get_llvm_ptr_as_int(const Compiler* compiler) {
+  return LLVMIntType(get_llvm_pointer_size(compiler));
 }
 
 LLVMValueRef compile_unop(Compiler* compiler, LLVMBuilderRef builder,
@@ -8030,9 +8351,22 @@ LLVMValueRef compile_unop(Compiler* compiler, LLVMBuilderRef builder,
       LLVMTypeRef llvm_type =
           get_llvm_type_of_expr(compiler, expr->subexpr, local_ctx);
       LLVMValueRef val = LLVMBuildLoad2(builder, llvm_type, ptr, "");
-      LLVMValueRef one = LLVMConstInt(llvm_type, 1, /*signed=*/0);
+
+      LLVMValueRef one;
+      if (LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind) {
+        LLVMTypeRef int_ty = get_llvm_ptr_as_int(compiler);
+        one = LLVMConstInt(int_ty, 1, /*signed=*/0);
+        val = LLVMBuildPtrToInt(builder, val, int_ty, "");
+      } else {
+        one = LLVMConstInt(llvm_type, 1, /*signed=*/0);
+      }
+
       LLVMValueRef postop = is_inc ? LLVMBuildAdd(builder, val, one, "")
                                    : LLVMBuildSub(builder, val, one, "");
+
+      if (LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind)
+        postop = LLVMBuildIntToPtr(builder, postop, llvm_type, "");
+
       LLVMBuildStore(builder, postop, ptr);
       return is_pre ? postop : val;
     }
@@ -8055,8 +8389,7 @@ LLVMValueRef compile_unop(Compiler* compiler, LLVMBuilderRef builder,
       return LLVMBuildLoad2(builder, llvm_ty, ptr, "");
     }
     default:
-      printf("TODO: Implement compile_unop for this op %d\n", expr->op);
-      __builtin_trap();
+      UNREACHABLE_MSG("TODO: Implement compile_unop for this op %d", expr->op);
   }
 }
 
@@ -8111,8 +8444,9 @@ LLVMValueRef compile_implicit_cast(Compiler* compiler, LLVMBuilderRef builder,
 
     if (LLVMGetTypeKind(llvm_to_ty) == LLVMPointerTypeKind) {
       unsigned from_size = LLVMGetIntTypeWidth(llvm_from_ty);
-      LLVMTargetDataRef data_layout = LLVMGetModuleDataLayout(compiler->mod);
-      unsigned ptr_size = LLVMPointerSize(data_layout) * kCharBit;
+      assert(from_size);
+
+      unsigned ptr_size = get_llvm_pointer_size(compiler);
 
       assert(from_size <= ptr_size);
 
@@ -8247,8 +8581,7 @@ LLVMValueRef compile_logical_binop(Compiler* compiler, LLVMBuilderRef builder,
       LLVMBuildCondBr(builder, lhs_val, res_bb, eval_rhs_bb);
       break;
     default:
-      printf("Unhandled local operator %d\n", op);
-      __builtin_trap();
+      UNREACHABLE_MSG("Unhandled local operator %d", op);
   }
 
   // BB for evaluating RHS.
@@ -8299,18 +8632,39 @@ LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
     offset = expr->lhs;
   }
 
-  if (maybe_ptr && can_be_used_for_ptr_arithmetic(expr->op)) {
+  bool can_be_used_for_ptr_arithmetic =
+      expr->op == BOK_Add || expr->op == BOK_Sub || expr->op == BOK_AddAssign ||
+      expr->op == BOK_SubAssign;
+
+  if (maybe_ptr && can_be_used_for_ptr_arithmetic) {
     const Type *pointee_ty =
         sema_get_pointee(compiler->sema, maybe_ptr_ty, local_ctx);
     LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, pointee_ty);
-    LLVMValueRef llvm_base =
-        compile_expr(compiler, builder, maybe_ptr, local_ctx, local_allocas,
-                     break_bb, cont_bb);
+
     LLVMValueRef llvm_offset = compile_expr(
         compiler, builder, offset, local_ctx, local_allocas, break_bb, cont_bb);
+
+    LLVMValueRef llvm_base;
+    LLVMValueRef ptr;
+    bool assign_op = expr->op == BOK_AddAssign || expr->op == BOK_SubAssign;
+    if (!assign_op) {
+      llvm_base = compile_expr(compiler, builder, maybe_ptr, local_ctx,
+                               local_allocas, break_bb, cont_bb);
+    } else {
+      assert(maybe_ptr == expr->lhs);
+      assert(offset == expr->rhs);
+      ptr = compile_lvalue_ptr(compiler, builder, maybe_ptr, local_ctx,
+                               local_allocas, break_bb, cont_bb);
+      llvm_base = LLVMBuildLoad2(builder, get_opaque_ptr(compiler), ptr, "");
+    }
+
     LLVMValueRef offsets[] = {llvm_offset};
     LLVMValueRef gep =
         LLVMBuildGEP2(builder, llvm_base_ty, llvm_base, offsets, 1, "");
+
+    if (assign_op)
+      LLVMBuildStore(builder, gep, ptr);
+
     return gep;
   }
 
@@ -8335,10 +8689,15 @@ LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
                                 local_allocas, break_bb, cont_bb);
     lhs = compile_lvalue_ptr(compiler, builder, expr->lhs, local_ctx,
                              local_allocas, break_bb, cont_bb);
+    common_ty = lhs_ty;
   } else if (expr->op == BOK_Eq || expr->op == BOK_Ne) {
     if (sema_is_pointer_type(compiler->sema, lhs_ty, local_ctx) &&
         sema_is_pointer_type(compiler->sema, rhs_ty, local_ctx)) {
-      common_ty = sema_get_type_of_binop_expr(compiler->sema, expr, local_ctx);
+      // TODO: When comparing pointers, only pointers of to the same type can be
+      // compared. The only exception to this is void pointers. We should check
+      // that both operands are the same first before comparing. Here we just
+      // assume they are the same.
+      common_ty = lhs_ty;
     } else {
       common_ty = sema_get_common_arithmetic_type(compiler->sema, lhs_ty,
                                                   rhs_ty, local_ctx);
@@ -8358,39 +8717,30 @@ LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
 
   LLVMValueRef res;
 
+  bool common_is_unsigned =
+      sema_is_unsigned_integral_type(compiler->sema, common_ty);
+
   switch (expr->op) {
     case BOK_Comma:
       res = rhs;
       break;
     case BOK_Lt: {
-      LLVMIntPredicate op =
-          sema_is_unsigned_integral_type(compiler->sema, common_ty)
-              ? LLVMIntULT
-              : LLVMIntSLT;
+      LLVMIntPredicate op = common_is_unsigned ? LLVMIntULT : LLVMIntSLT;
       res = LLVMBuildICmp(builder, op, lhs, rhs, "");
       break;
     }
     case BOK_Gt: {
-      LLVMIntPredicate op =
-          sema_is_unsigned_integral_type(compiler->sema, common_ty)
-              ? LLVMIntUGT
-              : LLVMIntSGT;
+      LLVMIntPredicate op = common_is_unsigned ? LLVMIntUGT : LLVMIntSGT;
       res = LLVMBuildICmp(builder, op, lhs, rhs, "");
       break;
     }
     case BOK_Le: {
-      LLVMIntPredicate op =
-          sema_is_unsigned_integral_type(compiler->sema, common_ty)
-              ? LLVMIntULE
-              : LLVMIntSLE;
+      LLVMIntPredicate op = common_is_unsigned ? LLVMIntULE : LLVMIntSLE;
       res = LLVMBuildICmp(builder, op, lhs, rhs, "");
       break;
     }
     case BOK_Ge: {
-      LLVMIntPredicate op =
-          sema_is_unsigned_integral_type(compiler->sema, common_ty)
-              ? LLVMIntUGE
-              : LLVMIntSGE;
+      LLVMIntPredicate op = common_is_unsigned ? LLVMIntUGE : LLVMIntSGE;
       res = LLVMBuildICmp(builder, op, lhs, rhs, "");
       break;
     }
@@ -8401,7 +8751,7 @@ LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
       res = LLVMBuildICmp(builder, LLVMIntEQ, lhs, rhs, "");
       break;
     case BOK_Mod:
-      if (sema_is_unsigned_integral_type(compiler->sema, common_ty))
+      if (common_is_unsigned)
         res = LLVMBuildURem(builder, lhs, rhs, "");
       else
         res = LLVMBuildSRem(builder, lhs, rhs, "");
@@ -8414,6 +8764,12 @@ LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
       break;
     case BOK_Mul:
       res = LLVMBuildMul(builder, lhs, rhs, "");
+      break;
+    case BOK_Div:
+      if (common_is_unsigned)
+        res = LLVMBuildUDiv(builder, lhs, rhs, "");
+      else
+        res = LLVMBuildSDiv(builder, lhs, rhs, "");
       break;
     case BOK_BitwiseAnd:
       res = LLVMBuildAnd(builder, lhs, rhs, "");
@@ -8465,8 +8821,7 @@ LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
       break;
     }
     default:
-      printf("TODO: Implement compile_binop for this op %d\n", expr->op);
-      __builtin_trap();
+      UNREACHABLE_MSG("TODO: Implement compile_binop for this op %d", expr->op);
   }
 
   const Type *res_ty =
@@ -8563,17 +8918,18 @@ LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
   switch (expr->vtable->kind) {
     case EK_String: {
       const StringLiteral *s = (const StringLiteral *)expr;
-      return LLVMBuildGlobalStringPtr(builder, s->val, "");
+      return LLVMBuildGlobalString(builder, s->val, "");
     }
     case EK_PrettyFunction: {
       LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
       size_t size;
-      return LLVMBuildGlobalStringPtr(builder, LLVMGetValueName2(fn, &size),
-                                      "");
+      return LLVMBuildGlobalString(builder, LLVMGetValueName2(fn, &size), "");
     }
     case EK_Int: {
       const Int *i = (const Int *)expr;
       bool has_sign = !is_unsigned_integral_type(&i->type.type);
+      assert(LLVMGetTypeKind(type) == LLVMIntegerTypeKind &&
+             LLVMGetIntTypeWidth(type) > 0);
       return LLVMConstInt(type, i->val, has_sign);
     }
     case EK_Bool: {
@@ -8624,8 +8980,7 @@ LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
           return LLVMConstInt(enum_ty, (uintptr_t)enum_val, /*signed=*/1);
         }
 
-        printf("Couldn't find value for enum member '%s'\n", decl->name);
-        __builtin_trap();
+        UNREACHABLE_MSG("Couldn't find value for enum member '%s'", decl->name);
       }
 
       val = compile_lvalue_ptr(compiler, builder, expr, local_ctx,
@@ -8728,9 +9083,8 @@ LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
       return expr;
     }
     default:
-      printf("TODO: Implement compile_expr for this expr %d\n",
-             expr->vtable->kind);
-      __builtin_trap();
+      UNREACHABLE_MSG("TODO: Implement compile_expr for this expr %d",
+                      expr->vtable->kind);
   }
 }
 
@@ -9224,9 +9578,8 @@ void compile_statement(Compiler* compiler, LLVMBuilderRef builder,
       return;
     }
     default:
-      printf("TODO: Implement compile_statement for this stmt %d\n",
-             stmt->vtable->kind);
-      __builtin_trap();
+      UNREACHABLE_MSG("TODO: Implement compile_statement for this stmt %d",
+                      stmt->vtable->kind);
   }
 }
 
@@ -9389,9 +9742,9 @@ LLVMValueRef compile_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
         return compile_lvalue_ptr(compiler, builder, cast->base, local_ctx,
                                   local_allocas, break_bb, cont_bb);
 
-      printf("Unhandled lvalue ptr cast from %d to %d\n",
-             LLVMGetTypeKind(llvm_src_ty), LLVMGetTypeKind(llvm_dst_ty));
-      __builtin_trap();
+      UNREACHABLE_MSG("Unhandled lvalue ptr cast from %d to %d",
+                      LLVMGetTypeKind(llvm_src_ty),
+                      LLVMGetTypeKind(llvm_dst_ty));
     }
     case EK_Index: {
       const Index *index = (const Index *)expr;
@@ -9428,12 +9781,10 @@ LLVMValueRef compile_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
                              "idx_arr");
       }
 
-      printf("Indexing non-ptr or arr type\n");
-      __builtin_trap();
+      UNREACHABLE_MSG("Indexing non-ptr or arr type");
     }
     default:
-      printf("TODO: Handle lvalue for EK %d\n", expr->vtable->kind);
-      __builtin_trap();
+      UNREACHABLE_MSG("TODO: Handle lvalue for EK %d", expr->vtable->kind);
   }
 }
 
@@ -9463,6 +9814,210 @@ void compile_global_variable(Compiler *compiler, const GlobalVariable *gv) {
 /// End Compiler Implementation
 ///
 
+typedef bool (*UnaryOp)(const void* it, void* arg);
+
+void* find_if(const void* start, const void* end, size_t sizeof_elem,
+              UnaryOp op, void* arg) {
+  const char* start_ = start;
+  const char* end_ = end;
+  for (; start_ != end_; start_ += sizeof_elem) {
+    if (op(start_, arg))
+      return (void*)start_;
+  }
+  return (void*)end_;
+}
+
+enum ParseMode {
+  // This argument is positional and required.
+  PM_RequiredPositional,
+
+  // This argument can be provided more than once and the result will be
+  // accumulated in a vector. The default value for this parsed argument
+  // is a vector of size 0.
+  PM_Multiple,
+
+  // When the argument is provided, it sets the corresponding ParsedArgument
+  // to true. This argument can only be accepted once. This has a default
+  // value of false.
+  PM_StoreTrue,
+};
+
+struct Argument {
+  char short_name;
+  const char* long_name;
+  const char* help;
+  enum ParseMode mode;
+};
+
+const struct Argument kArguments[] = {
+    {0, "input_file", "Input file", PM_RequiredPositional},
+    {'I', "include", "Include directory", PM_Multiple},
+    {'v', "verbose", "Enable verbose output", PM_StoreTrue},
+};
+const size_t kNumArguments = sizeof(kArguments) / sizeof(struct Argument);
+
+bool matches_short_name(const void* it, void* arg) {
+  return ((const struct Argument*)it)->short_name == *((char*)arg);
+}
+
+enum ParsedArgKind {
+  PAK_String,        // This represents a `const char *`.
+  PAK_StringVector,  // This represents a `vector` of `const char *`.
+  PAK_Bool,          // This represents a boolean.
+};
+
+struct ParsedArgument {
+  enum ParsedArgKind kind;
+  void* value;
+  bool stored_value;
+};
+
+const struct Argument* get_nth_pos_arg(size_t n) {
+  size_t i;
+  size_t j;
+  for (i = 0, j = 0; i < kNumArguments; ++i) {
+    if (kArguments[i].mode == PM_RequiredPositional) {
+      if (j == n)
+        return &kArguments[i];
+      j++;
+    }
+  }
+  return NULL;
+}
+
+void parse_args(TreeMap* parsed_args, int argc, char** argv) {
+  const struct Argument* args_end = &kArguments[kNumArguments];
+  size_t num_parsed_pos_args = 0;
+
+  // Set then default values for parsed arguments.
+  for (const struct Argument* it = kArguments; it != &kArguments[kNumArguments];
+       ++it) {
+    switch (it->mode) {
+      case PM_RequiredPositional:
+        // None of these modes uses a default value.
+        break;
+      case PM_StoreTrue: {
+        if (!tree_map_get(parsed_args, it->long_name, NULL)) {
+          struct ParsedArgument* parsed_arg =
+              malloc(sizeof(struct ParsedArgument));
+          parsed_arg->kind = PAK_Bool;
+          parsed_arg->stored_value = false;
+          tree_map_set(parsed_args, it->long_name, parsed_arg);
+        }
+        break;
+      }
+      case PM_Multiple: {
+        if (!tree_map_get(parsed_args, it->long_name, NULL)) {
+          struct ParsedArgument* parsed_arg =
+              malloc(sizeof(struct ParsedArgument));
+          parsed_arg->kind = PAK_StringVector;
+          parsed_arg->value = malloc(sizeof(vector));
+          vector_construct(parsed_arg->value, sizeof(char*), alignof(char*));
+          tree_map_set(parsed_args, it->long_name, parsed_arg);
+        }
+        break;
+      }
+    }
+  }
+
+  for (int i = 1; i < argc;) {
+    const char* arg = argv[i];
+
+    if (arg[0] == '-') {
+      // Optional argument.
+
+      // TODO: Eventually check long optional args.
+      assert(arg[1] == 0 || arg[1] != '-');
+      char short_name = arg[1];
+
+      const struct Argument* found_arg =
+          find_if(kArguments, args_end, sizeof(struct Argument),
+                  matches_short_name, &short_name);
+      ASSERT_MSG(found_arg != args_end, "Unknown argument '%s'", arg);
+
+      switch (found_arg->mode) {
+        case PM_RequiredPositional:
+          UNREACHABLE_MSG("TODO: Handle argument mode '%d'", found_arg->mode);
+        case PM_StoreTrue: {
+          // This already has a default value set prior.
+          struct ParsedArgument* parsed_arg = NULL;
+          tree_map_get(parsed_args, found_arg->long_name, &parsed_arg);
+          assert(parsed_arg);
+
+          parsed_arg->kind = PAK_Bool;
+          parsed_arg->stored_value = true;
+
+          i += 1;
+          break;
+        }
+        case PM_Multiple: {
+          // This already has a default value set prior.
+          struct ParsedArgument* parsed_arg = NULL;
+          tree_map_get(parsed_args, found_arg->long_name, &parsed_arg);
+          assert(parsed_arg);
+
+          const char** storage = vector_append_storage(parsed_arg->value);
+
+          // Set the corresponding argument. Note that if this is in the form
+          //
+          //   -Iargument
+          //
+          // where `I` is the short name, then the actual corresponding value
+          // is part of the current `arg`. Otherwise, it is in the form
+          //
+          //   -I argument
+          //
+          // where the value is the next `arg`.
+          if (arg[2] == 0) {
+            // Next argument.
+            *storage = argv[i + 1];
+
+            i += 2;
+          } else {
+            // Remainder of this argument.
+            *storage = &arg[2];
+
+            i += 1;
+          }
+        }
+      }
+    } else {
+      // Positional argument.
+      const struct Argument* pos_arg = get_nth_pos_arg(num_parsed_pos_args);
+      assert(pos_arg);
+      ++num_parsed_pos_args;
+
+      struct ParsedArgument* parsed_arg = malloc(sizeof(struct ParsedArgument));
+      parsed_arg->kind = PAK_String;
+      parsed_arg->value = (void*)arg;
+
+      tree_map_set(parsed_args, pos_arg->long_name, parsed_arg);
+
+      i += 1;
+    }
+  }
+}
+
+void destroy_parsed_argument(const void* key, void* value, void* arg) {
+  struct ParsedArgument* parsed_arg = value;
+  switch (parsed_arg->kind) {
+    case PAK_Bool:
+    case PAK_String:
+      // Do nothing since we actually save `const char *` here.
+      break;
+    case PAK_StringVector:
+      vector_destroy(parsed_arg->value);
+      free(parsed_arg->value);
+      break;
+  }
+  free(parsed_arg);
+}
+
+void destroy_parsed_args(TreeMap* parsed_args) {
+  tree_map_iterate(parsed_args, destroy_parsed_argument, /*arg=*/NULL);
+  tree_map_destroy(parsed_args);
+}
+
 int main(int argc, char **argv) {
   RunStringTests();
   RunVectorTests();
@@ -9472,6 +10027,29 @@ int main(int argc, char **argv) {
   if (argc < 2) {
     printf("Usage: %s input_file\n", argv[0]);
     return -1;
+  }
+
+  TreeMap parsed_args;
+  string_tree_map_construct(&parsed_args);
+  parse_args(&parsed_args, argc, argv);
+
+  struct ParsedArgument* include_dirs = NULL;
+  tree_map_get(&parsed_args, "include", &include_dirs);
+  assert(include_dirs && include_dirs->kind == PAK_StringVector);
+
+  vector include_dir_paths;  // vector of Paths
+  vector_construct(&include_dir_paths, sizeof(Path), alignof(Path));
+  // for (const char **it = (vector *)include_dirs->value,
+
+  struct ParsedArgument* verbose;
+  if (tree_map_get(&parsed_args, "verbose", &verbose) &&
+      verbose->stored_value) {
+    size_t num_includes = ((vector*)include_dirs->value)->size;
+    printf("Included directories (%zu):\n", num_includes);
+    for (size_t i = 0; i < num_includes; ++i) {
+      printf("  %s\n",
+             *(const char**)vector_at((vector*)include_dirs->value, i));
+    }
   }
 
   const char *input_filename = argv[1];
@@ -9512,10 +10090,12 @@ int main(int argc, char **argv) {
   LLVMSetModuleDataLayout(mod, data_layout);
 
   // Parsing + compiling
-  FileInputStream input;
-  file_input_stream_construct(&input, input_filename);
+  FileInputStream* file_input = malloc(sizeof(FileInputStream));
+  file_input_stream_construct(file_input, input_filename);
+  PreprocessorInputStream pp;
+  preprocessor_input_stream_construct(&pp, &file_input->base);
   Parser parser;
-  parser_construct(&parser, &input.base);
+  parser_construct(&parser, &pp.base);
 
   Sema sema;
   sema_construct(&sema);
@@ -9526,7 +10106,7 @@ int main(int argc, char **argv) {
   vector nodes_to_destroy;
   vector_construct(&nodes_to_destroy, sizeof(Node *), alignof(Node *));
 
-  for (;;) {
+  while (true) {
     const Token *token = parser_peek_token(&parser);
     if (token->kind == TK_Eof) {
       break;
@@ -9613,7 +10193,9 @@ int main(int argc, char **argv) {
   compiler_destroy(&compiler);
   sema_destroy(&sema);
   parser_destroy(&parser);
-  input_stream_destroy(&input.base);
+  input_stream_destroy(&pp.base);
+  vector_destroy(&include_dir_paths);
+  destroy_parsed_args(&parsed_args);
 
   LLVMDisposeModule(mod);
   LLVMDisposeTargetData(data_layout);
