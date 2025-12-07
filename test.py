@@ -1,25 +1,27 @@
 import unittest
 import os
 import subprocess
+from pathlib import Path
 
-
-STAGE1_BIN = "build/c"
-STAGE2_BIN = "build/c.stage2"
-STAGE3_BIN = "build/c.stage3"
+BUILD_DIR = Path("build")
+STAGE1_BIN = BUILD_DIR / "c"
+STAGE2_BIN = BUILD_DIR / "c.stage2"
+STAGE3_BIN = BUILD_DIR / "c.stage3"
 
 
 class TestCompiler:
     def invoke(self, filename):
-        res = subprocess.run([self.bin, filename], capture_output=True)
-        self.assertEqual(res.returncode, 0)
+        obj = str(BUILD_DIR / Path(f"{filename}.o").name)
+        res = subprocess.run([str(self.bin), filename, "-o", obj], capture_output=True)
+        self.assertEqual(res.returncode, 0, res.args)
 
         res = subprocess.run(
-            [os.environ.get("CC", "clang"), "out.obj", "-o", "a.out"],
+            [os.environ.get("CC", "clang"), obj, "-o", str(BUILD_DIR / "a.out")],
             capture_output=True,
         )
         self.assertEqual(res.returncode, 0)
 
-        res = subprocess.run(["./a.out"], capture_output=True)
+        res = subprocess.run([str(BUILD_DIR / "a.out")], capture_output=True)
         self.assertEqual(res.returncode, 0)
 
         return res.stdout.decode("utf-8")
