@@ -19,7 +19,8 @@ LLVM_CONFIG_CORE_LIBS=$(${LLVM_CONFIG} --libs core)
 mkdir -p build
 
 SRCS=(src/compiler.c src/vector.c src/tree-map.c src/cstring.c src/istream.c \
-      src/ifstream.c src/sstream.c src/lexer.c src/type.c)
+      src/ifstream.c src/sstream.c src/lexer.c src/type.c src/parser.c src/expr.c \
+      src/top-level-node.c src/stmt.c)
 PREPROCESSED_SRCS=()
 
 # Preprocess separately bc we can't preprocess on our own yet.
