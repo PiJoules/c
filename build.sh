@@ -20,7 +20,7 @@ mkdir -p build
 
 SRCS=(src/compiler.c src/vector.c src/tree-map.c src/cstring.c src/istream.c \
       src/ifstream.c src/sstream.c src/lexer.c src/type.c src/parser.c src/expr.c \
-      src/top-level-node.c src/stmt.c)
+      src/top-level-node.c src/stmt.c src/sema.c)
 PREPROCESSED_SRCS=()
 
 # Preprocess separately bc we can't preprocess on our own yet.
