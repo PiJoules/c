@@ -9,9 +9,16 @@
 void type_construct(Type* type, const TypeVtable* vtable) {
   type->vtable = vtable;
   type->qualifiers = 0;
+  type->align = NULL;
 }
 
-void type_destroy(Type* type) { type->vtable->dtor(type); }
+void type_destroy(Type* type) {
+  type->vtable->dtor(type);
+  if (type->align) {
+    expr_destroy(type->align);
+    free(type->align);
+  }
+}
 
 void type_dump(const Type* type) {
   ASSERT_MSG(type->vtable->dump, "TODO: Implement dump for type %d",

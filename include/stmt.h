@@ -2,6 +2,7 @@
 #define STMT_H_
 
 #include "expr.h"
+#include "source-location.h"
 #include "type.h"
 #include "vector.h"
 
@@ -27,10 +28,12 @@ typedef struct {
 
 struct Statement {
   const StatementVtable* vtable;
+  SourceLocation loc;
 };
 typedef struct Statement Statement;
 
-void statement_construct(Statement* stmt, const StatementVtable* vtable);
+void statement_construct(Statement* stmt, const StatementVtable* vtable,
+                         const SourceLocation* loc);
 void statement_destroy(Statement* stmt);
 
 typedef struct {
@@ -41,19 +44,19 @@ typedef struct {
 } Declaration;
 
 void declaration_construct(Declaration* decl, const char* name, Type* type,
-                           Expr* init);
+                           Expr* init, const SourceLocation* loc);
 
 typedef struct {
   Statement base;
 } ContinueStmt;
 
-void continue_stmt_construct(ContinueStmt* stmt);
+void continue_stmt_construct(ContinueStmt* stmt, const SourceLocation* loc);
 
 typedef struct {
   Statement base;
 } BreakStmt;
 
-void break_stmt_construct(BreakStmt* stmt);
+void break_stmt_construct(BreakStmt* stmt, const SourceLocation* loc);
 
 struct IfStmt {
   Statement base;
@@ -64,7 +67,8 @@ struct IfStmt {
 };
 typedef struct IfStmt IfStmt;
 
-void if_stmt_construct(IfStmt* stmt, Expr* cond, Statement* body);
+void if_stmt_construct(IfStmt* stmt, Expr* cond, Statement* body,
+                       const SourceLocation* loc);
 
 typedef struct {
   Expr* cond;
@@ -89,7 +93,7 @@ typedef struct {
 } SwitchStmt;
 
 void switch_stmt_construct(SwitchStmt* stmt, Expr* cond, vector cases,
-                           vector* default_stmts);
+                           vector* default_stmts, const SourceLocation* loc);
 
 typedef struct {
   Statement base;
@@ -97,7 +101,8 @@ typedef struct {
   Statement* body;  // Optional.
 } WhileStmt;
 
-void while_stmt_construct(WhileStmt* stmt, Expr* cond, Statement* body);
+void while_stmt_construct(WhileStmt* stmt, Expr* cond, Statement* body,
+                          const SourceLocation* loc);
 
 typedef struct {
   Statement base;
@@ -109,35 +114,30 @@ typedef struct {
 } ForStmt;
 
 void for_stmt_construct(ForStmt* stmt, Statement* init, Expr* cond, Expr* iter,
-                        Statement* body);
+                        Statement* body, const SourceLocation* loc);
 
-typedef struct {
+struct CompoundStmt {
   Statement base;
   vector body;  // vector of Statement pointers.
-} CompoundStmt;
+};
+typedef struct CompoundStmt CompoundStmt;
 
-void compound_stmt_construct(CompoundStmt* stmt, vector body);
+void compound_stmt_construct(CompoundStmt* stmt, vector body,
+                             const SourceLocation* loc);
 
 typedef struct {
   Statement base;
   Expr* expr;  // Optional. NULL means returning void.
 } ReturnStmt;
 
-void return_stmt_construct(ReturnStmt* stmt, Expr* expr);
+void return_stmt_construct(ReturnStmt* stmt, Expr* expr,
+                           const SourceLocation* loc);
 
 typedef struct {
   Statement base;
   Expr* expr;
 } ExprStmt;
 
-void expr_stmt_construct(ExprStmt* stmt, Expr* expr);
-
-typedef struct {
-  Expr expr;
-  CompoundStmt* stmt;  // Optional. NULL indicates an empty statement
-                       // expression, which evaluates to `void`.
-} StmtExpr;
-
-void stmt_expr_construct(StmtExpr* se, CompoundStmt* stmt);
+void expr_stmt_construct(ExprStmt* stmt, Expr* expr, const SourceLocation* loc);
 
 #endif  // STMT_H_

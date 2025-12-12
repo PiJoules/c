@@ -49,6 +49,9 @@ struct Type {
   // bit 1: volatile
   // bit 2: restrict
   Qualifiers qualifiers;
+
+  struct Expr* align;  // NULL indicates the default target alignment should be
+                       // used for this type.
 };
 typedef struct Type Type;
 

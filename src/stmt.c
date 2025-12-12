@@ -6,8 +6,10 @@
 #include "type.h"
 #include "vector.h"
 
-void statement_construct(Statement* stmt, const StatementVtable* vtable) {
+void statement_construct(Statement* stmt, const StatementVtable* vtable,
+                         const SourceLocation* loc) {
   stmt->vtable = vtable;
+  stmt->loc = *loc;
 }
 
 void statement_destroy(Statement* stmt) { stmt->vtable->dtor(stmt); }
@@ -20,8 +22,8 @@ static const StatementVtable DeclarationVtable = {
 };
 
 void declaration_construct(Declaration* decl, const char* name, Type* type,
-                           Expr* init) {
-  statement_construct(&decl->base, &DeclarationVtable);
+                           Expr* init, const SourceLocation* loc) {
+  statement_construct(&decl->base, &DeclarationVtable, loc);
   decl->name = strdup(name);
   decl->type = type;
   decl->initializer = init;
@@ -45,8 +47,8 @@ static const StatementVtable ContinueStmtVtable = {
     .dtor = continue_stmt_destroy,
 };
 
-void continue_stmt_construct(ContinueStmt* stmt) {
-  statement_construct(&stmt->base, &ContinueStmtVtable);
+void continue_stmt_construct(ContinueStmt* stmt, const SourceLocation* loc) {
+  statement_construct(&stmt->base, &ContinueStmtVtable, loc);
 }
 
 static void break_stmt_destroy(Statement*) {}
@@ -56,8 +58,8 @@ static const StatementVtable BreakStmtVtable = {
     .dtor = break_stmt_destroy,
 };
 
-void break_stmt_construct(BreakStmt* stmt) {
-  statement_construct(&stmt->base, &BreakStmtVtable);
+void break_stmt_construct(BreakStmt* stmt, const SourceLocation* loc) {
+  statement_construct(&stmt->base, &BreakStmtVtable, loc);
 }
 
 static void if_stmt_destroy(Statement*);
@@ -67,8 +69,9 @@ static const StatementVtable IfStmtVtable = {
     .dtor = if_stmt_destroy,
 };
 
-void if_stmt_construct(IfStmt* stmt, Expr* cond, Statement* body) {
-  statement_construct(&stmt->base, &IfStmtVtable);
+void if_stmt_construct(IfStmt* stmt, Expr* cond, Statement* body,
+                       const SourceLocation* loc) {
+  statement_construct(&stmt->base, &IfStmtVtable, loc);
   stmt->cond = cond;
   stmt->body = body;
   stmt->else_stmt = NULL;
@@ -113,8 +116,8 @@ static const StatementVtable SwitchStmtVtable = {
 };
 
 void switch_stmt_construct(SwitchStmt* stmt, Expr* cond, vector cases,
-                           vector* default_stmts) {
-  statement_construct(&stmt->base, &SwitchStmtVtable);
+                           vector* default_stmts, const SourceLocation* loc) {
+  statement_construct(&stmt->base, &SwitchStmtVtable, loc);
   stmt->cond = cond;
   stmt->cases = cases;
   stmt->default_stmts = default_stmts;
@@ -150,8 +153,9 @@ static const StatementVtable WhileStmtVtable = {
     .dtor = while_stmt_destroy,
 };
 
-void while_stmt_construct(WhileStmt* stmt, Expr* cond, Statement* body) {
-  statement_construct(&stmt->base, &WhileStmtVtable);
+void while_stmt_construct(WhileStmt* stmt, Expr* cond, Statement* body,
+                          const SourceLocation* loc) {
+  statement_construct(&stmt->base, &WhileStmtVtable, loc);
   stmt->cond = cond;
   assert(cond);
   stmt->body = body;
@@ -176,8 +180,8 @@ static const StatementVtable ForStmtVtable = {
 };
 
 void for_stmt_construct(ForStmt* stmt, Statement* init, Expr* cond, Expr* iter,
-                        Statement* body) {
-  statement_construct(&stmt->base, &ForStmtVtable);
+                        Statement* body, const SourceLocation* loc) {
+  statement_construct(&stmt->base, &ForStmtVtable, loc);
   stmt->init = init;
   stmt->cond = cond;
   stmt->iter = iter;
@@ -211,8 +215,9 @@ static const StatementVtable CompoundStmtVtable = {
     .dtor = compound_stmt_destroy,
 };
 
-void compound_stmt_construct(CompoundStmt* stmt, vector body) {
-  statement_construct(&stmt->base, &CompoundStmtVtable);
+void compound_stmt_construct(CompoundStmt* stmt, vector body,
+                             const SourceLocation* loc) {
+  statement_construct(&stmt->base, &CompoundStmtVtable, loc);
   stmt->body = body;
 }
 
@@ -233,8 +238,9 @@ static const StatementVtable ReturnStmtVtable = {
     .dtor = return_stmt_destroy,
 };
 
-void return_stmt_construct(ReturnStmt* stmt, Expr* expr) {
-  statement_construct(&stmt->base, &ReturnStmtVtable);
+void return_stmt_construct(ReturnStmt* stmt, Expr* expr,
+                           const SourceLocation* loc) {
+  statement_construct(&stmt->base, &ReturnStmtVtable, loc);
   stmt->expr = expr;
 }
 
@@ -253,8 +259,9 @@ static const StatementVtable ExprStmtVtable = {
     .dtor = expr_stmt_destroy,
 };
 
-void expr_stmt_construct(ExprStmt* stmt, Expr* expr) {
-  statement_construct(&stmt->base, &ExprStmtVtable);
+void expr_stmt_construct(ExprStmt* stmt, Expr* expr,
+                         const SourceLocation* loc) {
+  statement_construct(&stmt->base, &ExprStmtVtable, loc);
   stmt->expr = expr;
 }
 
@@ -262,22 +269,4 @@ void expr_stmt_destroy(Statement* stmt) {
   ExprStmt* expr_stmt = (ExprStmt*)stmt;
   expr_destroy(expr_stmt->expr);
   free(expr_stmt->expr);
-}
-
-static void stmt_expr_destroy(Expr* expr);
-
-static const ExprVtable StmtExprVtable = {
-    .kind = EK_StmtExpr,
-    .dtor = stmt_expr_destroy,
-};
-
-void stmt_expr_construct(StmtExpr* se, CompoundStmt* stmt) {
-  expr_construct(&se->expr, &StmtExprVtable);
-  se->stmt = stmt;
-}
-
-void stmt_expr_destroy(Expr* expr) {
-  StmtExpr* se = (StmtExpr*)expr;
-  statement_destroy(&se->stmt->base);
-  free(se->stmt);
 }
