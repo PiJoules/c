@@ -48,8 +48,11 @@ void sema_construct(Sema* sema) {
     FunctionType* builtin_trap_type = malloc(sizeof(FunctionType));
     function_type_construct(builtin_trap_type, &ret_ty->type, args);
 
+    SourceLocation dummy_loc;
+    source_location_construct(&dummy_loc, /*line=*/0, /*col=*/0,
+                              /*filename=*/"");
     global_variable_construct(&sema->builtin_trap, "__builtin_trap",
-                              &builtin_trap_type->type);
+                              &builtin_trap_type->type, &dummy_loc);
 
     sema_handle_global_variable(sema, &sema->builtin_trap);
   }
@@ -216,11 +219,13 @@ bool sema_is_pointer_to(const Sema* sema, const Type* type, TypeKind kind,
 }
 
 static bool sema_types_are_compatible_impl(Sema* sema, const Type* lhs,
-                                           const Type* rhs, bool ignore_quals);
+                                           const Type* rhs, bool ignore_quals,
+                                           const TreeMap* local_ctx);
 
 bool sema_struct_or_union_components_are_compatible(
     Sema* sema, const char* lhs_name, const vector* lhs_members,
-    const char* rhs_name, const vector* rhs_members, bool ignore_quals) {
+    const char* rhs_name, const vector* rhs_members, bool ignore_quals,
+    const TreeMap* local_ctx) {
   // If one is declared with a tag, the other must also be declared with the
   // same tag.
   if ((lhs_name && !rhs_name) || (!lhs_name && rhs_name))
@@ -252,15 +257,16 @@ bool sema_struct_or_union_components_are_compatible(
 
       if (lhs_member->bitfield && rhs_member->bitfield) {
         ConstExprResult lhs_bitfield =
-            sema_eval_expr(sema, lhs_member->bitfield);
+            sema_eval_expr_in_ctx(sema, lhs_member->bitfield, local_ctx);
         ConstExprResult rhs_bitfield =
-            sema_eval_expr(sema, rhs_member->bitfield);
+            sema_eval_expr_in_ctx(sema, rhs_member->bitfield, local_ctx);
         if (compare_constexpr_result_types(&lhs_bitfield, &rhs_bitfield))
           return false;
       }
 
       if (!sema_types_are_compatible_impl(sema, lhs_member->type,
-                                          rhs_member->type, ignore_quals))
+                                          rhs_member->type, ignore_quals,
+                                          local_ctx))
         return false;
     }
   }
@@ -269,17 +275,18 @@ bool sema_struct_or_union_components_are_compatible(
 }
 
 bool sema_types_are_compatible_impl(Sema* sema, const Type* lhs,
-                                    const Type* rhs, bool ignore_quals) {
+                                    const Type* rhs, bool ignore_quals,
+                                    const TreeMap* local_ctx) {
   if (lhs->vtable->kind == TK_NamedType) {
     const Type* resolved_lhs = sema_resolve_named_type(sema, (NamedType*)lhs);
-    return sema_types_are_compatible_impl(sema, resolved_lhs, rhs,
-                                          ignore_quals);
+    return sema_types_are_compatible_impl(sema, resolved_lhs, rhs, ignore_quals,
+                                          local_ctx);
   }
 
   if (rhs->vtable->kind == TK_NamedType) {
     const Type* resolved_rhs = sema_resolve_named_type(sema, (NamedType*)rhs);
-    return sema_types_are_compatible_impl(sema, lhs, resolved_rhs,
-                                          ignore_quals);
+    return sema_types_are_compatible_impl(sema, lhs, resolved_rhs, ignore_quals,
+                                          local_ctx);
   }
 
   if (lhs->vtable->kind != rhs->vtable->kind)
@@ -298,7 +305,7 @@ bool sema_types_are_compatible_impl(Sema* sema, const Type* lhs,
       const Type* lhs_pointee = ((PointerType*)lhs)->pointee;
       const Type* rhs_pointee = ((PointerType*)rhs)->pointee;
       if (!sema_types_are_compatible_impl(sema, lhs_pointee, rhs_pointee,
-                                          ignore_quals))
+                                          ignore_quals, local_ctx))
         return false;
       break;
     }
@@ -306,12 +313,15 @@ bool sema_types_are_compatible_impl(Sema* sema, const Type* lhs,
       ArrayType* lhs_arr = (ArrayType*)lhs;
       ArrayType* rhs_arr = (ArrayType*)rhs;
       if (!sema_types_are_compatible_impl(sema, lhs_arr->elem_type,
-                                          rhs_arr->elem_type, ignore_quals))
+                                          rhs_arr->elem_type, ignore_quals,
+                                          local_ctx))
         return false;
 
       if (lhs_arr->size && rhs_arr->size) {
-        ConstExprResult lhs_res = sema_eval_expr(sema, lhs_arr->size);
-        ConstExprResult rhs_res = sema_eval_expr(sema, rhs_arr->size);
+        ConstExprResult lhs_res =
+            sema_eval_expr_in_ctx(sema, lhs_arr->size, local_ctx);
+        ConstExprResult rhs_res =
+            sema_eval_expr_in_ctx(sema, rhs_arr->size, local_ctx);
         if (compare_constexpr_result_types(&lhs_res, &rhs_res) != 0)
           return false;
       }
@@ -326,7 +336,7 @@ bool sema_types_are_compatible_impl(Sema* sema, const Type* lhs,
 
       if (!sema_struct_or_union_components_are_compatible(
               sema, lhs_struct->name, lhs_struct->members, rhs_struct->name,
-              rhs_struct->members, ignore_quals))
+              rhs_struct->members, ignore_quals, local_ctx))
         return false;
 
       break;
@@ -337,7 +347,7 @@ bool sema_types_are_compatible_impl(Sema* sema, const Type* lhs,
 
       if (!sema_struct_or_union_components_are_compatible(
               sema, lhs_union->name, lhs_union->members, rhs_union->name,
-              rhs_union->members, ignore_quals))
+              rhs_union->members, ignore_quals, local_ctx))
         return false;
 
       break;
@@ -352,7 +362,8 @@ bool sema_types_are_compatible_impl(Sema* sema, const Type* lhs,
       FunctionType* lhs_func = (FunctionType*)lhs;
       FunctionType* rhs_func = (FunctionType*)rhs;
       if (!sema_types_are_compatible_impl(sema, lhs_func->return_type,
-                                          rhs_func->return_type, ignore_quals))
+                                          rhs_func->return_type, ignore_quals,
+                                          local_ctx))
         return false;
 
       if (lhs_func->has_var_args != rhs_func->has_var_args)
@@ -367,7 +378,7 @@ bool sema_types_are_compatible_impl(Sema* sema, const Type* lhs,
         Type* lhs_arg = ((FunctionArg*)vector_at(&lhs_func->pos_args, i))->type;
         Type* rhs_arg = ((FunctionArg*)vector_at(&rhs_func->pos_args, i))->type;
         if (!sema_types_are_compatible_impl(sema, lhs_arg, rhs_arg,
-                                            ignore_quals))
+                                            ignore_quals, local_ctx))
           return false;
       }
       break;
@@ -381,13 +392,17 @@ bool sema_types_are_compatible_impl(Sema* sema, const Type* lhs,
   return true;
 }
 
-bool sema_types_are_compatible(Sema* sema, const Type* lhs, const Type* rhs) {
-  return sema_types_are_compatible_impl(sema, lhs, rhs, /*ignore_quals=*/false);
+bool sema_types_are_compatible(Sema* sema, const Type* lhs, const Type* rhs,
+                               const TreeMap* local_ctx) {
+  return sema_types_are_compatible_impl(sema, lhs, rhs, /*ignore_quals=*/false,
+                                        local_ctx);
 }
 
 bool sema_types_are_compatible_ignore_quals(Sema* sema, const Type* lhs,
-                                            const Type* rhs) {
-  return sema_types_are_compatible_impl(sema, lhs, rhs, /*ignore_quals=*/true);
+                                            const Type* rhs,
+                                            const TreeMap* local_ctx) {
+  return sema_types_are_compatible_impl(sema, lhs, rhs, /*ignore_quals=*/true,
+                                        local_ctx);
 }
 
 static void verify_function_type(Sema* sema, const FunctionType* func_ty) {
@@ -425,8 +440,11 @@ void sema_handle_function_definition(Sema* sema, FunctionDefinition* f) {
   GlobalVariable* gv = val;
   ASSERT_MSG(!gv->initializer, "Redefinition of function '%s'", f->name);
 
-  ASSERT_MSG(sema_types_are_compatible(sema, gv->type, f->type),
+  TreeMap dummy_ctx;
+  string_tree_map_construct(&dummy_ctx);
+  ASSERT_MSG(sema_types_are_compatible(sema, gv->type, f->type, &dummy_ctx),
              "redefinition of '%s' with a different type", gv->name);
+  tree_map_destroy(&dummy_ctx);
 }
 
 void sema_handle_global_variable(Sema* sema, GlobalVariable* gv) {
@@ -439,13 +457,17 @@ void sema_handle_global_variable(Sema* sema, GlobalVariable* gv) {
     return;
   }
 
+  TreeMap dummy_ctx;
+  string_tree_map_construct(&dummy_ctx);
+
   // This global was declared prior. Check that we have the same compatible
   // types.
   TopLevelNode* found_val = val;
   if (found_val->vtable->kind == TLNK_GlobalVariable) {
     GlobalVariable* found = val;
-    ASSERT_MSG(sema_types_are_compatible(sema, found->type, gv->type),
-               "redefinition of '%s' with a different type", gv->name);
+    ASSERT_MSG(
+        sema_types_are_compatible(sema, found->type, gv->type, &dummy_ctx),
+        "redefinition of '%s' with a different type", gv->name);
 
     // Ensure we don't have multiple definitions.
     ASSERT_MSG(!(found->initializer && gv->initializer),
@@ -456,13 +478,14 @@ void sema_handle_global_variable(Sema* sema, GlobalVariable* gv) {
       tree_map_set(&sema->globals, gv->name, gv);
     }
 
+    tree_map_destroy(&dummy_ctx);
     return;
   }
 
   // This must be a function.
   assert(found_val->vtable->kind == TLNK_FunctionDefinition);
   FunctionDefinition* found = val;
-  ASSERT_MSG(sema_types_are_compatible(sema, found->type, gv->type),
+  ASSERT_MSG(sema_types_are_compatible(sema, found->type, gv->type, &dummy_ctx),
              "redefinition of '%s' with a different type", gv->name);
   assert(found->type->vtable->kind == TK_FunctionType);
   verify_function_type(sema, (const FunctionType*)found->type);
@@ -470,6 +493,8 @@ void sema_handle_global_variable(Sema* sema, GlobalVariable* gv) {
   // The new global variable must be a re-declaration since we can only
   // have one function definition.
   ASSERT_MSG(!gv->initializer, "Redefinition of function '%s'", gv->name);
+
+  tree_map_destroy(&dummy_ctx);
 }
 
 static void sema_handle_struct_declaration_impl(Sema* sema,
@@ -541,7 +566,12 @@ static void sema_handle_enum_declaration_impl(Sema* sema, EnumType* enum_ty) {
     assert(!tree_map_get(&sema->enum_values, member->name, NULL));
 
     if (member->value) {
-      ConstExprResult res = sema_eval_expr(sema, member->value);
+      TreeMap dummy_ctx;
+      string_tree_map_construct(&dummy_ctx);
+      ConstExprResult res =
+          sema_eval_expr_in_ctx(sema, member->value, &dummy_ctx);
+      tree_map_destroy(&dummy_ctx);
+
       switch (res.result_kind) {
         case RK_Boolean:
           UNREACHABLE_MSG("TODO: Can a bool be assigned to an enum member?");
@@ -575,6 +605,9 @@ void sema_add_typedef_type(Sema* sema, const char* name, Type* type) {
   } else if (type->vtable->kind == TK_EnumType) {
     EnumType* enum_ty = (EnumType*)type;
     sema_handle_enum_declaration_impl(sema, enum_ty);
+  } else if (type->vtable->kind == TK_UnionType) {
+    UnionType* union_ty = (UnionType*)type;
+    sema_handle_union_declaration_impl(sema, union_ty);
   }
 
   switch (type->vtable->kind) {
@@ -683,7 +716,7 @@ const Type* sema_get_common_arithmetic_type(Sema* sema, const Type* lhs_ty,
     rhs_ty = sema_resolve_named_type(sema, (const NamedType*)rhs_ty);
 
   // If the types are the same, that type is the common type.
-  if (sema_types_are_compatible_ignore_quals(sema, lhs_ty, rhs_ty))
+  if (sema_types_are_compatible_ignore_quals(sema, lhs_ty, rhs_ty, local_ctx))
     return lhs_ty;
 
   // TODO: Handle non-integral types also.
@@ -726,8 +759,8 @@ const Type* sema_get_common_arithmetic_type(Sema* sema, const Type* lhs_ty,
   // If the signed type can represent all values of the unsigned type, then
   // the operand with the unsigned type is implicitly converted to the
   // signed type.
-  size_t unsigned_size = sema_eval_sizeof_type(sema, unsigned_ty);
-  size_t signed_size = sema_eval_sizeof_type(sema, signed_ty);
+  size_t unsigned_size = sema_eval_sizeof_type(sema, unsigned_ty, local_ctx);
+  size_t signed_size = sema_eval_sizeof_type(sema, signed_ty, local_ctx);
   if (signed_size > unsigned_size)
     return signed_ty;
 
@@ -955,16 +988,6 @@ const Type* sema_get_type_of_expr_in_ctx(Sema* sema, const Expr* expr,
   }
 }
 
-// Infer the type of this expression in the global context. The caller of this
-// is not in charge of destroying the type.
-const Type* sema_get_type_of_expr(Sema* sema, const Expr* expr) {
-  TreeMap local_ctx;
-  string_tree_map_construct(&local_ctx);
-  const Type* res = sema_get_type_of_expr_in_ctx(sema, expr, &local_ctx);
-  tree_map_destroy(&local_ctx);
-  return res;
-}
-
 size_t builtin_type_get_size(const BuiltinType* bt) {
   // TODO: ATM these are the HOST values, not the target values.
   switch (bt->kind) {
@@ -1061,21 +1084,24 @@ static size_t builtin_type_get_align(const BuiltinType* bt) {
   }
 }
 
-size_t sema_eval_alignof_members(Sema* sema, const vector* members) {
+size_t sema_eval_alignof_members(Sema* sema, const vector* members,
+                                 const TreeMap* local_ctx) {
   assert(members);
   size_t max_align = 0;
   for (size_t i = 0; i < members->size; ++i) {
     const Member* member = vector_at(members, i);
-    size_t member_align = sema_eval_alignof_type(sema, member->type);
+    size_t member_align = sema_eval_alignof_type(sema, member->type, local_ctx);
     if (member_align > max_align)
       max_align = member_align;
   }
   return max_align;
 }
 
-size_t sema_eval_alignof_type(Sema* sema, const Type* type) {
+size_t sema_eval_alignof_type(Sema* sema, const Type* type,
+                              const TreeMap* local_ctx) {
   if (type->align) {
-    ConstExprResult alignment = sema_eval_expr(sema, type->align);
+    ConstExprResult alignment =
+        sema_eval_expr_in_ctx(sema, type->align, local_ctx);
     switch (alignment.result_kind) {
       case RK_Boolean:
         UNREACHABLE_MSG("Bool is not acceptable alignment");
@@ -1099,31 +1125,32 @@ size_t sema_eval_alignof_type(Sema* sema, const Type* type) {
       void* found;
       ASSERT_MSG(tree_map_get(&sema->typedef_types, nt->name, &found),
                  "Unknown type '%s'", nt->name);
-      return sema_eval_alignof_type(sema, (const Type*)found);
+      return sema_eval_alignof_type(sema, (const Type*)found, local_ctx);
     }
     case TK_EnumType:
       return builtin_type_get_align(
           sema_get_integral_type_for_enum(sema, (const EnumType*)type));
     case TK_ArrayType:
-      return sema_eval_alignof_array(sema, (const ArrayType*)type);
+      return sema_eval_alignof_array(sema, (const ArrayType*)type, local_ctx);
     case TK_FunctionType:
       UNREACHABLE_MSG("Cannot take alignof function type!");
     case TK_StructType: {
       const StructType* struct_ty =
           sema_resolve_struct_type(sema, (const StructType*)type);
-      return sema_eval_alignof_members(sema, struct_ty->members);
+      return sema_eval_alignof_members(sema, struct_ty->members, local_ctx);
     }
     case TK_UnionType: {
       const UnionType* union_ty =
           sema_resolve_union_type(sema, (const UnionType*)type);
-      return sema_eval_alignof_members(sema, union_ty->members);
+      return sema_eval_alignof_members(sema, union_ty->members, local_ctx);
     }
     case TK_ReplacementSentinelType:
       UNREACHABLE_MSG("Replacement sentinel type should not be used");
   }
 }
 
-size_t sema_eval_sizeof_struct_type(Sema* sema, const StructType* type) {
+size_t sema_eval_sizeof_struct_type(Sema* sema, const StructType* type,
+                                    const TreeMap* local_ctx) {
   type = sema_resolve_struct_type(sema, type);
   ASSERT_MSG(type->members, "Taking sizeof incomplete struct type '%s'",
              type->name);
@@ -1134,18 +1161,19 @@ size_t sema_eval_sizeof_struct_type(Sema* sema, const StructType* type) {
     // TODO: Account for bitfields.
     const Member* member = vector_at(type->members, i);
     const Type* member_ty = member->type;
-    size_t align = sema_eval_alignof_type(sema, member_ty);
+    size_t align = sema_eval_alignof_type(sema, member_ty, local_ctx);
     if (align > max_align)
       max_align = align;
     if (size % align != 0)
       size = align_up(size, align);
-    size += sema_eval_sizeof_type(sema, member_ty);
+    size += sema_eval_sizeof_type(sema, member_ty, local_ctx);
   }
   size = align_up(size, max_align);
   return size;
 }
 
-const Member* sema_get_largest_union_member(Sema* sema, const UnionType* type) {
+const Member* sema_get_largest_union_member(Sema* sema, const UnionType* type,
+                                            const TreeMap* local_ctx) {
   type = sema_resolve_union_type(sema, type);
   assert(type->members && type->members->size);
 
@@ -1155,7 +1183,7 @@ const Member* sema_get_largest_union_member(Sema* sema, const UnionType* type) {
     // TODO: Account for bitfields.
     const Member* member = vector_at(type->members, i);
     const Type* member_ty = member->type;
-    size_t member_size = sema_eval_sizeof_type(sema, member_ty);
+    size_t member_size = sema_eval_sizeof_type(sema, member_ty, local_ctx);
     if (member_size > size) {
       size = member_size;
       largest = member;
@@ -1165,15 +1193,18 @@ const Member* sema_get_largest_union_member(Sema* sema, const UnionType* type) {
   return largest;
 }
 
-size_t sema_eval_sizeof_union_type(Sema* sema, const UnionType* type) {
-  return sema_eval_sizeof_type(sema,
-                               sema_get_largest_union_member(sema, type)->type);
+size_t sema_eval_sizeof_union_type(Sema* sema, const UnionType* type,
+                                   const TreeMap* local_ctx) {
+  return sema_eval_sizeof_type(
+      sema, sema_get_largest_union_member(sema, type, local_ctx)->type,
+      local_ctx);
 }
 
-size_t sema_eval_sizeof_array(Sema* sema, const ArrayType* arr) {
-  size_t elem_size = sema_eval_sizeof_type(sema, arr->elem_type);
+size_t sema_eval_sizeof_array(Sema* sema, const ArrayType* arr,
+                              const TreeMap* local_ctx) {
+  size_t elem_size = sema_eval_sizeof_type(sema, arr->elem_type, local_ctx);
   assert(arr->size);
-  ConstExprResult num_elems = sema_eval_expr(sema, arr->size);
+  ConstExprResult num_elems = sema_eval_expr_in_ctx(sema, arr->size, local_ctx);
   switch (num_elems.result_kind) {
     case RK_UnsignedLongLong:
       return elem_size * num_elems.result.ull;
@@ -1185,7 +1216,8 @@ size_t sema_eval_sizeof_array(Sema* sema, const ArrayType* arr) {
   }
 }
 
-size_t sema_eval_sizeof_type(Sema* sema, const Type* type) {
+size_t sema_eval_sizeof_type(Sema* sema, const Type* type,
+                             const TreeMap* local_ctx) {
   switch (type->vtable->kind) {
     case TK_BuiltinType:
       return builtin_type_get_size((const BuiltinType*)type);
@@ -1199,19 +1231,21 @@ size_t sema_eval_sizeof_type(Sema* sema, const Type* type) {
       void* found;
       ASSERT_MSG(tree_map_get(&sema->typedef_types, nt->name, &found),
                  "Unknown type '%s'\n", nt->name);
-      return sema_eval_sizeof_type(sema, (const Type*)found);
+      return sema_eval_sizeof_type(sema, (const Type*)found, local_ctx);
     }
     case TK_EnumType:
       return builtin_type_get_size(
           sema_get_integral_type_for_enum(sema, (const EnumType*)type));
     case TK_ArrayType:
-      return sema_eval_sizeof_array(sema, (const ArrayType*)type);
+      return sema_eval_sizeof_array(sema, (const ArrayType*)type, local_ctx);
     case TK_FunctionType:
       UNREACHABLE_MSG("Cannot take sizeof function type!");
     case TK_StructType:
-      return sema_eval_sizeof_struct_type(sema, (const StructType*)type);
+      return sema_eval_sizeof_struct_type(sema, (const StructType*)type,
+                                          local_ctx);
     case TK_UnionType:
-      return sema_eval_sizeof_union_type(sema, (const UnionType*)type);
+      return sema_eval_sizeof_union_type(sema, (const UnionType*)type,
+                                         local_ctx);
     case TK_ReplacementSentinelType:
       UNREACHABLE_MSG("Replacement sentinel type should not be used");
   }
@@ -1278,13 +1312,15 @@ int compare_constexpr_result_types(const ConstExprResult* lhs,
   }
 }
 
-size_t sema_eval_alignof_array(Sema* sema, const ArrayType* arr) {
-  return sema_eval_alignof_type(sema, arr->elem_type);
+size_t sema_eval_alignof_array(Sema* sema, const ArrayType* arr,
+                               const TreeMap* local_ctx) {
+  return sema_eval_alignof_type(sema, arr->elem_type, local_ctx);
 }
 
-ConstExprResult sema_eval_binop(Sema* sema, const BinOp* expr) {
-  ConstExprResult lhs = sema_eval_expr(sema, expr->lhs);
-  ConstExprResult rhs = sema_eval_expr(sema, expr->rhs);
+ConstExprResult sema_eval_binop_in_ctx(Sema* sema, const BinOp* expr,
+                                       const TreeMap* local_ctx) {
+  ConstExprResult lhs = sema_eval_expr_in_ctx(sema, expr->lhs, local_ctx);
+  ConstExprResult rhs = sema_eval_expr_in_ctx(sema, expr->rhs, local_ctx);
 
   switch (expr->op) {
     case BOK_Eq: {
@@ -1393,44 +1429,49 @@ ConstExprResult sema_eval_binop(Sema* sema, const BinOp* expr) {
   }
 }
 
-ConstExprResult sema_eval_alignof(Sema* sema, const AlignOf* ao) {
+ConstExprResult sema_eval_alignof_in_ctx(Sema* sema, const AlignOf* ao,
+                                         const TreeMap* local_ctx) {
   const Type* type;
   if (ao->is_expr) {
-    type = sema_get_type_of_expr(sema, (const Expr*)ao->expr_or_type);
+    type = sema_get_type_of_expr_in_ctx(sema, (const Expr*)ao->expr_or_type,
+                                        local_ctx);
   } else {
     type = (const Type*)ao->expr_or_type;
   }
 
-  size_t size = sema_eval_alignof_type(sema, type);
+  size_t size = sema_eval_alignof_type(sema, type, local_ctx);
   ConstExprResult res;
   res.result_kind = RK_UnsignedLongLong;
   res.result.ull = size;
   return res;
 }
 
-ConstExprResult sema_eval_sizeof(Sema* sema, const SizeOf* so) {
+ConstExprResult sema_eval_sizeof_in_ctx(Sema* sema, const SizeOf* so,
+                                        const TreeMap* local_ctx) {
   const Type* type;
   if (so->is_expr) {
-    type = sema_get_type_of_expr(sema, (const Expr*)so->expr_or_type);
+    type = sema_get_type_of_expr_in_ctx(sema, (const Expr*)so->expr_or_type,
+                                        local_ctx);
   } else {
     type = (const Type*)so->expr_or_type;
   }
 
-  size_t size = sema_eval_sizeof_type(sema, type);
+  size_t size = sema_eval_sizeof_type(sema, type, local_ctx);
   ConstExprResult res;
   res.result_kind = RK_UnsignedLongLong;
   res.result.ull = size;
   return res;
 }
 
-ConstExprResult sema_eval_expr(Sema* sema, const Expr* expr) {
+ConstExprResult sema_eval_expr_in_ctx(Sema* sema, const Expr* expr,
+                                      const TreeMap* local_ctx) {
   switch (expr->vtable->kind) {
     case EK_BinOp:
-      return sema_eval_binop(sema, (const BinOp*)expr);
+      return sema_eval_binop_in_ctx(sema, (const BinOp*)expr, local_ctx);
     case EK_SizeOf:
-      return sema_eval_sizeof(sema, (const SizeOf*)expr);
+      return sema_eval_sizeof_in_ctx(sema, (const SizeOf*)expr, local_ctx);
     case EK_AlignOf:
-      return sema_eval_alignof(sema, (const AlignOf*)expr);
+      return sema_eval_alignof_in_ctx(sema, (const AlignOf*)expr, local_ctx);
     case EK_Int: {
       ConstExprResult res;
       res.result_kind = RK_Int;
@@ -1439,7 +1480,8 @@ ConstExprResult sema_eval_expr(Sema* sema, const Expr* expr) {
     }
     case EK_UnOp: {
       const UnOp* unop = (const UnOp*)expr;
-      ConstExprResult sub_res = sema_eval_expr(sema, unop->subexpr);
+      ConstExprResult sub_res =
+          sema_eval_expr_in_ctx(sema, unop->subexpr, local_ctx);
       switch (unop->op) {
         case UOK_Negate:
           switch (sub_res.result_kind) {
@@ -1472,17 +1514,20 @@ ConstExprResult sema_eval_expr(Sema* sema, const Expr* expr) {
         assert(((TopLevelNode*)val)->vtable->kind == TLNK_GlobalVariable);
         const GlobalVariable* gv = val;
         assert(gv->initializer);
-        return sema_eval_expr(sema, gv->initializer);
+        return sema_eval_expr_in_ctx(sema, gv->initializer, local_ctx);
       }
 
       UNREACHABLE_MSG("Unknown global '%s'", decl->name);
     }
     case EK_Conditional: {
       const Conditional* conditional = (const Conditional*)expr;
-      ConstExprResult cond_res = sema_eval_expr(sema, conditional->cond);
+      ConstExprResult cond_res =
+          sema_eval_expr_in_ctx(sema, conditional->cond, local_ctx);
       assert(cond_res.result_kind == RK_Boolean);
-      return sema_eval_expr(sema, cond_res.result.b ? conditional->true_expr
-                                                    : conditional->false_expr);
+      return sema_eval_expr_in_ctx(
+          sema,
+          cond_res.result.b ? conditional->true_expr : conditional->false_expr,
+          local_ctx);
     }
     default:
       UNREACHABLE_MSG(
@@ -1492,8 +1537,9 @@ ConstExprResult sema_eval_expr(Sema* sema, const Expr* expr) {
   }
 }
 
-void sema_verify_static_assert_condition(Sema* sema, const Expr* cond) {
-  ConstExprResult res = sema_eval_expr(sema, cond);
+void sema_verify_static_assert_condition(Sema* sema, const Expr* cond,
+                                         const TreeMap* local_ctx) {
+  ConstExprResult res = sema_eval_expr_in_ctx(sema, cond, local_ctx);
   switch (res.result_kind) {
     case RK_Boolean:
       if (res.result.b)

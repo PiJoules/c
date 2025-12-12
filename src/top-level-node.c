@@ -9,8 +9,10 @@
 #include "vector.h"
 
 void top_level_node_construct(TopLevelNode* node,
-                              const TopLevelNodeVtable* vtable) {
+                              const TopLevelNodeVtable* vtable,
+                              const SourceLocation* loc) {
   node->vtable = vtable;
+  node->loc = *loc;
 }
 
 void top_level_node_destroy(TopLevelNode* node) { node->vtable->dtor(node); }
@@ -34,8 +36,8 @@ void typedef_destroy(TopLevelNode* node) {
     free(td->name);
 }
 
-void typedef_construct(Typedef* td) {
-  top_level_node_construct(&td->node, &TypedefVtable);
+void typedef_construct(Typedef* td, const SourceLocation* loc) {
+  top_level_node_construct(&td->node, &TypedefVtable, loc);
   td->type = NULL;
   td->name = NULL;
 }
@@ -47,8 +49,9 @@ static const TopLevelNodeVtable StaticAssertVtable = {
     .dtor = static_assert_destroy,
 };
 
-void static_assert_construct(StaticAssert* sa, Expr* expr) {
-  top_level_node_construct(&sa->node, &StaticAssertVtable);
+void static_assert_construct(StaticAssert* sa, Expr* expr,
+                             const SourceLocation* loc) {
+  top_level_node_construct(&sa->node, &StaticAssertVtable, loc);
   sa->expr = expr;
 }
 
@@ -65,9 +68,9 @@ static const TopLevelNodeVtable GlobalVariableVtable = {
     .dtor = global_variable_destroy,
 };
 
-void global_variable_construct(GlobalVariable* gv, const char* name,
-                               Type* type) {
-  top_level_node_construct(&gv->node, &GlobalVariableVtable);
+void global_variable_construct(GlobalVariable* gv, const char* name, Type* type,
+                               const SourceLocation* loc) {
+  top_level_node_construct(&gv->node, &GlobalVariableVtable, loc);
   gv->name = strdup(name);
   gv->type = type;
   gv->initializer = NULL;
@@ -94,14 +97,15 @@ static const TopLevelNodeVtable StructDeclarationVtable = {
 };
 
 void struct_declaration_construct_from_type(StructDeclaration* decl,
-                                            StructType* type) {
-  top_level_node_construct(&decl->node, &StructDeclarationVtable);
+                                            StructType* type,
+                                            const SourceLocation* loc) {
+  top_level_node_construct(&decl->node, &StructDeclarationVtable, loc);
   decl->type = type;
 }
 
 void struct_declaration_construct(StructDeclaration* decl, char* name,
-                                  vector* members) {
-  top_level_node_construct(&decl->node, &StructDeclarationVtable);
+                                  vector* members, const SourceLocation* loc) {
+  top_level_node_construct(&decl->node, &StructDeclarationVtable, loc);
   decl->type = malloc(sizeof(StructType));
   struct_type_construct(decl->type, name, members);
 }
@@ -119,15 +123,15 @@ static const TopLevelNodeVtable EnumDeclarationVtable = {
     .dtor = enum_declaration_destroy,
 };
 
-void enum_declaration_construct_from_type(EnumDeclaration* decl,
-                                          EnumType* type) {
-  top_level_node_construct(&decl->node, &EnumDeclarationVtable);
+void enum_declaration_construct_from_type(EnumDeclaration* decl, EnumType* type,
+                                          const SourceLocation* loc) {
+  top_level_node_construct(&decl->node, &EnumDeclarationVtable, loc);
   decl->type = type;
 }
 
 void enum_declaration_construct(EnumDeclaration* decl, char* name,
-                                vector* members) {
-  top_level_node_construct(&decl->node, &EnumDeclarationVtable);
+                                vector* members, const SourceLocation* loc) {
+  top_level_node_construct(&decl->node, &EnumDeclarationVtable, loc);
   decl->type = malloc(sizeof(EnumType));
   enum_type_construct(decl->type, name, members);
 }
@@ -146,14 +150,15 @@ static const TopLevelNodeVtable UnionDeclarationVtable = {
 };
 
 void union_declaration_construct_from_type(UnionDeclaration* decl,
-                                           UnionType* type) {
-  top_level_node_construct(&decl->node, &UnionDeclarationVtable);
+                                           UnionType* type,
+                                           const SourceLocation* loc) {
+  top_level_node_construct(&decl->node, &UnionDeclarationVtable, loc);
   decl->type = type;
 }
 
 void union_declaration_construct(UnionDeclaration* decl, char* name,
-                                 vector* members) {
-  top_level_node_construct(&decl->node, &UnionDeclarationVtable);
+                                 vector* members, const SourceLocation* loc) {
+  top_level_node_construct(&decl->node, &UnionDeclarationVtable, loc);
   decl->type = malloc(sizeof(UnionType));
   union_type_construct(decl->type, name, members);
 }
@@ -172,8 +177,9 @@ static const TopLevelNodeVtable FunctionDefinitionVtable = {
 };
 
 void function_definition_construct(FunctionDefinition* f, const char* name,
-                                   Type* type, CompoundStmt* body) {
-  top_level_node_construct(&f->node, &FunctionDefinitionVtable);
+                                   Type* type, CompoundStmt* body,
+                                   const SourceLocation* loc) {
+  top_level_node_construct(&f->node, &FunctionDefinitionVtable, loc);
   f->name = strdup(name);
   assert(type->vtable->kind == TK_FunctionType);
   f->type = type;

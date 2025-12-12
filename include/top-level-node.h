@@ -2,6 +2,7 @@
 #define TOP_LEVEL_NODE_H_
 
 #include "expr.h"
+#include "source-location.h"
 #include "stmt.h"
 #include "type.h"
 #include "vector.h"
@@ -59,11 +60,13 @@ typedef struct {
 
 struct TopLevelNode {
   const TopLevelNodeVtable* vtable;
+  SourceLocation loc;
 };
 typedef struct TopLevelNode TopLevelNode;
 
 void top_level_node_construct(TopLevelNode* node,
-                              const TopLevelNodeVtable* vtable);
+                              const TopLevelNodeVtable* vtable,
+                              const SourceLocation* loc);
 void top_level_node_destroy(TopLevelNode* node);
 
 typedef struct {
@@ -72,14 +75,15 @@ typedef struct {
   char* name;
 } Typedef;
 
-void typedef_construct(Typedef* td);
+void typedef_construct(Typedef* td, const SourceLocation* loc);
 
 typedef struct {
   TopLevelNode node;
   Expr* expr;
 } StaticAssert;
 
-void static_assert_construct(StaticAssert* sa, Expr* expr);
+void static_assert_construct(StaticAssert* sa, Expr* expr,
+                             const SourceLocation* loc);
 
 typedef struct {
   TopLevelNode node;
@@ -91,8 +95,8 @@ typedef struct {
   bool is_thread_local;
 } GlobalVariable;
 
-void global_variable_construct(GlobalVariable* gv, const char* name,
-                               Type* type);
+void global_variable_construct(GlobalVariable* gv, const char* name, Type* type,
+                               const SourceLocation* loc);
 
 typedef struct {
   TopLevelNode node;
@@ -100,19 +104,20 @@ typedef struct {
 } StructDeclaration;
 
 void struct_declaration_construct_from_type(StructDeclaration* decl,
-                                            StructType* type);
+                                            StructType* type,
+                                            const SourceLocation* loc);
 void struct_declaration_construct(StructDeclaration* decl, char* name,
-                                  vector* members);
+                                  vector* members, const SourceLocation* loc);
 
 typedef struct {
   TopLevelNode node;
   EnumType* type;
 } EnumDeclaration;
 
-void enum_declaration_construct_from_type(EnumDeclaration* decl,
-                                          EnumType* type);
+void enum_declaration_construct_from_type(EnumDeclaration* decl, EnumType* type,
+                                          const SourceLocation* loc);
 void enum_declaration_construct(EnumDeclaration* decl, char* name,
-                                vector* members);
+                                vector* members, const SourceLocation* loc);
 
 typedef struct {
   TopLevelNode node;
@@ -120,9 +125,10 @@ typedef struct {
 } UnionDeclaration;
 
 void union_declaration_construct_from_type(UnionDeclaration* decl,
-                                           UnionType* type);
+                                           UnionType* type,
+                                           const SourceLocation* loc);
 void union_declaration_construct(UnionDeclaration* decl, char* name,
-                                 vector* members);
+                                 vector* members, const SourceLocation* loc);
 
 typedef struct {
   TopLevelNode node;
@@ -133,6 +139,7 @@ typedef struct {
 } FunctionDefinition;
 
 void function_definition_construct(FunctionDefinition* f, const char* name,
-                                   Type* type, CompoundStmt* body);
+                                   Type* type, CompoundStmt* body,
+                                   const SourceLocation* loc);
 
 #endif  // TOP_LEVEL_NODE_H_

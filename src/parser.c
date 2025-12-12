@@ -1690,6 +1690,8 @@ Expr* parse_expr(Parser* parser) {
 // <static_assert> = "static_assert" "(" <expr> ")"
 //
 TopLevelNode* parse_static_assert(Parser* parser) {
+  SourceLocation loc = peek_token_source_loc(parser);
+
   parser_consume_token(parser, TK_StaticAssert);
   parser_consume_token(parser, TK_LPar);
 
@@ -1699,7 +1701,7 @@ TopLevelNode* parse_static_assert(Parser* parser) {
   parser_consume_token(parser, TK_Semicolon);
 
   StaticAssert* sa = malloc(sizeof(StaticAssert));
-  static_assert_construct(sa, expr);
+  static_assert_construct(sa, expr, &loc);
 
   return &sa->node;
 }
@@ -1708,10 +1710,12 @@ TopLevelNode* parse_static_assert(Parser* parser) {
 // <typedef> = "typedef" <type_with_declarator>
 //
 TopLevelNode* parse_typedef(Parser* parser) {
+  SourceLocation loc = peek_token_source_loc(parser);
+
   parser_consume_token(parser, TK_Typedef);
 
   Typedef* td = malloc(sizeof(Typedef));
-  typedef_construct(td);
+  typedef_construct(td, &loc);
 
   td->type = parse_type_for_declaration(parser, &td->name, /*storage=*/NULL);
 
@@ -2035,6 +2039,8 @@ Statement* parse_compound_stmt(Parser* parser) {
 // This disambiguates between a top-level tagged type declaration vs a global
 // variable declaration.
 TopLevelNode* parse_top_level_type_decl(Parser* parser) {
+  SourceLocation loc = peek_token_source_loc(parser);
+
   const Token* peek = parser_peek_token(parser);
   assert(is_token_type_token(parser, peek) ||
          is_storage_class_specifier_token(peek->kind));
@@ -2051,17 +2057,17 @@ TopLevelNode* parse_top_level_type_decl(Parser* parser) {
     switch (type->vtable->kind) {
       case TK_UnionType: {
         UnionDeclaration* decl = malloc(sizeof(UnionDeclaration));
-        union_declaration_construct_from_type(decl, (UnionType*)type);
+        union_declaration_construct_from_type(decl, (UnionType*)type, &loc);
         return &decl->node;
       }
       case TK_EnumType: {
         EnumDeclaration* decl = malloc(sizeof(EnumDeclaration));
-        enum_declaration_construct_from_type(decl, (EnumType*)type);
+        enum_declaration_construct_from_type(decl, (EnumType*)type, &loc);
         return &decl->node;
       }
       case TK_StructType: {
         StructDeclaration* decl = malloc(sizeof(StructDeclaration));
-        struct_declaration_construct_from_type(decl, (StructType*)type);
+        struct_declaration_construct_from_type(decl, (StructType*)type, &loc);
         return &decl->node;
       }
       default:
@@ -2085,7 +2091,8 @@ TopLevelNode* parse_top_level_type_decl(Parser* parser) {
     Statement* cmpd = parse_compound_stmt(parser);
 
     FunctionDefinition* func_def = malloc(sizeof(FunctionDefinition));
-    function_definition_construct(func_def, name, type, (CompoundStmt*)cmpd);
+    function_definition_construct(func_def, name, type, (CompoundStmt*)cmpd,
+                                  &loc);
 
     if (storage.static_)
       func_def->is_extern = false;
@@ -2096,7 +2103,7 @@ TopLevelNode* parse_top_level_type_decl(Parser* parser) {
   }
 
   GlobalVariable* gv = malloc(sizeof(GlobalVariable));
-  global_variable_construct(gv, name, type);
+  global_variable_construct(gv, name, type, &loc);
 
   if (storage.static_)
     gv->is_extern = false;
@@ -2120,32 +2127,38 @@ TopLevelNode* parse_top_level_type_decl(Parser* parser) {
 }
 
 TopLevelNode* parse_struct_declaration(Parser* parser) {
+  SourceLocation loc = peek_token_source_loc(parser);
+
   char* name = NULL;
   vector* members = NULL;
   parse_struct_name_and_members(parser, &name, &members);
 
   StructDeclaration* decl = malloc(sizeof(StructDeclaration));
-  struct_declaration_construct(decl, name, members);
+  struct_declaration_construct(decl, name, members, &loc);
   return &decl->node;
 }
 
 TopLevelNode* parse_enum_declaration(Parser* parser) {
+  SourceLocation loc = peek_token_source_loc(parser);
+
   char* name = NULL;
   vector* members = NULL;
   parse_enum_name_and_members(parser, &name, &members);
 
   EnumDeclaration* decl = malloc(sizeof(EnumDeclaration));
-  enum_declaration_construct(decl, name, members);
+  enum_declaration_construct(decl, name, members, &loc);
   return &decl->node;
 }
 
 TopLevelNode* parse_union_declaration(Parser* parser) {
+  SourceLocation loc = peek_token_source_loc(parser);
+
   char* name = NULL;
   vector* members = NULL;
   parse_union_name_and_members(parser, &name, &members);
 
   UnionDeclaration* decl = malloc(sizeof(UnionDeclaration));
-  union_declaration_construct(decl, name, members);
+  union_declaration_construct(decl, name, members, &loc);
   return &decl->node;
 }
 

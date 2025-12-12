@@ -41,4 +41,16 @@ static size_t align_up(size_t x, size_t alignment) {
   return (x + (alignment - 1)) & ~(alignment - 1);
 }
 
+typedef bool (*ConstUnaryOp)(const void* it, void* arg);
+static inline void* find_if(const void* start, const void* end,
+                            size_t sizeof_elem, ConstUnaryOp op, void* arg) {
+  const char* start_ = start;
+  const char* end_ = end;
+  for (; start_ != end_; start_ += sizeof_elem) {
+    if (op(start_, arg))
+      return (void*)start_;
+  }
+  return (void*)end_;
+}
+
 #endif  // COMMON_H_
