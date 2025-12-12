@@ -799,7 +799,8 @@ const Type* sema_get_result_type_of_binop_expr(Sema* sema, const BinOp* expr,
       return rhs_ty;
     default:
       UNREACHABLE_MSG("TODO: Implement get type for binop kind %d on %zu:%zu",
-                      expr->op, expr->expr.line, expr->expr.col);
+                      expr->op, source_location_line(&expr->expr.loc),
+                      source_location_col(&expr->expr.loc));
   }
 }
 
@@ -1073,6 +1074,19 @@ size_t sema_eval_alignof_members(Sema* sema, const vector* members) {
 }
 
 size_t sema_eval_alignof_type(Sema* sema, const Type* type) {
+  if (type->align) {
+    ConstExprResult alignment = sema_eval_expr(sema, type->align);
+    switch (alignment.result_kind) {
+      case RK_Boolean:
+        UNREACHABLE_MSG("Bool is not acceptable alignment");
+      case RK_Int:
+        assert(alignment.result.i > 0);
+        return (size_t)alignment.result.i;
+      case RK_UnsignedLongLong:
+        return alignment.result.ull;
+    }
+  }
+
   switch (type->vtable->kind) {
     case TK_BuiltinType:
       return builtin_type_get_align((const BuiltinType*)type);
@@ -1360,7 +1374,8 @@ ConstExprResult sema_eval_binop(Sema* sema, const BinOp* expr) {
       switch (lhs.result_kind) {
         case RK_Boolean:
           UNREACHABLE_MSG("TODO: Check if booleans can be compared %zu:%zu",
-                          expr->expr.line, expr->expr.col);
+                          source_location_line(&expr->expr.loc),
+                          source_location_col(&expr->expr.loc));
         case RK_Int:
           lhs.result.b = lhs.result.i < rhs.result.i;
           lhs.result_kind = RK_Boolean;
@@ -1414,6 +1429,8 @@ ConstExprResult sema_eval_expr(Sema* sema, const Expr* expr) {
       return sema_eval_binop(sema, (const BinOp*)expr);
     case EK_SizeOf:
       return sema_eval_sizeof(sema, (const SizeOf*)expr);
+    case EK_AlignOf:
+      return sema_eval_alignof(sema, (const AlignOf*)expr);
     case EK_Int: {
       ConstExprResult res;
       res.result_kind = RK_Int;
@@ -1491,5 +1508,7 @@ void sema_verify_static_assert_condition(Sema* sema, const Expr* cond) {
         return;
       break;
   }
-  UNREACHABLE_MSG("static_assert failed");
+  UNREACHABLE_MSG("static_assert failed at %zu:%zu",
+                  source_location_line(&cond->loc),
+                  source_location_col(&cond->loc));
 }

@@ -21,7 +21,8 @@ typedef struct {
   TreeMap typedef_types;
 } Parser;
 
-void parser_construct(Parser* parser, InputStream* input);
+void parser_construct(Parser* parser, InputStream* input,
+                      const char* input_name);
 void parser_destroy(Parser* parser);
 void parser_define_named_type(Parser* parser, const char* name);
 bool parser_has_named_type(const Parser* parser, const char* name);

@@ -7,17 +7,18 @@
 #include "cstring.h"
 #include "istream.h"
 
-void lexer_construct(Lexer* lexer, InputStream* input) {
+void lexer_construct(Lexer* lexer, InputStream* input, const char* input_name) {
   lexer->input = input;
-  lexer->lookahead = 0;
+  lexer->lookahead_ = 0;
   lexer->line_ = 1;
   // Start at zero since this is incremented for each char read.
   lexer->col_ = 0;
+  lexer->input_name = input_name;
 }
 
 void lexer_destroy(Lexer* lexer) {}
 
-bool lexer_has_lookahead(const Lexer* lexer) { return lexer->lookahead != 0; }
+bool lexer_has_lookahead(const Lexer* lexer) { return lexer->lookahead_ != 0; }
 
 // Return true if the lexer can read a more token. This means there's at least
 // a lookahead or something we can read from the file stream.
@@ -45,7 +46,7 @@ bool lexer_can_get_char(Lexer* lexer) {
     lexer->col_++;
   }
 
-  lexer->lookahead = peek;
+  lexer->lookahead_ = peek;
   return true;
 }
 
@@ -67,18 +68,18 @@ int lexer_peek_char(Lexer* lexer) {
       lexer->col_++;
     }
 
-    lexer->lookahead = res;
-    assert(lexer->lookahead != 0 && "Invalid lookahead");
-    assert(lexer->lookahead != EOF);
+    lexer->lookahead_ = res;
+    assert(lexer->lookahead_ != 0 && "Invalid lookahead");
+    assert(lexer->lookahead_ != EOF);
   }
 
-  return lexer->lookahead;
+  return lexer->lookahead_;
 }
 
 int lexer_get_char(Lexer* lexer) {
   if (lexer_has_lookahead(lexer)) {
-    int c = lexer->lookahead;
-    lexer->lookahead = 0;
+    int c = lexer->lookahead_;
+    lexer->lookahead_ = 0;
     return c;
   }
 
@@ -94,7 +95,10 @@ int lexer_get_char(Lexer* lexer) {
 
 void token_construct(Token* tok) { string_construct(&tok->chars); }
 
-void token_destroy(Token* tok) { string_destroy(&tok->chars); }
+void token_destroy(Token* tok) {
+  string_destroy(&tok->chars);
+  source_location_destroy(&tok->loc);
+}
 
 static bool is_kw_char(int c) { return c == '_' || isalnum(c); }
 
@@ -152,8 +156,8 @@ Token lex(Lexer* lexer) {
     skip_ws(lexer);
 
     if (lexer_peek_char(lexer) == EOF) {
-      tok.line = lexer->line_;
-      tok.col = lexer->col_;
+      source_location_construct(&tok.loc, lexer->line_, lexer->col_,
+                                lexer->input_name);
       return tok;
     }
 
@@ -164,8 +168,8 @@ Token lex(Lexer* lexer) {
 
     // First handle potential comments before anything else.
     if (c == '/') {
-      tok.line = lexer->line_;
-      tok.col = lexer->col_;
+      source_location_construct(&tok.loc, lexer->line_, lexer->col_,
+                                lexer->input_name);
 
       if (lexer_peek_char(lexer) == '/') {
         // This is a comment. Consume all characters until the newline.
@@ -194,15 +198,15 @@ Token lex(Lexer* lexer) {
     break;
   }
 
-  tok.line = lexer->line_;
-  tok.col = lexer->col_;
+  source_location_construct(&tok.loc, lexer->line_, lexer->col_,
+                            lexer->input_name);
 
   // Handle elipsis.
   if (c == '.') {
     if (lexer_peek_then_consume_char(lexer, '.')) {
       ASSERT_MSG(lexer_peek_then_consume_char(lexer, '.'),
-                 "%zu:%zu: Expected 3 '.' for elipses but found 2.", tok.line,
-                 tok.col);
+                 "%zu:%zu: Expected 3 '.' for elipses but found 2.",
+                 source_location_line(&tok.loc), source_location_col(&tok.loc));
       string_append(&tok.chars, "..");
       tok.kind = TK_Ellipsis;
     } else {
@@ -360,7 +364,8 @@ Token lex(Lexer* lexer) {
     string_append_char(&tok.chars, (char)c);
 
     ASSERT_MSG(lexer_peek_then_consume_char(lexer, '\''),
-               "%zu:%zu: Expected `'` for ending char.\n", tok.line, tok.col);
+               "%zu:%zu: Expected `'` for ending char.\n",
+               source_location_line(&tok.loc), source_location_col(&tok.loc));
 
     string_append_char(&tok.chars, '\'');
     return tok;
@@ -479,6 +484,8 @@ Token lex(Lexer* lexer) {
     tok.kind = TK_Enum;
   } else if (string_equals(&tok.chars, "union")) {
     tok.kind = TK_Union;
+  } else if (string_equals(&tok.chars, "alignas")) {
+    tok.kind = TK_Alignas;
   } else if (string_equals(&tok.chars, "__attribute__")) {
     tok.kind = TK_Attribute;
   } else if (string_equals(&tok.chars, "__extension__")) {

@@ -26,6 +26,14 @@
     abort();                                                           \
   }
 
+#if defined(DOTRACE)
+#define TRACE(fmt, ...)                                             \
+  fprintf(stderr, "TRACE %s:%d: %s: " fmt "\n", __FILE__, __LINE__, \
+          __PRETTY_FUNCTION__ __VA_OPT__(, ) __VA_ARGS__)
+#else
+#define TRACE(fmt, ...) while (0)  // Here to absorb a trailing `;`
+#endif
+
 static bool is_power_of_2(size_t x) { return (x & (x - 1)) == 0 && x != 0; }
 
 static size_t align_up(size_t x, size_t alignment) {

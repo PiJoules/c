@@ -6,13 +6,16 @@
 #include "common.h"
 #include "istream.h"
 #include "lexer.h"
+#include "source-location.h"
 #include "sstream.h"
 #include "stmt.h"
 #include "top-level-node.h"
 #include "tree-map.h"
+#include "type.h"
 
-void parser_construct(Parser* parser, InputStream* input) {
-  lexer_construct(&parser->lexer, input);
+void parser_construct(Parser* parser, InputStream* input,
+                      const char* input_name) {
+  lexer_construct(&parser->lexer, input, input_name);
   parser->has_lookahead = false;
   string_tree_map_construct(&parser->typedef_types);
 }
@@ -34,8 +37,9 @@ bool parser_has_named_type(const Parser* parser, const char* name) {
 
 static void expect_token(const Token* tok, TokenKind expected) {
   ASSERT_MSG(tok->kind == expected,
-             "%zu:%zu: Expected token %d but found %d: '%s'", tok->line,
-             tok->col, expected, tok->kind, tok->chars.data);
+             "%zu:%zu: Expected token %d but found %d: '%s'",
+             source_location_line(&tok->loc), source_location_col(&tok->loc),
+             expected, tok->kind, tok->chars.data);
 }
 
 Token parser_pop_token(Parser* parser) {
@@ -70,8 +74,9 @@ void parser_skip_next_token(Parser* parser) {
 void parser_consume_token(Parser* parser, TokenKind kind) {
   Token next = parser_pop_token(parser);
   ASSERT_MSG(next.kind == kind,
-             "%zu:%zu: Expected token kind %d but found %d: '%s'", next.line,
-             next.col, kind, next.kind, next.chars.data);
+             "%zu:%zu: Expected token kind %d but found %d: '%s'",
+             source_location_line(&next.loc), source_location_col(&next.loc),
+             kind, next.kind, next.chars.data);
   token_destroy(&next);
 }
 
@@ -226,11 +231,15 @@ void parser_consume_asm_label(Parser* parser) {
   }
 }
 
+static SourceLocation peek_token_source_loc(Parser* parser) {
+  return parser_peek_token(parser)->loc;
+}
+
 void parser_consume_pragma(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
+  size_t line = source_location_line(&parser_peek_token(parser)->loc);
   parser_consume_token(parser, TK_Hash);
 
-  assert(parser_peek_token(parser)->line == line &&
+  assert(source_location_line(&parser_peek_token(parser)->loc) == line &&
          "# and pragma must be on same line");
   parser_consume_token(parser, TK_Pragma);
 
@@ -242,7 +251,7 @@ void parser_consume_pragma(Parser* parser) {
   // newlines.
   while (1) {
     const Token* peek = parser_peek_token(parser);
-    if (peek->line != line)
+    if (source_location_line(&peek->loc) != line)
       break;
     parser_skip_next_token(parser);
   }
@@ -272,7 +281,7 @@ static void parse_struct_or_union_name_and_members_impl(Parser* parser,
 
   *members = malloc(sizeof(vector));
   vector_construct(*members, sizeof(Member), alignof(Member));
-  for (; !next_token_is(parser, TK_RCurlyBrace);) {
+  while (!next_token_is(parser, TK_RCurlyBrace)) {
     // https://gcc.gnu.org/onlinedocs/gcc/Alternate-Keywords.html
     //
     // Writing __extension__ before an expression prevents warnings about
@@ -432,6 +441,7 @@ Type* parse_specifiers_and_qualifiers_and_storage(Parser* parser,
   UnionType* union_ty;
   bool should_stop = false;
   char* name;
+  Expr* alignas_ = NULL;
   for (; !should_stop;) {
     bool consume_next_token = true;
     const Token* peek = parser_peek_token(parser);
@@ -463,6 +473,17 @@ Type* parse_specifiers_and_qualifiers_and_storage(Parser* parser,
         consume_next_token = false;
         union_ty = parse_union_type(parser);
         break;
+      case TK_Alignas: {
+        parser_consume_token(parser, TK_Alignas);
+        parser_consume_token(parser, TK_LPar);
+
+        assert(!alignas_);
+        alignas_ = parse_expr(parser);
+
+        parser_consume_token(parser, TK_RPar);
+        consume_next_token = false;
+        break;
+      }
       case TK_Char:
         spec.char_ = 1;
         break;
@@ -559,22 +580,26 @@ Type* parse_specifiers_and_qualifiers_and_storage(Parser* parser,
   if (spec.named_) {
     NamedType* nt = create_named_type(name);
     nt->type.qualifiers = quals;
+    nt->type.align = alignas_;
     free(name);
     return &nt->type;
   }
 
   if (spec.struct_) {
     struct_ty->type.qualifiers = quals;
+    struct_ty->type.align = alignas_;
     return &struct_ty->type;
   }
 
   if (spec.enum_) {
     enum_ty->type.qualifiers = quals;
+    enum_ty->type.align = alignas_;
     return &enum_ty->type;
   }
 
   if (spec.union_) {
     union_ty->type.qualifiers = quals;
+    union_ty->type.align = alignas_;
     return &union_ty->type;
   }
 
@@ -647,12 +672,14 @@ Type* parse_specifiers_and_qualifiers_and_storage(Parser* parser,
     const Token* tok = parser_peek_token(parser);
     UNREACHABLE_MSG(
         "%zu:%zu: parse_specifiers_and_qualifiers: Unhandled token (%d): '%s'",
-        tok->line, tok->col, tok->kind, tok->chars.data);
+        source_location_line(&tok->loc), source_location_col(&tok->loc),
+        tok->kind, tok->chars.data);
   }
 
   BuiltinType* bt = malloc(sizeof(BuiltinType));
   builtin_type_construct(bt, kind);
   bt->type.qualifiers = quals;
+  bt->type.align = alignas_;
   return &bt->type;
 }
 
@@ -737,7 +764,8 @@ Type* parse_function_suffix(Parser* parser, Type* outer_ty,
           next_token_is(parser, TK_RPar),
           "%zu:%zu: parse_function_suffix: '...' must be the last in the "
           "parameter list; instead found '%s'.",
-          peek->line, peek->col, peek->chars.data);
+          source_location_line(&peek->loc), source_location_col(&peek->loc),
+          peek->chars.data);
       continue;
     }
 
@@ -827,8 +855,7 @@ Type* parse_type(Parser* parser) {
 // <sizeof> = "sizeof" "(" (<expr> | <type>) ")"
 //
 Expr* parse_sizeof(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   parser_consume_token(parser, TK_SizeOf);
   parser_consume_token(parser, TK_LPar);
@@ -847,9 +874,7 @@ Expr* parse_sizeof(Parser* parser) {
 
   parser_consume_token(parser, TK_RPar);
 
-  sizeof_construct(so, expr_or_type, is_expr);
-  so->expr.line = line;
-  so->expr.col = col;
+  sizeof_construct(so, expr_or_type, is_expr, &loc);
   return &so->expr;
 }
 
@@ -857,8 +882,7 @@ Expr* parse_sizeof(Parser* parser) {
 // <alignof> = "alignof" "(" (<expr> | <type>) ")"
 //
 Expr* parse_alignof(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   parser_consume_token(parser, TK_AlignOf);
   parser_consume_token(parser, TK_LPar);
@@ -877,9 +901,7 @@ Expr* parse_alignof(Parser* parser) {
 
   parser_consume_token(parser, TK_RPar);
 
-  alignof_construct(ao, expr_or_type, is_expr);
-  ao->expr.line = line;
-  ao->expr.col = col;
+  alignof_construct(ao, expr_or_type, is_expr, &loc);
   return &ao->expr;
 }
 
@@ -896,6 +918,7 @@ static Expr* parse_parentheses_expr_tail(Parser* parser) {
 //
 Expr* parse_primary_expr(Parser* parser) {
   const Token* tok = parser_peek_token(parser);
+  SourceLocation loc = peek_token_source_loc(parser);
 
   if (tok->kind == TK_LPar) {
     parser_consume_token(parser, TK_LPar);
@@ -904,14 +927,14 @@ Expr* parse_primary_expr(Parser* parser) {
 
   if (tok->kind == TK_PrettyFunction) {
     PrettyFunction* pf = malloc(sizeof(PrettyFunction));
-    pretty_function_construct(pf);
+    pretty_function_construct(pf, &loc);
     parser_consume_token(parser, TK_PrettyFunction);
     return &pf->expr;
   }
 
   if (tok->kind == TK_Identifier) {
     DeclRef* ref = malloc(sizeof(DeclRef));
-    declref_construct(ref, tok->chars.data);
+    declref_construct(ref, tok->chars.data, &loc);
     parser_consume_token(parser, TK_Identifier);
     return &ref->expr;
   }
@@ -927,7 +950,7 @@ Expr* parse_primary_expr(Parser* parser) {
     unsigned long long val = strtoull(tok->chars.data, NULL, base);
     Int* i = malloc(sizeof(Int));
     // FIXME: This doesn't account for suffixes.
-    int_construct(i, val, BTK_Int);
+    int_construct(i, val, BTK_Int, &loc);
     parser_consume_token(parser, TK_IntLiteral);
     return &i->expr;
   }
@@ -954,7 +977,7 @@ Expr* parse_primary_expr(Parser* parser) {
     }
 
     StringLiteral* s = malloc(sizeof(StringLiteral));
-    string_literal_construct(s, str.data, str.size);
+    string_literal_construct(s, str.data, str.size, &loc);
 
     string_destroy(&str);
 
@@ -963,7 +986,7 @@ Expr* parse_primary_expr(Parser* parser) {
 
   if (tok->kind == TK_True || tok->kind == TK_False) {
     Bool* b = malloc(sizeof(Bool));
-    bool_construct(b, tok->kind == TK_True);
+    bool_construct(b, tok->kind == TK_True, &loc);
     parser_skip_next_token(parser);
     return &b->expr;
   }
@@ -976,7 +999,7 @@ Expr* parse_primary_expr(Parser* parser) {
            "single quotes");
 
     Char* c = malloc(sizeof(Char));
-    char_construct(c, tok->chars.data[1]);
+    char_construct(c, tok->chars.data[1], &loc);
     parser_consume_token(parser, TK_CharLiteral);
     return &c->expr;
   }
@@ -1018,13 +1041,13 @@ Expr* parse_primary_expr(Parser* parser) {
     parser_consume_token(parser, TK_RCurlyBrace);
 
     InitializerList* init = malloc(sizeof(InitializerList));
-    initializer_list_construct(init, elems);
+    initializer_list_construct(init, elems, &loc);
     return &init->expr;
   }
 
   UNREACHABLE_MSG("%zu:%zu: parse_primary_expr: Unhandled token (%d): '%s'\n",
-                  tok->line, tok->col, tok->kind, tok->chars.data);
-  return NULL;
+                  source_location_line(&tok->loc),
+                  source_location_col(&tok->loc), tok->kind, tok->chars.data);
 }
 
 //
@@ -1069,11 +1092,10 @@ vector parse_argument_list(Parser* parser) {
 //                | <postfix_expr> "--"
 //
 static Expr* parse_postfix_expr_with_primary(Parser* parser, Expr* expr) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   bool should_continue = true;
-  for (; should_continue;) {
+  while (should_continue) {
     const Token* tok = parser_peek_token(parser);
 
     switch (tok->kind) {
@@ -1083,7 +1105,7 @@ static Expr* parse_postfix_expr_with_primary(Parser* parser, Expr* expr) {
         parser_consume_token(parser, TK_RSquareBrace);
 
         Index* index = malloc(sizeof(Index));
-        index_construct(index, expr, idx);
+        index_construct(index, expr, idx, &loc);
         expr = &index->expr;
         break;
       }
@@ -1100,7 +1122,7 @@ static Expr* parse_postfix_expr_with_primary(Parser* parser, Expr* expr) {
         parser_consume_token(parser, TK_RPar);
 
         Call* call = malloc(sizeof(Call));
-        call_construct(call, expr, v);
+        call_construct(call, expr, v, &loc);
         expr = &call->expr;
         break;
       }
@@ -1115,7 +1137,8 @@ static Expr* parse_postfix_expr_with_primary(Parser* parser, Expr* expr) {
         assert(id.kind == TK_Identifier);
 
         MemberAccess* member_access = malloc(sizeof(MemberAccess));
-        member_access_construct(member_access, expr, id.chars.data, is_arrow);
+        member_access_construct(member_access, expr, id.chars.data, is_arrow,
+                                &loc);
         expr = &member_access->expr;
 
         token_destroy(&id);
@@ -1125,7 +1148,7 @@ static Expr* parse_postfix_expr_with_primary(Parser* parser, Expr* expr) {
       case TK_Inc: {
         parser_consume_token(parser, TK_Inc);
         UnOp* unop = malloc(sizeof(UnOp));
-        unop_construct(unop, expr, UOK_PostInc);
+        unop_construct(unop, expr, UOK_PostInc, &loc);
         expr = &unop->expr;
         break;
       }
@@ -1133,7 +1156,7 @@ static Expr* parse_postfix_expr_with_primary(Parser* parser, Expr* expr) {
       case TK_Dec: {
         parser_consume_token(parser, TK_Dec);
         UnOp* unop = malloc(sizeof(UnOp));
-        unop_construct(unop, expr, UOK_PostDec);
+        unop_construct(unop, expr, UOK_PostDec, &loc);
         expr = &unop->expr;
         break;
       }
@@ -1142,8 +1165,6 @@ static Expr* parse_postfix_expr_with_primary(Parser* parser, Expr* expr) {
         should_continue = false;
     }
   }
-  expr->line = line;
-  expr->col = col;
   return expr;
 }
 
@@ -1159,8 +1180,7 @@ Expr* parse_postfix_expr(Parser* parser) {
 //             | "sizeof" "(" (<unary_expr> | <type>) ")"
 //
 Expr* parse_unary_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   const Token* tok = parser_peek_token(parser);
 
@@ -1208,9 +1228,7 @@ Expr* parse_unary_expr(Parser* parser) {
   }
 
   UnOp* unop = malloc(sizeof(UnOp));
-  unop_construct(unop, expr, op);
-  unop->expr.line = line;
-  unop->expr.col = col;
+  unop_construct(unop, expr, op, &loc);
   return &unop->expr;
 }
 
@@ -1222,8 +1240,7 @@ bool is_next_token_type_token(Parser* parser) {
 // expression surrounded by parenthesis since we need to know if the contents
 // after the LPar is a type or not.
 static Expr* parse_cast_or_paren_or_stmt_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   parser_consume_token(parser, TK_LPar);
 
@@ -1233,9 +1250,7 @@ static Expr* parse_cast_or_paren_or_stmt_expr(Parser* parser) {
   if (next_token_is(parser, TK_LCurlyBrace)) {
     Statement* stmt = parse_compound_stmt(parser);
     StmtExpr* se = malloc(sizeof(StmtExpr));
-    stmt_expr_construct(se, (CompoundStmt*)stmt);
-    se->expr.line = line;
-    se->expr.col = col;
+    stmt_expr_construct(se, (CompoundStmt*)stmt, &loc);
     parser_consume_token(parser, TK_RPar);
     return &se->expr;
   }
@@ -1253,9 +1268,7 @@ static Expr* parse_cast_or_paren_or_stmt_expr(Parser* parser) {
   Expr* base = parse_cast_expr(parser);
 
   Cast* cast = malloc(sizeof(Cast));
-  cast_construct(cast, base, type);
-  cast->expr.line = line;
-  cast->expr.col = col;
+  cast_construct(cast, base, type, &loc);
   return &cast->expr;
 }
 
@@ -1266,15 +1279,10 @@ static Expr* parse_cast_or_paren_or_stmt_expr(Parser* parser) {
 Expr* parse_cast_expr(Parser* parser) {
   const Token* tok = parser_peek_token(parser);
 
-  if (tok->kind == TK_LPar) {
-    Expr* e = parse_cast_or_paren_or_stmt_expr(parser);
-    assert(e->line && e->col);
-    return e;
-  }
+  if (tok->kind == TK_LPar)
+    return parse_cast_or_paren_or_stmt_expr(parser);
 
-  Expr* e = parse_unary_expr(parser);
-  assert(e->line && e->col);
-  return e;
+  return parse_unary_expr(parser);
 }
 
 //
@@ -1282,15 +1290,9 @@ Expr* parse_cast_expr(Parser* parser) {
 //                      | <cast_expr> ("*" | "/" | "%") <multiplicative_expr>
 //
 Expr* parse_multiplicative_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_cast_expr(parser);
-  assert(expr);
-  if (!(expr->line && expr->col)) {
-    printf("line: %zu, col: %zu\n", expr->line, expr->col);
-  }
-  assert(expr->line && expr->col);
 
   const Token* token = parser_peek_token(parser);
   BinOpKind op;
@@ -1314,9 +1316,7 @@ Expr* parse_multiplicative_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, op);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, op, &loc);
   return &binop->expr;
 }
 
@@ -1325,12 +1325,9 @@ Expr* parse_multiplicative_expr(Parser* parser) {
 //                | <multiplicative_expr> ("+" | "-") <additive_expr>
 //
 Expr* parse_additive_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_multiplicative_expr(parser);
-  assert(expr);
-  assert(expr->line && expr->col);
 
   const Token* token = parser_peek_token(parser);
   BinOpKind op;
@@ -1351,9 +1348,7 @@ Expr* parse_additive_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, op);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, op, &loc);
   return &binop->expr;
 }
 
@@ -1362,13 +1357,9 @@ Expr* parse_additive_expr(Parser* parser) {
 //             | <additive_expr> ("<<" | ">>") <shift_expr>
 //
 Expr* parse_shift_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
-  assert(line && col);
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_additive_expr(parser);
-  assert(expr);
-  assert(expr->line && expr->col);
 
   const Token* token = parser_peek_token(parser);
   BinOpKind op;
@@ -1389,9 +1380,7 @@ Expr* parse_shift_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, op);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, op, &loc);
   return &binop->expr;
 }
 
@@ -1400,11 +1389,9 @@ Expr* parse_shift_expr(Parser* parser) {
 //                   | <shift_expr> ("<" | ">" | ">=" | "<=") <relational_expr>
 //
 Expr* parse_relational_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_shift_expr(parser);
-  assert(expr);
 
   const Token* token = parser_peek_token(parser);
   BinOpKind op;
@@ -1431,9 +1418,7 @@ Expr* parse_relational_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, op);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, op, &loc);
   return &binop->expr;
 }
 
@@ -1442,11 +1427,9 @@ Expr* parse_relational_expr(Parser* parser) {
 //                 | <relational_expr> ("==" | "!=") <equality_expr>
 //
 Expr* parse_equality_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_relational_expr(parser);
-  assert(expr);
 
   const Token* token = parser_peek_token(parser);
   BinOpKind op;
@@ -1467,9 +1450,7 @@ Expr* parse_equality_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, op);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, op, &loc);
   return &binop->expr;
 }
 
@@ -1478,11 +1459,9 @@ Expr* parse_equality_expr(Parser* parser) {
 //            | <equality_expr> "&" <and_expr>
 //
 Expr* parse_and_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_equality_expr(parser);
-  assert(expr);
 
   const Token* token = parser_peek_token(parser);
   if (token->kind != TK_Ampersand)
@@ -1494,9 +1473,7 @@ Expr* parse_and_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, BOK_BitwiseAnd);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, BOK_BitwiseAnd, &loc);
   return &binop->expr;
 }
 
@@ -1505,11 +1482,9 @@ Expr* parse_and_expr(Parser* parser) {
 //                     | <and_expr> "^" <exclusive_or_expr>
 //
 Expr* parse_exclusive_or_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_and_expr(parser);
-  assert(expr);
 
   const Token* token = parser_peek_token(parser);
   if (token->kind != TK_Xor)
@@ -1521,9 +1496,7 @@ Expr* parse_exclusive_or_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, BOK_Xor);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, BOK_Xor, &loc);
   return &binop->expr;
 }
 
@@ -1532,11 +1505,9 @@ Expr* parse_exclusive_or_expr(Parser* parser) {
 //                     | <exclusive_or_expr> "|" <inclusive_or_expr>
 //
 Expr* parse_inclusive_or_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_exclusive_or_expr(parser);
-  assert(expr);
 
   const Token* token = parser_peek_token(parser);
   if (token->kind != TK_Or)
@@ -1548,9 +1519,7 @@ Expr* parse_inclusive_or_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, BOK_BitwiseOr);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, BOK_BitwiseOr, &loc);
   return &binop->expr;
 }
 
@@ -1559,11 +1528,9 @@ Expr* parse_inclusive_or_expr(Parser* parser) {
 //                    | <inclusive_or_expr> "&&" <logical_and_expr>
 //
 Expr* parse_logical_and_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_inclusive_or_expr(parser);
-  assert(expr);
 
   const Token* token = parser_peek_token(parser);
   if (token->kind != TK_LogicalAnd)
@@ -1575,9 +1542,7 @@ Expr* parse_logical_and_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, BOK_LogicalAnd);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, BOK_LogicalAnd, &loc);
   return &binop->expr;
 }
 
@@ -1586,11 +1551,9 @@ Expr* parse_logical_and_expr(Parser* parser) {
 //                   | <logical_and_expr> "||" <logical_or_expr>
 //
 Expr* parse_logical_or_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_logical_and_expr(parser);
-  assert(expr);
 
   const Token* token = parser_peek_token(parser);
   if (token->kind != TK_LogicalOr)
@@ -1602,9 +1565,7 @@ Expr* parse_logical_or_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, BOK_LogicalOr);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, BOK_LogicalOr, &loc);
   return &binop->expr;
 }
 
@@ -1613,11 +1574,9 @@ Expr* parse_logical_or_expr(Parser* parser) {
 //                    | <logical_or_expr> "?" <expr> ":" <conditional_expr>
 //
 Expr* parse_conditional_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_logical_or_expr(parser);
-  assert(expr);
 
   const Token* token = parser_peek_token(parser);
   if (token->kind != TK_Question)
@@ -1634,9 +1593,7 @@ Expr* parse_conditional_expr(Parser* parser) {
   assert(false_expr);
 
   Conditional* cond = malloc(sizeof(Conditional));
-  conditional_construct(cond, expr, true_expr, false_expr);
-  cond->expr.line = line;
-  cond->expr.col = col;
+  conditional_construct(cond, expr, true_expr, false_expr, &loc);
   return &cond->expr;
 }
 
@@ -1648,12 +1605,9 @@ Expr* parse_conditional_expr(Parser* parser) {
 //                    "^")? "="
 //
 Expr* parse_assignment_expr(Parser* parser) {
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_conditional_expr(parser);
-  assert(expr);
-  assert(expr->line && expr->col);
 
   BinOpKind op;
   const Token* token = parser_peek_token(parser);
@@ -1698,9 +1652,7 @@ Expr* parse_assignment_expr(Parser* parser) {
   assert(expr);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, op);
-  binop->expr.line = line;
-  binop->expr.col = col;
+  binop_construct(binop, expr, rhs, op, &loc);
   return &binop->expr;
 }
 
@@ -1716,8 +1668,7 @@ Expr* parse_expr(Parser* parser) {
   if (next_token_is(parser, TK_Extension))
     parser_consume_token(parser, TK_Extension);
 
-  size_t line = parser_peek_token(parser)->line;
-  size_t col = parser_peek_token(parser)->col;
+  SourceLocation loc = peek_token_source_loc(parser);
 
   Expr* expr = parse_assignment_expr(parser);
   assert(expr);
@@ -1731,10 +1682,7 @@ Expr* parse_expr(Parser* parser) {
   assert(rhs);
 
   BinOp* binop = malloc(sizeof(BinOp));
-  binop_construct(binop, expr, rhs, BOK_Comma);
-  binop->expr.line = line;
-  binop->expr.col = col;
-
+  binop_construct(binop, expr, rhs, BOK_Comma, &loc);
   return &binop->expr;
 }
 
@@ -1777,15 +1725,34 @@ TopLevelNode* parse_typedef(Parser* parser) {
 }
 
 Statement* parse_expr_statement(Parser* parser) {
+  SourceLocation loc = peek_token_source_loc(parser);
+
   Expr* expr = parse_expr(parser);
   parser_consume_token(parser, TK_Semicolon);
 
   ExprStmt* stmt = malloc(sizeof(ExprStmt));
-  expr_stmt_construct(stmt, expr);
+  expr_stmt_construct(stmt, expr, &loc);
   return &stmt->base;
 }
 
+static void maybe_infer_array_size(Type* type, const Expr* init) {
+  // If the type is an array type which is unsized, infer the size from the
+  // expression.
+  if (is_array_type(type)) {
+    ArrayType* arr_ty = (ArrayType*)type;
+    if (!arr_ty->size && init->vtable->kind == EK_InitializerList) {
+      const InitializerList* il = (const InitializerList*)init;
+      arr_ty->size = malloc(sizeof(Int));
+      // TODO: Maybe infer the size from an initializer list rather than create
+      // a dummy one here.
+      int_construct((Int*)arr_ty->size, il->elems.size, BTK_Int, &init->loc);
+    }
+  }
+}
+
 Statement* parse_declaration(Parser* parser) {
+  SourceLocation loc = peek_token_source_loc(parser);
+
   FoundStorageClasses storage;
   char* name = NULL;
   Type* type = parse_type_for_declaration(parser, &name, &storage);
@@ -1795,18 +1762,21 @@ Statement* parse_declaration(Parser* parser) {
   if (next_token_is(parser, TK_Assign)) {
     parser_consume_token(parser, TK_Assign);
     init = parse_expr(parser);
+
+    maybe_infer_array_size(type, init);
   }
 
   parser_consume_token(parser, TK_Semicolon);
 
   Declaration* decl = malloc(sizeof(Declaration));
-  declaration_construct(decl, name, type, init);
+  declaration_construct(decl, name, type, init, &loc);
   free(name);
   return &decl->base;
 }
 
 static Statement* parse_statement_impl(Parser* parser) {
   const Token* peek = parser_peek_token(parser);
+  SourceLocation loc = peek_token_source_loc(parser);
 
   if (peek->kind == TK_LCurlyBrace)
     return parse_compound_stmt(parser);
@@ -1828,7 +1798,7 @@ static Statement* parse_statement_impl(Parser* parser) {
     }
 
     IfStmt* ifstmt = malloc(sizeof(IfStmt));
-    if_stmt_construct(ifstmt, cond, body);
+    if_stmt_construct(ifstmt, cond, body, &loc);
 
     if (next_token_is(parser, TK_Else)) {
       parser_consume_token(parser, TK_Else);
@@ -1855,7 +1825,7 @@ static Statement* parse_statement_impl(Parser* parser) {
     }
 
     WhileStmt* while_stmt = malloc(sizeof(WhileStmt));
-    while_stmt_construct(while_stmt, cond, body);
+    while_stmt_construct(while_stmt, cond, body, &loc);
     return &while_stmt->base;
   }
 
@@ -1871,7 +1841,7 @@ static Statement* parse_statement_impl(Parser* parser) {
     parser_consume_token(parser, TK_Semicolon);
 
     ReturnStmt* ret = malloc(sizeof(ReturnStmt));
-    return_stmt_construct(ret, expr);
+    return_stmt_construct(ret, expr, &loc);
     return &ret->base;
   }
 
@@ -1906,8 +1876,9 @@ static Statement* parse_statement_impl(Parser* parser) {
           // warn on missing fallthroughs.
           parser_consume_token(parser, TK_Identifier);
         } else {
-          UNREACHABLE_MSG("%zu:%zu: Unknown attribute '%s'", attr->line,
-                          attr->col, attr->chars.data);
+          UNREACHABLE_MSG("%zu:%zu: Unknown attribute '%s'",
+                          source_location_line(&attr->loc),
+                          source_location_col(&attr->loc), attr->chars.data);
         }
 
         parser_consume_token(parser, TK_RSquareBrace);
@@ -1958,7 +1929,7 @@ static Statement* parse_statement_impl(Parser* parser) {
     parser_consume_token(parser, TK_RCurlyBrace);
 
     SwitchStmt* switch_stmt = malloc(sizeof(SwitchStmt));
-    switch_stmt_construct(switch_stmt, cond, cases, default_stmts);
+    switch_stmt_construct(switch_stmt, cond, cases, default_stmts, &loc);
     return &switch_stmt->base;
   }
 
@@ -1967,7 +1938,7 @@ static Statement* parse_statement_impl(Parser* parser) {
     parser_consume_token(parser, TK_Semicolon);
 
     ContinueStmt* cnt = malloc(sizeof(ContinueStmt));
-    continue_stmt_construct(cnt);
+    continue_stmt_construct(cnt, &loc);
     return &cnt->base;
   }
 
@@ -1976,7 +1947,7 @@ static Statement* parse_statement_impl(Parser* parser) {
     parser_consume_token(parser, TK_Semicolon);
 
     BreakStmt* brk = malloc(sizeof(BreakStmt));
-    break_stmt_construct(brk);
+    break_stmt_construct(brk, &loc);
     return &brk->base;
   }
 
@@ -2019,7 +1990,7 @@ static Statement* parse_statement_impl(Parser* parser) {
     }
 
     ForStmt* for_stmt = malloc(sizeof(ForStmt));
-    for_stmt_construct(for_stmt, init, cond, iter, body);
+    for_stmt_construct(for_stmt, init, cond, iter, body, &loc);
     return &for_stmt->base;
   }
 
@@ -2043,6 +2014,7 @@ Statement* parse_statement(Parser* parser) {
 }
 
 Statement* parse_compound_stmt(Parser* parser) {
+  SourceLocation loc = peek_token_source_loc(parser);
   parser_consume_token(parser, TK_LCurlyBrace);
 
   vector body;
@@ -2056,7 +2028,7 @@ Statement* parse_compound_stmt(Parser* parser) {
   parser_consume_token(parser, TK_RCurlyBrace);
 
   CompoundStmt* cmpd = malloc(sizeof(CompoundStmt));
-  compound_stmt_construct(cmpd, body);
+  compound_stmt_construct(cmpd, body, &loc);
   return &cmpd->base;
 }
 
@@ -2106,7 +2078,7 @@ TopLevelNode* parse_top_level_type_decl(Parser* parser) {
 
   const Token* tok = parser_peek_token(parser);
   ASSERT_MSG(!storage.auto_, "%zu:%zu: 'auto' can only be used at block scope",
-             tok->line, tok->col);
+             source_location_line(&tok->loc), source_location_col(&tok->loc));
 
   if (type->vtable->kind == TK_FunctionType &&
       next_token_is(parser, TK_LCurlyBrace)) {
@@ -2137,16 +2109,7 @@ TopLevelNode* parse_top_level_type_decl(Parser* parser) {
     Expr* init = parse_expr(parser);
     gv->initializer = init;
 
-    // If the type is an array type which is unsized, infer the size from the
-    // expression.
-    if (is_array_type(type)) {
-      ArrayType* arr_ty = (ArrayType*)type;
-      if (!arr_ty->size && init->vtable->kind == EK_InitializerList) {
-        const InitializerList* il = (const InitializerList*)init;
-        arr_ty->size = (Expr*)malloc(sizeof(Int));
-        int_construct((Int*)arr_ty->size, il->elems.size, BTK_Int);
-      }
-    }
+    maybe_infer_array_size(type, init);
   }
 
   free(name);
@@ -2228,7 +2191,9 @@ TopLevelNode* parse_top_level_decl(Parser* parser) {
     return node;
 
   UNREACHABLE_MSG("%zu:%zu: parse_top_level_decl: Unhandled token (%d): '%s'\n",
-                  token->line, token->col, token->kind, token->chars.data);
+                  source_location_line(&token->loc),
+                  source_location_col(&token->loc), token->kind,
+                  token->chars.data);
   return NULL;
 }
 
@@ -2241,7 +2206,7 @@ static Type* ParseTypeString(const char* str, char** name) {
   string_input_stream_construct(&ss, str);
 
   Parser p;
-  parser_construct(&p, &ss.base);
+  parser_construct(&p, &ss.base, "<input>");
   parser_define_named_type(&p, "size_t");  // Just let some tests use this.
 
   Type* type = parse_type_for_declaration(&p, name, /*storage=*/NULL);

@@ -5,6 +5,7 @@
 
 #include "cstring.h"
 #include "istream.h"
+#include "source-location.h"
 
 typedef enum {
   TK_BuiltinTypesFirst,
@@ -98,6 +99,7 @@ typedef enum {
   TK_Default,
   TK_True,  // TODO: I believe these are macros instead of actual keywords.
   TK_False,
+  TK_Alignas,
   TK_Attribute,
   TK_Extension,
   TK_Asm,
@@ -148,8 +150,7 @@ static bool is_storage_class_specifier_token(TokenKind kind) {
 typedef struct {
   string chars;
   TokenKind kind;
-  size_t line;
-  size_t col;
+  SourceLocation loc;
 } Token;
 
 void token_construct(Token* tok);
@@ -157,9 +158,10 @@ void token_destroy(Token* tok);
 
 typedef struct {
   InputStream* input;
+  const char* input_name;
 
   // 0 indicates no lookahead. Non-zero means we have a lookahead.
-  int lookahead;
+  int lookahead_;
 
   // Lexer users should never access these directly. Instead refer to the line
   // and col returned in the Token.
@@ -167,7 +169,7 @@ typedef struct {
   size_t col_;
 } Lexer;
 
-void lexer_construct(Lexer* lexer, InputStream* input);
+void lexer_construct(Lexer* lexer, InputStream* input, const char* input_name);
 void lexer_destroy(Lexer* lexer);
 bool lexer_has_lookahead(const Lexer* lexer);
 bool lexer_can_get_char(Lexer* lexer);
