@@ -118,16 +118,13 @@ const Type* sema_get_result_type_of_binop_expr(Sema* sema, const BinOp* expr,
                                                const TreeMap* local_ctx);
 const StructType* sema_get_struct_type_from_member_access(
     Sema* sema, const MemberAccess* access, const TreeMap* local_ctx);
-const Member* sema_get_largest_union_member(Sema* sema, const UnionType* type);
+const Member* sema_get_largest_union_member(Sema* sema, const UnionType* type,
+                                            const TreeMap* local_ctx);
 
 // Infer the type of this expression. The caller of this is not in charge of
 // destroying the type.
 const Type* sema_get_type_of_expr_in_ctx(Sema* sema, const Expr* expr,
                                          const TreeMap* local_ctx);
-
-// Infer the type of this expression in the global context. The caller of this
-// is not in charge of destroying the type.
-const Type* sema_get_type_of_expr(Sema* sema, const Expr* expr);
 
 bool sema_is_enum_type(const Sema* sema, const Type* type,
                        const TreeMap* local_ctx);
@@ -143,22 +140,33 @@ bool sema_is_unsigned_integral_type(const Sema* sema, const Type* type);
 bool sema_is_function_or_function_ptr(Sema* sema, const Type* ty,
                                       const TreeMap* local_ctx);
 
-size_t sema_eval_sizeof_type(Sema* sema, const Type* type);
-size_t sema_eval_alignof_type(Sema* sema, const Type* type);
-size_t sema_eval_sizeof_array(Sema*, const ArrayType*);
-size_t sema_eval_alignof_array(Sema*, const ArrayType*);
-size_t sema_eval_alignof_members(Sema* sema, const vector* members);
-size_t sema_eval_sizeof_struct_type(Sema* sema, const StructType* type);
-size_t sema_eval_sizeof_union_type(Sema* sema, const UnionType* type);
+size_t sema_eval_sizeof_type(Sema* sema, const Type* type,
+                             const TreeMap* local_ctx);
+size_t sema_eval_alignof_type(Sema* sema, const Type* type,
+                              const TreeMap* local_ctx);
+size_t sema_eval_sizeof_array(Sema*, const ArrayType*,
+                              const TreeMap* local_ctx);
+size_t sema_eval_alignof_array(Sema*, const ArrayType*,
+                               const TreeMap* local_ctx);
+size_t sema_eval_alignof_members(Sema* sema, const vector* members,
+                                 const TreeMap* local_ctx);
+size_t sema_eval_sizeof_struct_type(Sema* sema, const StructType* type,
+                                    const TreeMap* local_ctx);
+size_t sema_eval_sizeof_union_type(Sema* sema, const UnionType* type,
+                                   const TreeMap* local_ctx);
 
 bool sema_struct_or_union_components_are_compatible(
     Sema* sema, const char* lhs_name, const vector* lhs_members,
-    const char* rhs_name, const vector* rhs_members, bool ignore_quals);
-bool sema_types_are_compatible(Sema* sema, const Type* lhs, const Type* rhs);
+    const char* rhs_name, const vector* rhs_members, bool ignore_quals,
+    const TreeMap* local_ctx);
+bool sema_types_are_compatible(Sema* sema, const Type* lhs, const Type* rhs,
+                               const TreeMap* local_ctx);
 bool sema_types_are_compatible_ignore_quals(Sema* sema, const Type* lhs,
-                                            const Type* rhs);
+                                            const Type* rhs,
+                                            const TreeMap* local_ctx);
 
-void sema_verify_static_assert_condition(Sema* sema, const Expr* cond);
+void sema_verify_static_assert_condition(Sema* sema, const Expr* cond,
+                                         const TreeMap* local_ctx);
 
 typedef enum {
   // TODO: Add the other expression result kinds.
@@ -178,10 +186,13 @@ typedef struct {
   } result;
 } ConstExprResult;
 
-ConstExprResult sema_eval_expr(Sema*, const Expr*);
-ConstExprResult sema_eval_binop(Sema* sema, const BinOp* expr);
-ConstExprResult sema_eval_alignof(Sema* sema, const AlignOf* ao);
-ConstExprResult sema_eval_sizeof(Sema* sema, const SizeOf* so);
+ConstExprResult sema_eval_expr_in_ctx(Sema*, const Expr*, const TreeMap*);
+ConstExprResult sema_eval_binop_in_ctx(Sema* sema, const BinOp* expr,
+                                       const TreeMap*);
+ConstExprResult sema_eval_alignof_in_ctx(Sema* sema, const AlignOf* ao,
+                                         const TreeMap*);
+ConstExprResult sema_eval_sizeof_in_ctx(Sema* sema, const SizeOf* so,
+                                        const TreeMap*);
 
 int compare_constexpr_result_types(const ConstExprResult*,
                                    const ConstExprResult*);

@@ -15,6 +15,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "argparse.h"
+#include "ast-dump.h"
 #include "common.h"
 #include "cstring.h"
 #include "expr.h"
@@ -262,13 +264,6 @@ bool preprocessor_input_stream_eof(InputStream* input) {
 ///
 
 ///
-/// Start Sema Implementation
-
-///
-/// End Sema Implementation
-///
-
-///
 /// Start Compiler Implementation
 ///
 
@@ -300,9 +295,11 @@ void compiler_construct(Compiler* compiler, LLVMModuleRef mod, Sema* sema,
 
 void compiler_destroy(Compiler* compiler) {}
 
-LLVMTypeRef get_llvm_type(Compiler* compiler, const Type* type);
+LLVMTypeRef get_llvm_type(Compiler* compiler, const Type* type,
+                          const TreeMap* local_ctx);
 
-LLVMTypeRef get_llvm_struct_type(Compiler* compiler, const StructType* st) {
+LLVMTypeRef get_llvm_struct_type(Compiler* compiler, const StructType* st,
+                                 const TreeMap* local_ctx) {
   st = sema_resolve_struct_type(compiler->sema, st);
 
   void* llvm_struct;
@@ -321,7 +318,7 @@ LLVMTypeRef get_llvm_struct_type(Compiler* compiler, const StructType* st) {
   for (size_t i = 0; i < st->members->size; ++i) {
     Member* member = vector_at(st->members, i);
     LLVMTypeRef* storage = vector_append_storage(&elems);
-    *storage = get_llvm_type(compiler, member->type);
+    *storage = get_llvm_type(compiler, member->type, local_ctx);
   }
 
   if (st->name) {
@@ -338,7 +335,8 @@ LLVMTypeRef get_llvm_struct_type(Compiler* compiler, const StructType* st) {
   return llvm_struct;
 }
 
-LLVMTypeRef get_llvm_union_type(Compiler* compiler, const UnionType* ut) {
+LLVMTypeRef get_llvm_union_type(Compiler* compiler, const UnionType* ut,
+                                const TreeMap* local_ctx) {
   ut = sema_resolve_union_type(compiler->sema, ut);
 
   void* llvm_union;
@@ -354,7 +352,9 @@ LLVMTypeRef get_llvm_union_type(Compiler* compiler, const UnionType* ut) {
   // Doesn't exits. Create the struct body which only consists of the largest
   // union member.
   LLVMTypeRef member = get_llvm_type(
-      compiler, sema_get_largest_union_member(compiler->sema, ut)->type);
+      compiler,
+      sema_get_largest_union_member(compiler->sema, ut, local_ctx)->type,
+      local_ctx);
 
   if (ut->name) {
     llvm_union =
@@ -372,12 +372,14 @@ LLVMTypeRef get_opaque_ptr(Compiler* compiler) {
                                   /*AddressSpace=*/0);
 }
 
-LLVMTypeRef get_llvm_array_type(Compiler* compiler, const ArrayType* at) {
+LLVMTypeRef get_llvm_array_type(Compiler* compiler, const ArrayType* at,
+                                const TreeMap* local_ctx) {
   if (!at->size)
     return get_opaque_ptr(compiler);
 
-  ConstExprResult size = sema_eval_expr(compiler->sema, at->size);
-  LLVMTypeRef elem = get_llvm_type(compiler, at->elem_type);
+  ConstExprResult size =
+      sema_eval_expr_in_ctx(compiler->sema, at->size, local_ctx);
+  LLVMTypeRef elem = get_llvm_type(compiler, at->elem_type, local_ctx);
   switch (size.result_kind) {
     case RK_UnsignedLongLong:
       return LLVMArrayType(elem, (unsigned)size.result.ull);
@@ -388,8 +390,9 @@ LLVMTypeRef get_llvm_array_type(Compiler* compiler, const ArrayType* at) {
   }
 }
 
-LLVMTypeRef get_llvm_function_type(Compiler* compiler, const FunctionType* ft) {
-  LLVMTypeRef ret = get_llvm_type(compiler, ft->return_type);
+LLVMTypeRef get_llvm_function_type(Compiler* compiler, const FunctionType* ft,
+                                   const TreeMap* local_ctx) {
+  LLVMTypeRef ret = get_llvm_type(compiler, ft->return_type, local_ctx);
 
   vector params;
   vector_construct(&params, sizeof(LLVMTypeRef), alignof(LLVMTypeRef));
@@ -398,7 +401,7 @@ LLVMTypeRef get_llvm_function_type(Compiler* compiler, const FunctionType* ft) {
     if (is_void_type(arg_ty))
       continue;
     LLVMTypeRef* storage = vector_append_storage(&params);
-    *storage = get_llvm_type(compiler, arg_ty);
+    *storage = get_llvm_type(compiler, arg_ty, local_ctx);
   }
 
   LLVMTypeRef res = LLVMFunctionType(ret, params.data, (unsigned)params.size,
@@ -482,29 +485,32 @@ LLVMTypeRef get_llvm_builtin_type(Compiler* compiler, const BuiltinType* bt) {
   }
 }
 
-LLVMTypeRef get_llvm_type(Compiler* compiler, const Type* type) {
+LLVMTypeRef get_llvm_type(Compiler* compiler, const Type* type,
+                          const TreeMap* local_ctx) {
   switch (type->vtable->kind) {
     case TK_BuiltinType:
       return get_llvm_builtin_type(compiler, (const BuiltinType*)type);
     case TK_EnumType: {
       const BuiltinType* repr = sema_get_integral_type_for_enum(
           compiler->sema, (const EnumType*)type);
-      return get_llvm_type(compiler, &repr->type);
+      return get_llvm_type(compiler, &repr->type, local_ctx);
     }
     case TK_NamedType:
       return get_llvm_type(
           compiler,
-          sema_resolve_named_type(compiler->sema, (const NamedType*)type));
+          sema_resolve_named_type(compiler->sema, (const NamedType*)type),
+          local_ctx);
     case TK_StructType:
-      return get_llvm_struct_type(compiler, (const StructType*)type);
+      return get_llvm_struct_type(compiler, (const StructType*)type, local_ctx);
     case TK_UnionType:
-      return get_llvm_union_type(compiler, (const UnionType*)type);
+      return get_llvm_union_type(compiler, (const UnionType*)type, local_ctx);
     case TK_PointerType:
       return get_opaque_ptr(compiler);
     case TK_ArrayType:
-      return get_llvm_array_type(compiler, (const ArrayType*)type);
+      return get_llvm_array_type(compiler, (const ArrayType*)type, local_ctx);
     case TK_FunctionType:
-      return get_llvm_function_type(compiler, (const FunctionType*)type);
+      return get_llvm_function_type(compiler, (const FunctionType*)type,
+                                    local_ctx);
     case TK_ReplacementSentinelType:
       UNREACHABLE_MSG("This type should not be handled here.");
   }
@@ -520,7 +526,8 @@ LLVMTypeRef get_llvm_type_of_expr_global_ctx(Compiler* compiler,
 
 LLVMValueRef maybe_compile_constant_implicit_cast(Compiler* compiler,
                                                   const Expr* expr,
-                                                  const Type* to_ty);
+                                                  const Type* to_ty,
+                                                  const TreeMap* local_ctx);
 
 LLVMValueRef get_named_global(Compiler* compiler, const char* name) {
   // If not in the local scope, check the global scope.
@@ -540,7 +547,12 @@ LLVMValueRef get_named_global(Compiler* compiler, const char* name) {
       EnumType* enum_ty = NULL;
       tree_map_get(&compiler->sema->enum_names, name, (void*)&enum_ty);
       assert(enum_ty);
-      LLVMTypeRef llvm_ty = get_llvm_type(compiler, &enum_ty->type);
+
+      TreeMap dummy_ctx;
+      string_tree_map_construct(&dummy_ctx);
+      LLVMTypeRef llvm_ty = get_llvm_type(compiler, &enum_ty->type, &dummy_ctx);
+      tree_map_destroy(&dummy_ctx);
+
       return LLVMConstInt(llvm_ty, (unsigned long long)res,
                           /*IsSigned=*/1);
     }
@@ -549,8 +561,12 @@ LLVMValueRef get_named_global(Compiler* compiler, const char* name) {
   return val;
 }
 
+LLVMTypeRef get_llvm_type_of_expr(Compiler* compiler, const Expr* expr,
+                                  const TreeMap* local_ctx);
+
 LLVMValueRef compile_constant_expr(Compiler* compiler, const Expr* expr,
-                                   const Type* to_ty) {
+                                   const Type* to_ty,
+                                   const TreeMap* local_ctx) {
   switch (expr->vtable->kind) {
     case EK_DeclRef: {
       const DeclRef* decl = (const DeclRef*)expr;
@@ -559,8 +575,8 @@ LLVMValueRef compile_constant_expr(Compiler* compiler, const Expr* expr,
       return glob;
     }
     case EK_SizeOf: {
-      ConstExprResult res =
-          sema_eval_sizeof(compiler->sema, (const SizeOf*)expr);
+      ConstExprResult res = sema_eval_sizeof_in_ctx(
+          compiler->sema, (const SizeOf*)expr, local_ctx);
       assert(res.result_kind == RK_UnsignedLongLong);
       LLVMTypeRef llvm_type = get_llvm_type_of_expr_global_ctx(compiler, expr);
       return LLVMConstInt(llvm_type, res.result.ull, /*IsSigned=*/0);
@@ -578,7 +594,8 @@ LLVMValueRef compile_constant_expr(Compiler* compiler, const Expr* expr,
       return glob;
     }
     case EK_Char: {
-      const Type* type = sema_get_type_of_expr(compiler->sema, expr);
+      const Type* type =
+          sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
       assert(type->vtable->kind == TK_BuiltinType);
       bool is_signed = !is_unsigned_integral_type(type);
       LLVMTypeRef llvm_type = get_llvm_type_of_expr_global_ctx(compiler, expr);
@@ -586,15 +603,17 @@ LLVMValueRef compile_constant_expr(Compiler* compiler, const Expr* expr,
                           is_signed);
     }
     case EK_Int: {
-      const Type* type = sema_get_type_of_expr(compiler->sema, expr);
+      const Type* type =
+          sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
       assert(type->vtable->kind == TK_BuiltinType);
       bool is_signed = !is_unsigned_integral_type(type);
       LLVMTypeRef llvm_type = get_llvm_type_of_expr_global_ctx(compiler, expr);
       return LLVMConstInt(llvm_type, ((const Int*)expr)->val, is_signed);
     }
     case EK_BinOp: {
-      LLVMTypeRef llvm_type = get_llvm_type_of_expr_global_ctx(compiler, expr);
-      ConstExprResult res = sema_eval_expr(compiler->sema, expr);
+      LLVMTypeRef llvm_type = get_llvm_type_of_expr(compiler, expr, local_ctx);
+      ConstExprResult res =
+          sema_eval_expr_in_ctx(compiler->sema, expr, local_ctx);
       switch (res.result_kind) {
         case RK_Boolean:
           return LLVMConstInt(llvm_type, res.result.b, /*IsSigned=*/0);
@@ -607,16 +626,19 @@ LLVMValueRef compile_constant_expr(Compiler* compiler, const Expr* expr,
     }
     case EK_Cast: {
       const Cast* cast = (const Cast*)expr;
-      const Type* from_ty = sema_get_type_of_expr(compiler->sema, cast->base);
+      const Type* from_ty =
+          sema_get_type_of_expr_in_ctx(compiler->sema, cast->base, local_ctx);
       const Type* to_ty = cast->to;
 
-      LLVMValueRef from = compile_constant_expr(compiler, cast->base, to_ty);
+      LLVMValueRef from =
+          compile_constant_expr(compiler, cast->base, to_ty, local_ctx);
 
-      if (sema_types_are_compatible(compiler->sema, from_ty, to_ty))
+      if (sema_types_are_compatible(compiler->sema, from_ty, to_ty, local_ctx))
         return from;
 
       if (is_integral_type(from_ty) && is_pointer_type(to_ty))
-        return LLVMConstIntToPtr(from, get_llvm_type(compiler, to_ty));
+        return LLVMConstIntToPtr(from,
+                                 get_llvm_type(compiler, to_ty, local_ctx));
 
       UNREACHABLE_MSG("TODO: Unhandled constant cast conversion");
     }
@@ -624,9 +646,7 @@ LLVMValueRef compile_constant_expr(Compiler* compiler, const Expr* expr,
       const InitializerList* init = (const InitializerList*)expr;
 
       LLVMValueRef res;
-      TreeMap dummy_ctx;  // TODO: Have global version of sema_is_array_type.
-      string_tree_map_construct(&dummy_ctx);
-      bool is_array_ty = sema_is_array_type(compiler->sema, to_ty, &dummy_ctx);
+      bool is_array_ty = sema_is_array_type(compiler->sema, to_ty, local_ctx);
 
       LLVMValueRef* constants = malloc(sizeof(LLVMValueRef) * init->elems.size);
       for (size_t i = 0; i < init->elems.size; ++i) {
@@ -634,31 +654,32 @@ LLVMValueRef compile_constant_expr(Compiler* compiler, const Expr* expr,
         if (elem->expr->vtable->kind == EK_InitializerList) {
           if (is_array_ty) {
             const ArrayType* arr_ty =
-                sema_get_array_type(compiler->sema, to_ty, &dummy_ctx);
+                sema_get_array_type(compiler->sema, to_ty, local_ctx);
             constants[i] = maybe_compile_constant_implicit_cast(
-                compiler, elem->expr, arr_ty->elem_type);
+                compiler, elem->expr, arr_ty->elem_type, local_ctx);
           } else {
             const StructType* struct_ty =
-                sema_get_struct_type(compiler->sema, to_ty, &dummy_ctx);
+                sema_get_struct_type(compiler->sema, to_ty, local_ctx);
             const Member* member_ty = struct_get_nth_member(struct_ty, i);
             constants[i] = maybe_compile_constant_implicit_cast(
-                compiler, elem->expr, member_ty->type);
+                compiler, elem->expr, member_ty->type, local_ctx);
           }
         } else {
-          const Type* elem_ty =
-              sema_get_type_of_expr(compiler->sema, elem->expr);
+          const Type* elem_ty = sema_get_type_of_expr_in_ctx(
+              compiler->sema, elem->expr, local_ctx);
           constants[i] = maybe_compile_constant_implicit_cast(
-              compiler, elem->expr, elem_ty);
+              compiler, elem->expr, elem_ty, local_ctx);
         }
       }
 
       if (is_array_ty) {
         const ArrayType* arr_ty =
-            sema_get_array_type(compiler->sema, to_ty, &dummy_ctx);
-        res = LLVMConstArray(get_llvm_type(compiler, arr_ty->elem_type),
-                             constants, (unsigned)init->elems.size);
+            sema_get_array_type(compiler->sema, to_ty, local_ctx);
+        res = LLVMConstArray(
+            get_llvm_type(compiler, arr_ty->elem_type, local_ctx), constants,
+            (unsigned)init->elems.size);
       } else {
-        assert(sema_is_struct_type(compiler->sema, to_ty, &dummy_ctx));
+        assert(sema_is_struct_type(compiler->sema, to_ty, local_ctx));
         res = LLVMConstStruct(constants, (unsigned)init->elems.size,
                               /*Packed=*/0);
       }
@@ -670,7 +691,8 @@ LLVMValueRef compile_constant_expr(Compiler* compiler, const Expr* expr,
       const UnOp* unop = (const UnOp*)expr;
       switch (unop->op) {
         case UOK_AddrOf:
-          return compile_constant_expr(compiler, unop->subexpr, to_ty);
+          return compile_constant_expr(compiler, unop->subexpr, to_ty,
+                                       local_ctx);
         default:
           UNREACHABLE_MSG(
               "TODO: Implement IR constant expr evaluation for unop expr op %d",
@@ -686,20 +708,23 @@ LLVMValueRef compile_constant_expr(Compiler* compiler, const Expr* expr,
 
 LLVMValueRef maybe_compile_constant_implicit_cast(Compiler* compiler,
                                                   const Expr* expr,
-                                                  const Type* to_ty) {
-  LLVMValueRef from = compile_constant_expr(compiler, expr, to_ty);
+                                                  const Type* to_ty,
+                                                  const TreeMap* local_ctx) {
+  LLVMValueRef from = compile_constant_expr(compiler, expr, to_ty, local_ctx);
 
   // We cannot disambiguate if an initializer list is for an array or struct.
   // They should not be treated like normal expressions, so just use the
   // destination type in this case.
-  const Type* from_ty = expr->vtable->kind == EK_InitializerList
-                            ? to_ty
-                            : sema_get_type_of_expr(compiler->sema, expr);
+  const Type* from_ty =
+      expr->vtable->kind == EK_InitializerList
+          ? to_ty
+          : sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
 
   from_ty = sema_resolve_maybe_named_type(compiler->sema, from_ty);
   to_ty = sema_resolve_maybe_named_type(compiler->sema, to_ty);
 
-  if (sema_types_are_compatible_ignore_quals(compiler->sema, from_ty, to_ty))
+  if (sema_types_are_compatible_ignore_quals(compiler->sema, from_ty, to_ty,
+                                             local_ctx))
     return from;
 
   if (from_ty->vtable->kind == TK_EnumType) {
@@ -715,7 +740,7 @@ LLVMValueRef maybe_compile_constant_implicit_cast(Compiler* compiler,
 
   if (is_integral_type(from_ty) && is_integral_type(to_ty)) {
     unsigned long long from_val = LLVMConstIntGetZExtValue(from);
-    LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, to_ty);
+    LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, to_ty, local_ctx);
     bool is_signed = !is_unsigned_integral_type(to_ty);
     return LLVMConstInt(llvm_to_ty, from_val, is_signed);
   }
@@ -787,9 +812,6 @@ LLVMValueRef compile_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
                                 LLVMBasicBlockRef break_bb,
                                 LLVMBasicBlockRef cont_bb);
 
-LLVMTypeRef get_llvm_type_of_expr(Compiler* compiler, const Expr* expr,
-                                  TreeMap* local_ctx);
-
 LLVMValueRef compile_unop_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
                                      const UnOp* expr, TreeMap* local_ctx,
                                      TreeMap* local_allocas,
@@ -825,12 +847,13 @@ LLVMTypeRef get_llvm_ptr_as_int(const Compiler* compiler) {
 // need to take into account alignment of the original type.
 static LLVMValueRef get_aligned_load(Compiler* compiler, LLVMBuilderRef builder,
                                      const Type* type, LLVMValueRef ptr,
-                                     const char* name) {
-  LLVMTypeRef llvm_type = get_llvm_type(compiler, type);
+                                     const char* name,
+                                     const TreeMap* local_ctx) {
+  LLVMTypeRef llvm_type = get_llvm_type(compiler, type, local_ctx);
   LLVMValueRef load = LLVMBuildLoad2(builder, llvm_type, ptr, name);
 
   if (type->align) {
-    size_t alignment = sema_eval_alignof_type(compiler->sema, type);
+    size_t alignment = sema_eval_alignof_type(compiler->sema, type, local_ctx);
     LLVMSetAlignment(load, (unsigned)alignment);
   }
 
@@ -839,23 +862,24 @@ static LLVMValueRef get_aligned_load(Compiler* compiler, LLVMBuilderRef builder,
 
 static void get_aligned_store(Compiler* compiler, LLVMBuilderRef builder,
                               const Type* type, LLVMValueRef val,
-                              LLVMValueRef ptr) {
+                              LLVMValueRef ptr, const TreeMap* local_ctx) {
   LLVMValueRef store = LLVMBuildStore(builder, val, ptr);
 
   if (type->align) {
-    size_t alignment = sema_eval_alignof_type(compiler->sema, type);
+    size_t alignment = sema_eval_alignof_type(compiler->sema, type, local_ctx);
     LLVMSetAlignment(store, (unsigned)alignment);
   }
 }
 
 static LLVMValueRef get_aligned_alloca(Compiler* compiler,
                                        LLVMBuilderRef builder, const Type* type,
-                                       const char* name) {
-  LLVMTypeRef llvm_type = get_llvm_type(compiler, type);
+                                       const char* name,
+                                       const TreeMap* local_ctx) {
+  LLVMTypeRef llvm_type = get_llvm_type(compiler, type, local_ctx);
   LLVMValueRef alloca = LLVMBuildAlloca(builder, llvm_type, name);
 
   if (type->align) {
-    size_t alignment = sema_eval_alignof_type(compiler->sema, type);
+    size_t alignment = sema_eval_alignof_type(compiler->sema, type, local_ctx);
     LLVMSetAlignment(alloca, (unsigned)alignment);
   }
 
@@ -895,13 +919,18 @@ LLVMValueRef compile_unop(Compiler* compiler, LLVMBuilderRef builder,
                              local_allocas, break_bb, cont_bb);
       const Type* type = sema_get_type_of_expr_in_ctx(compiler->sema,
                                                       expr->subexpr, local_ctx);
-      LLVMTypeRef llvm_type = get_llvm_type(compiler, type);
-      LLVMValueRef val = get_aligned_load(compiler, builder, type, ptr, "");
+      LLVMTypeRef llvm_type = get_llvm_type(compiler, type, local_ctx);
+      LLVMValueRef val =
+          get_aligned_load(compiler, builder, type, ptr, "", local_ctx);
 
       LLVMValueRef one;
       if (LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind) {
+        const Type* pointee = sema_get_pointee(compiler->sema, type, local_ctx);
+        size_t pointee_size =
+            sema_eval_sizeof_type(compiler->sema, pointee, local_ctx);
+
         LLVMTypeRef int_ty = get_llvm_ptr_as_int(compiler);
-        one = LLVMConstInt(int_ty, get_llvm_ptr_size_in_bytes(compiler),
+        one = LLVMConstInt(int_ty, pointee_size,
                            /*signed=*/0);
         val = LLVMBuildPtrToInt(builder, val, int_ty, "");
       } else {
@@ -914,7 +943,7 @@ LLVMValueRef compile_unop(Compiler* compiler, LLVMBuilderRef builder,
       if (LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind)
         postop = LLVMBuildIntToPtr(builder, postop, llvm_type, "");
 
-      get_aligned_store(compiler, builder, type, postop, ptr);
+      get_aligned_store(compiler, builder, type, postop, ptr, local_ctx);
       return is_pre ? postop : val;
     }
     case UOK_Negate: {
@@ -934,7 +963,7 @@ LLVMValueRef compile_unop(Compiler* compiler, LLVMBuilderRef builder,
       return get_aligned_load(
           compiler, builder,
           sema_get_type_of_expr_in_ctx(compiler->sema, &expr->expr, local_ctx),
-          ptr, "");
+          ptr, "", local_ctx);
     }
     default:
       UNREACHABLE_MSG("TODO: Implement compile_unop for this op %d", expr->op);
@@ -970,10 +999,10 @@ LLVMValueRef compile_implicit_cast(Compiler* compiler, LLVMBuilderRef builder,
                              break_bb, cont_bb);
   }
 
-  if (sema_types_are_compatible(compiler->sema, from_ty, to))
+  if (sema_types_are_compatible(compiler->sema, from_ty, to, local_ctx))
     return llvm_from;
 
-  LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, to);
+  LLVMTypeRef llvm_to_ty = get_llvm_type(compiler, to, local_ctx);
   LLVMTypeRef llvm_from_ty = LLVMTypeOf(llvm_from);
 
   if (LLVMGetTypeKind(llvm_from_ty) == LLVMPointerTypeKind) {
@@ -1042,7 +1071,8 @@ LLVMValueRef compile_implicit_cast(Compiler* compiler, LLVMBuilderRef builder,
 // the stack pointer to keep decrementing if it's in a loop.
 LLVMValueRef build_alloca_at_func_start(Compiler* compiler,
                                         LLVMBuilderRef builder,
-                                        const char* name, const Type* type) {
+                                        const char* name, const Type* type,
+                                        const TreeMap* local_ctx) {
   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(builder));
   LLVMBasicBlockRef current_bb = LLVMGetInsertBlock(builder);
   LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(fn);
@@ -1055,7 +1085,8 @@ LLVMValueRef build_alloca_at_func_start(Compiler* compiler,
   else
     LLVMPositionBuilderAtEnd(builder, entry_bb);
 
-  LLVMValueRef alloca = get_aligned_alloca(compiler, builder, type, name);
+  LLVMValueRef alloca =
+      get_aligned_alloca(compiler, builder, type, name, local_ctx);
 
   LLVMPositionBuilderAtEnd(builder, current_bb);
 
@@ -1111,7 +1142,7 @@ LLVMValueRef compile_conditional(Compiler* compiler, LLVMBuilderRef builder,
   const Type* common_ty = sema_get_common_arithmetic_type_of_exprs(
       compiler->sema, expr->true_expr, expr->false_expr, local_ctx);
   LLVMValueRef phi =
-      LLVMBuildPhi(builder, get_llvm_type(compiler, common_ty), "");
+      LLVMBuildPhi(builder, get_llvm_type(compiler, common_ty, local_ctx), "");
   LLVMValueRef incoming_vals[] = {true_expr, false_expr};
   LLVMBasicBlockRef incoming_blocks[] = {ifbb, elsebb};
   LLVMAddIncoming(phi, incoming_vals, incoming_blocks, 2);
@@ -1204,7 +1235,7 @@ LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
   if (maybe_ptr && can_be_used_for_ptr_arithmetic) {
     const Type* pointee_ty =
         sema_get_pointee(compiler->sema, maybe_ptr_ty, local_ctx);
-    LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, pointee_ty);
+    LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, pointee_ty, local_ctx);
 
     LLVMValueRef llvm_offset = compile_expr(
         compiler, builder, offset, local_ctx, local_allocas, break_bb, cont_bb);
@@ -1349,21 +1380,21 @@ LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
       res = LLVMBuildOr(builder, lhs, rhs, "");
       break;
     case BOK_Assign:
-      get_aligned_store(compiler, builder, common_ty, rhs, lhs);
+      get_aligned_store(compiler, builder, common_ty, rhs, lhs, local_ctx);
       res = rhs;
       break;
     case BOK_AddAssign: {
       LLVMValueRef lhs_val =
-          get_aligned_load(compiler, builder, common_ty, lhs, "");
+          get_aligned_load(compiler, builder, common_ty, lhs, "", local_ctx);
       res = LLVMBuildAdd(builder, lhs_val, rhs, "");
-      get_aligned_store(compiler, builder, common_ty, res, lhs);
+      get_aligned_store(compiler, builder, common_ty, res, lhs, local_ctx);
       break;
     }
     case BOK_OrAssign: {
       LLVMValueRef lhs_val =
-          get_aligned_load(compiler, builder, common_ty, lhs, "");
+          get_aligned_load(compiler, builder, common_ty, lhs, "", local_ctx);
       res = LLVMBuildOr(builder, lhs_val, rhs, "");
-      get_aligned_store(compiler, builder, common_ty, res, lhs);
+      get_aligned_store(compiler, builder, common_ty, res, lhs, local_ctx);
       break;
     }
     case BOK_LShift:
@@ -1374,15 +1405,16 @@ LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
           expr->op == BOK_LShiftAssign || expr->op == BOK_RShiftAssign;
       bool is_shl = expr->op == BOK_LShiftAssign || expr->op == BOK_LShift;
       LLVMValueRef lhs_val =
-          is_assign ? get_aligned_load(compiler, builder, lhs_ty, lhs, "")
-                    : lhs;
+          is_assign
+              ? get_aligned_load(compiler, builder, lhs_ty, lhs, "", local_ctx)
+              : lhs;
       if (is_shl) {
         res = LLVMBuildShl(builder, lhs_val, rhs, "");
       } else {
         res = LLVMBuildAShr(builder, lhs_val, rhs, "");
       }
       if (is_assign)
-        get_aligned_store(compiler, builder, lhs_ty, res, lhs);
+        get_aligned_store(compiler, builder, lhs_ty, res, lhs, local_ctx);
       break;
     }
     default:
@@ -1400,20 +1432,21 @@ LLVMValueRef compile_binop(Compiler* compiler, LLVMBuilderRef builder,
 }
 
 LLVMTypeRef get_llvm_type_of_expr(Compiler* compiler, const Expr* expr,
-                                  TreeMap* local_ctx) {
+                                  const TreeMap* local_ctx) {
   const Type* ty =
       sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
-  return get_llvm_type(compiler, ty);
+  return get_llvm_type(compiler, ty, local_ctx);
 }
 
 LLVMTypeRef get_llvm_type_of_expr_global_ctx(Compiler* compiler,
                                              const Expr* expr) {
   TreeMap local_ctx;
   string_tree_map_construct(&local_ctx);
-  LLVMTypeRef type = get_llvm_type(
-      compiler, sema_get_type_of_expr_in_ctx(compiler->sema, expr, &local_ctx));
+  const Type* type =
+      sema_get_type_of_expr_in_ctx(compiler->sema, expr, &local_ctx);
+  LLVMTypeRef llvm_type = get_llvm_type(compiler, type, &local_ctx);
   tree_map_destroy(&local_ctx);
-  return type;
+  return llvm_type;
 }
 
 // Returns a vector of LLVMValueRefs.
@@ -1481,7 +1514,7 @@ LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
                           LLVMBasicBlockRef cont_bb) {
   const Type* type =
       sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
-  LLVMTypeRef llvm_type = get_llvm_type(compiler, type);
+  LLVMTypeRef llvm_type = get_llvm_type(compiler, type, local_ctx);
   switch (expr->vtable->kind) {
     case EK_String: {
       const StringLiteral* s = (const StringLiteral*)expr;
@@ -1510,14 +1543,14 @@ LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
                           /*UsSugbed=*/false);
     }
     case EK_SizeOf: {
-      ConstExprResult res =
-          sema_eval_sizeof(compiler->sema, (const SizeOf*)expr);
+      ConstExprResult res = sema_eval_sizeof_in_ctx(
+          compiler->sema, (const SizeOf*)expr, local_ctx);
       assert(res.result_kind == RK_UnsignedLongLong);
       return LLVMConstInt(llvm_type, res.result.ull, /*IsSigned=*/0);
     }
     case EK_AlignOf: {
-      ConstExprResult res =
-          sema_eval_alignof(compiler->sema, (const AlignOf*)expr);
+      ConstExprResult res = sema_eval_alignof_in_ctx(
+          compiler->sema, (const AlignOf*)expr, local_ctx);
       assert(res.result_kind == RK_UnsignedLongLong);
       return LLVMConstInt(llvm_type, res.result.ull, /*IsSigned=*/0);
     }
@@ -1557,7 +1590,7 @@ LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
       if (sema_is_array_type(compiler->sema, decl_ty, local_ctx))
         return val;
 
-      return get_aligned_load(compiler, builder, type, val, "");
+      return get_aligned_load(compiler, builder, type, val, "", local_ctx);
     }
     case EK_Call: {
       const Call* call = (const Call*)expr;
@@ -1571,7 +1604,8 @@ LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
           sema_get_type_of_expr_in_ctx(compiler->sema, call->base, local_ctx);
       const FunctionType* func_ty =
           sema_get_function(compiler->sema, ty, local_ctx);
-      LLVMTypeRef llvm_func_ty = get_llvm_type(compiler, &func_ty->type);
+      LLVMTypeRef llvm_func_ty =
+          get_llvm_type(compiler, &func_ty->type, local_ctx);
       LLVMValueRef llvm_func =
           compile_expr(compiler, builder, call->base, local_ctx, local_allocas,
                        break_bb, cont_bb);
@@ -1612,7 +1646,8 @@ LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
       if (access->is_arrow) {
         ptr = compile_expr(compiler, builder, access->base, local_ctx,
                            local_allocas, break_bb, cont_bb);
-        LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
+        LLVMTypeRef llvm_base_ty =
+            get_llvm_type(compiler, &base_ty->type, local_ctx);
         LLVMValueRef llvm_offset =
             LLVMConstInt(LLVMInt32Type(), offset, /*signed=*/0);
         LLVMValueRef offsets[] = {LLVMConstNull(LLVMInt32Type()), llvm_offset};
@@ -1621,7 +1656,8 @@ LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
         ptr = compile_lvalue_ptr(compiler, builder, expr, local_ctx,
                                  local_allocas, break_bb, cont_bb);
       }
-      return get_aligned_load(compiler, builder, member->type, ptr, "");
+      return get_aligned_load(compiler, builder, member->type, ptr, "",
+                              local_ctx);
     }
     case EK_Conditional: {
       const Conditional* conditional = (const Conditional*)expr;
@@ -1638,7 +1674,7 @@ LLVMValueRef compile_expr(Compiler* compiler, LLVMBuilderRef builder,
                                             local_allocas, break_bb, cont_bb);
       const Type* ty =
           sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
-      return get_aligned_load(compiler, builder, ty, ptr, "");
+      return get_aligned_load(compiler, builder, ty, ptr, "", local_ctx);
     }
     case EK_StmtExpr: {
       const StmtExpr* stmt_expr = (const StmtExpr*)expr;
@@ -2069,10 +2105,10 @@ void compile_statement(Compiler* compiler, LLVMBuilderRef builder,
       }
 
       if (!llvm_ty)
-        llvm_ty = get_llvm_type(compiler, decl->type);
+        llvm_ty = get_llvm_type(compiler, decl->type, local_ctx);
 
-      LLVMValueRef alloca =
-          build_alloca_at_func_start(compiler, builder, decl->name, decl->type);
+      LLVMValueRef alloca = build_alloca_at_func_start(
+          compiler, builder, decl->name, decl->type, local_ctx);
 
       if (decl->initializer) {
         if (decl->initializer->vtable->kind == EK_InitializerList) {
@@ -2086,15 +2122,17 @@ void compile_statement(Compiler* compiler, LLVMBuilderRef builder,
             const ArrayType* arr_ty =
                 sema_get_array_type(compiler->sema, decl->type, local_ctx);
             if (arr_ty->size) {
-              agg_size = sema_eval_sizeof_type(compiler->sema, decl->type);
+              agg_size =
+                  sema_eval_sizeof_type(compiler->sema, decl->type, local_ctx);
             } else {
               assert(init->elems.size > 0);
-              agg_size =
-                  sema_eval_sizeof_type(compiler->sema, arr_ty->elem_type) *
-                  init->elems.size;
+              agg_size = sema_eval_sizeof_type(compiler->sema,
+                                               arr_ty->elem_type, local_ctx) *
+                         init->elems.size;
             }
           } else {
-            agg_size = sema_eval_sizeof_type(compiler->sema, decl->type);
+            agg_size =
+                sema_eval_sizeof_type(compiler->sema, decl->type, local_ctx);
           }
           LLVMBuildMemSet(
               builder, alloca, LLVMConstNull(LLVMInt8Type()),
@@ -2128,7 +2166,8 @@ void compile_statement(Compiler* compiler, LLVMBuilderRef builder,
           LLVMValueRef init = compile_implicit_cast(
               compiler, builder, decl->initializer, decl->type, local_ctx,
               local_allocas, break_bb, cont_bb);
-          get_aligned_store(compiler, builder, decl->type, init, alloca);
+          get_aligned_store(compiler, builder, decl->type, init, alloca,
+                            local_ctx);
         }
       }
 
@@ -2174,7 +2213,13 @@ LLVMMetadataRef get_di_function_type(Compiler* compiler,
 void compile_function_definition(Compiler* compiler,
                                  const FunctionDefinition* f) {
   FunctionType* func_ty = (FunctionType*)(f->type);
-  LLVMTypeRef llvm_func_ty = get_llvm_type(compiler, f->type);
+
+  TreeMap local_ctx;
+  string_tree_map_construct(&local_ctx);
+
+  // TODO: Have a global version of `get_llvm_type`. The local_ctx is really
+  // unused here but it's needed as an argument.
+  LLVMTypeRef llvm_func_ty = get_llvm_type(compiler, f->type, &local_ctx);
 
   LLVMValueRef func = get_named_global(compiler, f->name);
   if (!func)
@@ -2204,9 +2249,7 @@ void compile_function_definition(Compiler* compiler,
       ctx, /*Line=*/1, /*Column=*/0, subprogram, /*InlinedAt=*/NULL);
   LLVMSetCurrentDebugLocation2(builder, debug_loc);
 
-  TreeMap local_ctx;
   TreeMap local_allocas;
-  string_tree_map_construct(&local_ctx);
   string_tree_map_construct(&local_allocas);
 
   for (size_t i = 0; i < func_ty->pos_args.size; ++i) {
@@ -2216,9 +2259,10 @@ void compile_function_definition(Compiler* compiler,
 
     // Copy the parameter locally.
     LLVMValueRef llvm_arg = LLVMGetParam(func, (unsigned)i);
-    LLVMValueRef alloca =
-        build_alloca_at_func_start(compiler, builder, arg->name, arg->type);
-    get_aligned_store(compiler, builder, arg->type, llvm_arg, alloca);
+    LLVMValueRef alloca = build_alloca_at_func_start(
+        compiler, builder, arg->name, arg->type, &local_ctx);
+    get_aligned_store(compiler, builder, arg->type, llvm_arg, alloca,
+                      &local_ctx);
 
     tree_map_set(&local_ctx, arg->name, arg->type);
     tree_map_set(&local_allocas, arg->name, alloca);
@@ -2291,7 +2335,8 @@ LLVMValueRef compile_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
                                local_allocas, break_bb, cont_bb);
       }
 
-      LLVMTypeRef llvm_base_ty = get_llvm_type(compiler, &base_ty->type);
+      LLVMTypeRef llvm_base_ty =
+          get_llvm_type(compiler, &base_ty->type, local_ctx);
       LLVMValueRef llvm_offset =
           LLVMConstInt(LLVMInt32Type(), offset, /*signed=*/0);
       LLVMValueRef offsets[] = {LLVMConstNull(LLVMInt32Type()), llvm_offset};
@@ -2308,8 +2353,8 @@ LLVMValueRef compile_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
       const Type* src_ty =
           sema_get_type_of_expr_in_ctx(compiler->sema, expr, local_ctx);
       const Type* dst_ty = cast->to;
-      LLVMTypeRef llvm_src_ty = get_llvm_type(compiler, src_ty);
-      LLVMTypeRef llvm_dst_ty = get_llvm_type(compiler, dst_ty);
+      LLVMTypeRef llvm_src_ty = get_llvm_type(compiler, src_ty, local_ctx);
+      LLVMTypeRef llvm_dst_ty = get_llvm_type(compiler, dst_ty, local_ctx);
       if (LLVMGetTypeKind(llvm_src_ty) == LLVMGetTypeKind(llvm_dst_ty))
         return compile_lvalue_ptr(compiler, builder, cast->base, local_ctx,
                                   local_allocas, break_bb, cont_bb);
@@ -2337,7 +2382,8 @@ LLVMValueRef compile_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
 
         const Type* pointee_ty =
             sema_get_pointee(compiler->sema, base_ty, local_ctx);
-        LLVMTypeRef llvm_pointee_ty = get_llvm_type(compiler, pointee_ty);
+        LLVMTypeRef llvm_pointee_ty =
+            get_llvm_type(compiler, pointee_ty, local_ctx);
         return LLVMBuildGEP2(builder, llvm_pointee_ty, base_ptr, offsets, 1,
                              "idx_ptr");
       } else if (sema_is_array_type(compiler->sema, base_ty, local_ctx)) {
@@ -2348,7 +2394,7 @@ LLVMValueRef compile_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
         const Type* elem_ty =
             sema_get_array_type(compiler->sema, base_ty, local_ctx)->elem_type;
 
-        LLVMTypeRef llvm_elem_ty = get_llvm_type(compiler, elem_ty);
+        LLVMTypeRef llvm_elem_ty = get_llvm_type(compiler, elem_ty, local_ctx);
         return LLVMBuildGEP2(builder, llvm_elem_ty, base_ptr, offsets, 1,
                              "idx_arr");
       }
@@ -2361,7 +2407,9 @@ LLVMValueRef compile_lvalue_ptr(Compiler* compiler, LLVMBuilderRef builder,
 }
 
 void compile_global_variable(Compiler* compiler, const GlobalVariable* gv) {
-  LLVMTypeRef ty = get_llvm_type(compiler, gv->type);
+  TreeMap dummy_ctx;
+  string_tree_map_construct(&dummy_ctx);
+  LLVMTypeRef ty = get_llvm_type(compiler, gv->type, &dummy_ctx);
 
   if (gv->type->vtable->kind == TK_FunctionType) {
     if (!get_named_global(compiler, gv->name)) {
@@ -2369,6 +2417,7 @@ void compile_global_variable(Compiler* compiler, const GlobalVariable* gv) {
       assert(!gv->initializer &&
              "If this had an initializer, it would be a function definition.");
     }
+    tree_map_destroy(&dummy_ctx);
     return;
   }
 
@@ -2377,55 +2426,19 @@ void compile_global_variable(Compiler* compiler, const GlobalVariable* gv) {
     // TODO: This would be handled much easier if we had a node for implicit
     // casts.
     LLVMValueRef val = maybe_compile_constant_implicit_cast(
-        compiler, gv->initializer, gv->type);
+        compiler, gv->initializer, gv->type, &dummy_ctx);
     LLVMSetInitializer(glob, val);
 
     if (!gv->is_extern)
       LLVMSetLinkage(glob, LLVMInternalLinkage);
   }
+
+  tree_map_destroy(&dummy_ctx);
 }
 
 ///
 /// End Compiler Implementation
 ///
-
-typedef bool (*ConstUnaryOp)(const void* it, void* arg);
-void* find_if(const void* start, const void* end, size_t sizeof_elem,
-              ConstUnaryOp op, void* arg) {
-  const char* start_ = start;
-  const char* end_ = end;
-  for (; start_ != end_; start_ += sizeof_elem) {
-    if (op(start_, arg))
-      return (void*)start_;
-  }
-  return (void*)end_;
-}
-
-enum ParseMode {
-  // This argument is positional and required.
-  PM_RequiredPositional,
-
-  // This argument can be provided more than once and the result will be
-  // accumulated in a vector. The default value for this parsed argument
-  // is a vector of size 0.
-  PM_Multiple,
-
-  // When the argument is provided, it sets the corresponding ParsedArgument
-  // to true. This argument can only be accepted once. This has a default
-  // value of false.
-  PM_StoreTrue,
-
-  // This argument is optional and can store a single value. If it is
-  // provided, it is stored as a string.
-  PM_Optional,
-};
-
-struct Argument {
-  char short_name;
-  const char* long_name;
-  const char* help;
-  enum ParseMode mode;
-};
 
 const struct Argument kArguments[] = {
     {0, "input_file", "Input file", PM_RequiredPositional},
@@ -2438,202 +2451,17 @@ const struct Argument kArguments[] = {
     {'o', "output", "Output file", PM_Optional},
     {0, "emit-llvm", "Emit LLVM IR to output instead of object code",
      PM_StoreTrue},
+    {0, "ast-dump", "Dump the AST", PM_StoreTrue},
 };
 const size_t kNumArguments = sizeof(kArguments) / sizeof(struct Argument);
 
-bool matches_short_name(const void* it, void* arg) {
-  return ((const struct Argument*)it)->short_name == *((char*)arg);
-}
-
-bool matches_long_name(const void* it, void* arg) {
-  return strcmp(((const struct Argument*)it)->long_name, arg) == 0;
-}
-
-enum ParsedArgKind {
-  PAK_String,        // This represents a `const char *`.
-  PAK_StringVector,  // This represents a `vector` of `const char *`.
-  PAK_Bool,          // This represents a boolean.
-};
-
-struct ParsedArgument {
-  enum ParsedArgKind kind;
-  void* value;
-  bool stored_value;
-};
-
-const struct Argument* get_nth_pos_arg(size_t n) {
-  size_t i;
-  size_t j;
-  for (i = 0, j = 0; i < kNumArguments; ++i) {
-    if (kArguments[i].mode == PM_RequiredPositional) {
-      if (j == n)
-        return &kArguments[i];
-      j++;
-    }
+static void destroy_ast_nodes(vector* ast_nodes) {
+  for (size_t i = 0; i < ast_nodes->size; ++i) {
+    TopLevelNode* node = *(TopLevelNode**)vector_at(ast_nodes, i);
+    top_level_node_destroy(node);
+    free(node);
   }
-  return NULL;
-}
-
-const char* get_next_string_argument_and_advance(int* current_arg,
-                                                 char** argv) {
-  // Get the corresponding argument. Note that if this is in the form
-  //
-  //   -Iargument
-  //
-  // where `I` is the short name, then the actual corresponding value
-  // is part of the current `arg`. Otherwise, it is in the form
-  //
-  //   -I argument
-  //
-  // where the value is the next `arg`.
-  const char* res;
-  const char* arg = argv[*current_arg];
-  if (arg[2] == 0) {
-    // Next argument.
-    res = argv[*current_arg + 1];
-
-    *current_arg += 2;
-  } else {
-    // Remainder of this argument.
-    res = &arg[2];
-
-    *current_arg += 1;
-  }
-  return res;
-}
-
-void parse_args(TreeMap* parsed_args, int argc, char** argv) {
-  const struct Argument* args_end = &kArguments[kNumArguments];
-  size_t num_parsed_pos_args = 0;
-
-  // Set then default values for parsed arguments.
-  for (const struct Argument* it = kArguments; it != &kArguments[kNumArguments];
-       ++it) {
-    switch (it->mode) {
-      case PM_RequiredPositional:
-      case PM_Optional:
-        // None of these modes uses a default value.
-        break;
-      case PM_StoreTrue: {
-        if (!tree_map_get(parsed_args, it->long_name, NULL)) {
-          struct ParsedArgument* parsed_arg =
-              malloc(sizeof(struct ParsedArgument));
-          parsed_arg->kind = PAK_Bool;
-          parsed_arg->stored_value = false;
-          tree_map_set(parsed_args, it->long_name, parsed_arg);
-        }
-        break;
-      }
-      case PM_Multiple: {
-        if (!tree_map_get(parsed_args, it->long_name, NULL)) {
-          struct ParsedArgument* parsed_arg =
-              malloc(sizeof(struct ParsedArgument));
-          parsed_arg->kind = PAK_StringVector;
-          parsed_arg->value = malloc(sizeof(vector));
-          vector_construct(parsed_arg->value, sizeof(char*), alignof(char*));
-          tree_map_set(parsed_args, it->long_name, parsed_arg);
-        }
-        break;
-      }
-    }
-  }
-
-  for (int i = 1; i < argc;) {
-    const char* arg = argv[i];
-
-    if (arg[0] == '-') {
-      // Optional argument.
-
-      const struct Argument* found_arg;
-      if (arg[1] != '-') {
-        char short_name = arg[1];
-        found_arg = find_if(kArguments, args_end, sizeof(struct Argument),
-                            matches_short_name, &short_name);
-        ASSERT_MSG(found_arg != args_end, "Unknown argument '%s'", arg);
-      } else {
-        const char* long_name = &arg[2];
-        found_arg = find_if(kArguments, args_end, sizeof(struct Argument),
-                            matches_long_name, (void*)long_name);
-        ASSERT_MSG(found_arg != args_end, "Unknown argument '%s'", arg);
-      }
-
-      switch (found_arg->mode) {
-        case PM_RequiredPositional:
-          UNREACHABLE_MSG(
-              "Required positional argument should not be handled in the "
-              "optional argument cases");
-        case PM_StoreTrue: {
-          // This already has a default value set prior.
-          struct ParsedArgument* parsed_arg = NULL;
-          tree_map_get(parsed_args, found_arg->long_name, &parsed_arg);
-          assert(parsed_arg);
-
-          parsed_arg->kind = PAK_Bool;
-          parsed_arg->stored_value = true;
-
-          i += 1;
-          break;
-        }
-        case PM_Optional: {
-          ASSERT_MSG(!tree_map_get(parsed_args, found_arg->long_name, NULL),
-                     "Duplicate optional argument '%s' was already provided.",
-                     found_arg->long_name);
-          const char* val = get_next_string_argument_and_advance(&i, argv);
-
-          struct ParsedArgument* parsed_arg =
-              malloc(sizeof(struct ParsedArgument));
-          parsed_arg->kind = PAK_String;
-          parsed_arg->value = (void*)val;
-          tree_map_set(parsed_args, found_arg->long_name, parsed_arg);
-          break;
-        }
-        case PM_Multiple: {
-          // This already has a default value set prior.
-          struct ParsedArgument* parsed_arg = NULL;
-          tree_map_get(parsed_args, found_arg->long_name, &parsed_arg);
-          ASSERT_MSG(parsed_arg, "Expected default value for '%s'",
-                     found_arg->long_name);
-
-          const char** storage = vector_append_storage(parsed_arg->value);
-          *storage = get_next_string_argument_and_advance(&i, argv);
-          break;
-        }
-      }
-    } else {
-      // Positional argument.
-      const struct Argument* pos_arg = get_nth_pos_arg(num_parsed_pos_args);
-      assert(pos_arg);
-      ++num_parsed_pos_args;
-
-      struct ParsedArgument* parsed_arg = malloc(sizeof(struct ParsedArgument));
-      parsed_arg->kind = PAK_String;
-      parsed_arg->value = (void*)arg;
-
-      tree_map_set(parsed_args, pos_arg->long_name, parsed_arg);
-
-      i += 1;
-    }
-  }
-}
-
-void destroy_parsed_argument(const void* key, void* value, void* arg) {
-  struct ParsedArgument* parsed_arg = value;
-  switch (parsed_arg->kind) {
-    case PAK_Bool:
-    case PAK_String:
-      // Do nothing since we actually save `const char *` here.
-      break;
-    case PAK_StringVector:
-      vector_destroy(parsed_arg->value);
-      free(parsed_arg->value);
-      break;
-  }
-  free(parsed_arg);
-}
-
-void destroy_parsed_args(TreeMap* parsed_args) {
-  tree_map_iterate(parsed_args, destroy_parsed_argument, /*arg=*/NULL);
-  tree_map_destroy(parsed_args);
+  vector_destroy(ast_nodes);
 }
 
 int main(int argc, char** argv) {
@@ -2642,14 +2470,9 @@ int main(int argc, char** argv) {
   RunTreeMapTests();
   RunParserTests();
 
-  if (argc < 2) {
-    printf("Usage: %s input_file\n", argv[0]);
-    return -1;
-  }
-
   TreeMap parsed_args;
   string_tree_map_construct(&parsed_args);
-  parse_args(&parsed_args, argc, argv);
+  parse_args(kNumArguments, kArguments, &parsed_args, argc, argv);
 
   struct ParsedArgument* include_dirs = NULL;
   tree_map_get(&parsed_args, "include", &include_dirs);
@@ -2673,6 +2496,104 @@ int main(int argc, char** argv) {
   ASSERT_MSG(tree_map_get(&parsed_args, "input_file", &input_arg),
              "No input file provided");
   const char* input_filename = input_arg->value;
+
+  // Parsing + compiling
+  vector ast_nodes;
+  vector_construct(&ast_nodes, sizeof(TopLevelNode*), alignof(TopLevelNode*));
+  {
+    FileInputStream* file_input = malloc(sizeof(FileInputStream));
+    file_input_stream_construct(file_input, input_filename);
+    PreprocessorInputStream pp;
+    preprocessor_input_stream_construct(&pp, &file_input->base);
+    Parser parser;
+    parser_construct(&parser, &pp.base, input_filename);
+
+    // Construct the AST.
+    while (true) {
+      const Token* token = parser_peek_token(&parser);
+      if (token->kind == TK_Eof)
+        break;
+
+      TRACE("Parsing top level node at %s:%zu:%zu (%s)",
+            source_location_filename(&token->loc),
+            source_location_line(&token->loc), source_location_col(&token->loc),
+            token->chars.data);
+
+      // Note that the parse_* functions destroy the tokens.
+      TopLevelNode* top_level_decl = parse_top_level_decl(&parser);
+
+      TopLevelNode** storage = vector_append_storage(&ast_nodes);
+      *storage = top_level_decl;
+    }
+
+    struct ParsedArgument* do_dump_ast;
+    if (tree_map_get(&parsed_args, "ast-dump", &do_dump_ast) &&
+        do_dump_ast->stored_value) {
+      dump_ast(&ast_nodes);
+
+      destroy_parsed_args(&parsed_args);
+      destroy_ast_nodes(&ast_nodes);
+      parser_destroy(&parser);
+      input_stream_destroy(&pp.base);
+      vector_destroy(&include_dir_paths);
+      return 0;
+    }
+
+    parser_destroy(&parser);
+    input_stream_destroy(&pp.base);
+  }
+
+  Sema sema;
+  sema_construct(&sema);
+
+  // Perform semantic analysis on the AST.
+  for (const TopLevelNode** it = vector_begin(&ast_nodes);
+       it != vector_end(&ast_nodes); ++it) {
+    const TopLevelNode* top_level_decl = *it;
+
+    switch (top_level_decl->vtable->kind) {
+      case TLNK_Typedef: {
+        Typedef* td = (Typedef*)top_level_decl;
+        sema_add_typedef_type(&sema, td->name, td->type);
+        break;
+      }
+      case TLNK_StaticAssert: {
+        StaticAssert* sa = (StaticAssert*)top_level_decl;
+
+        TreeMap dummy_ctx;
+        string_tree_map_construct(&dummy_ctx);
+        sema_verify_static_assert_condition(&sema, sa->expr, &dummy_ctx);
+        tree_map_destroy(&dummy_ctx);
+
+        break;
+      }
+      case TLNK_GlobalVariable: {
+        GlobalVariable* gv = (GlobalVariable*)top_level_decl;
+        sema_handle_global_variable(&sema, gv);
+        break;
+      }
+      case TLNK_FunctionDefinition: {
+        FunctionDefinition* f = (FunctionDefinition*)top_level_decl;
+        sema_handle_function_definition(&sema, f);
+        break;
+      }
+      case TLNK_StructDeclaration: {
+        StructDeclaration* decl = (StructDeclaration*)top_level_decl;
+        sema_handle_struct_declaration(&sema, decl);
+        break;
+      }
+      case TLNK_EnumDeclaration: {
+        EnumDeclaration* decl = (EnumDeclaration*)top_level_decl;
+        sema_handle_enum_declaration(&sema, decl);
+        break;
+      }
+      case TLNK_UnionDeclaration: {
+        UnionDeclaration* decl = (UnionDeclaration*)top_level_decl;
+        sema_handle_union_declaration(&sema, decl);
+        break;
+      }
+    }
+  }
 
   // LLVM Initialization
   LLVMModuleRef mod = LLVMModuleCreateWithName(input_filename);
@@ -2709,97 +2630,48 @@ int main(int argc, char** argv) {
   LLVMTargetDataRef data_layout = LLVMCreateTargetDataLayout(target_machine);
   LLVMSetModuleDataLayout(mod, data_layout);
 
-  // Parsing + compiling
-  FileInputStream* file_input = malloc(sizeof(FileInputStream));
-  file_input_stream_construct(file_input, input_filename);
-  PreprocessorInputStream pp;
-  preprocessor_input_stream_construct(&pp, &file_input->base);
-  Parser parser;
-  parser_construct(&parser, &pp.base, input_filename);
-
-  Sema sema;
-  sema_construct(&sema);
-
   Compiler compiler;
   compiler_construct(&compiler, mod, &sema, dibuilder);
-
-  vector nodes_to_destroy;
-  vector_construct(&nodes_to_destroy, sizeof(TopLevelNode*),
-                   alignof(TopLevelNode*));
-
-  while (true) {
-    const Token* token = parser_peek_token(&parser);
-    if (token->kind == TK_Eof) {
-      break;
-    } else {
-      TRACE("Evaluating top level node at %s:%zu:%zu (%s)",
-            source_location_filename(&token->loc),
-            source_location_line(&token->loc), source_location_col(&token->loc),
-            token->chars.data);
-
-      // Note that the parse_* functions destroy the tokens.
-      TopLevelNode* top_level_decl = parse_top_level_decl(&parser);
-
-      switch (top_level_decl->vtable->kind) {
-        case TLNK_Typedef: {
-          Typedef* td = (Typedef*)top_level_decl;
-          sema_add_typedef_type(&sema, td->name, td->type);
-          break;
-        }
-        case TLNK_StaticAssert: {
-          StaticAssert* sa = (StaticAssert*)top_level_decl;
-          sema_verify_static_assert_condition(&sema, sa->expr);
-          break;
-        }
-        case TLNK_GlobalVariable: {
-          GlobalVariable* gv = (GlobalVariable*)top_level_decl;
-          sema_handle_global_variable(&sema, gv);
-          compile_global_variable(&compiler, gv);
-          break;
-        }
-        case TLNK_FunctionDefinition: {
-          FunctionDefinition* f = (FunctionDefinition*)top_level_decl;
-          sema_handle_function_definition(&sema, f);
-          compile_function_definition(&compiler, f);
-          break;
-        }
-        case TLNK_StructDeclaration: {
-          StructDeclaration* decl = (StructDeclaration*)top_level_decl;
-          sema_handle_struct_declaration(&sema, decl);
-          break;
-        }
-        case TLNK_EnumDeclaration: {
-          EnumDeclaration* decl = (EnumDeclaration*)top_level_decl;
-          sema_handle_enum_declaration(&sema, decl);
-          break;
-        }
-        case TLNK_UnionDeclaration: {
-          UnionDeclaration* decl = (UnionDeclaration*)top_level_decl;
-          sema_handle_union_declaration(&sema, decl);
-          break;
-        }
-      }
-
-      TopLevelNode** storage = vector_append_storage(&nodes_to_destroy);
-      *storage = top_level_decl;
-
-      if (LLVMVerifyModule(mod, LLVMPrintMessageAction, NULL)) {
-        printf("Verify module failed\n");
-        LLVMDumpModule(mod);
-        __builtin_trap();
-      }
-    }
-  }
-
-  LLVMDIBuilderFinalize(dibuilder);
 
   const char* output = "out.obj";
   struct ParsedArgument* output_arg;
   if (tree_map_get(&parsed_args, "output", &output_arg))
     output = output_arg->value;
 
-  struct ParsedArgument* emit_llvm;
+  // Compile the AST.
+  for (const TopLevelNode** it = vector_begin(&ast_nodes);
+       it != vector_end(&ast_nodes); ++it) {
+    const TopLevelNode* top_level_decl = *it;
 
+    switch (top_level_decl->vtable->kind) {
+      case TLNK_Typedef:
+      case TLNK_StaticAssert:
+      case TLNK_StructDeclaration:
+      case TLNK_EnumDeclaration:
+      case TLNK_UnionDeclaration:
+        break;
+      case TLNK_GlobalVariable: {
+        GlobalVariable* gv = (GlobalVariable*)top_level_decl;
+        compile_global_variable(&compiler, gv);
+        break;
+      }
+      case TLNK_FunctionDefinition: {
+        FunctionDefinition* f = (FunctionDefinition*)top_level_decl;
+        compile_function_definition(&compiler, f);
+        break;
+      }
+    }
+
+    if (LLVMVerifyModule(mod, LLVMPrintMessageAction, NULL)) {
+      printf("Verify module failed\n");
+      LLVMDumpModule(mod);
+      __builtin_trap();
+    }
+  }
+
+  LLVMDIBuilderFinalize(dibuilder);
+
+  struct ParsedArgument* emit_llvm;
   int ret_code = 0;
 
   if (tree_map_get(&parsed_args, "emit-llvm", &emit_llvm) &&
@@ -2814,17 +2686,10 @@ int main(int argc, char** argv) {
     ret_code = -1;
   }
 
-  for (size_t i = 0; i < nodes_to_destroy.size; ++i) {
-    TopLevelNode* node = *(TopLevelNode**)vector_at(&nodes_to_destroy, i);
-    top_level_node_destroy(node);
-    free(node);
-  }
-  vector_destroy(&nodes_to_destroy);
+  destroy_ast_nodes(&ast_nodes);
 
   compiler_destroy(&compiler);
   sema_destroy(&sema);
-  parser_destroy(&parser);
-  input_stream_destroy(&pp.base);
   vector_destroy(&include_dir_paths);
   destroy_parsed_args(&parsed_args);
 
