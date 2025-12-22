@@ -1,5 +1,6 @@
 #include "argparse.h"
 
+#include <assert.h>
 #include <string.h>
 
 #include "common.h"
@@ -56,8 +57,33 @@ static const char* get_next_string_argument_and_advance(int* current_arg,
   return res;
 }
 
+static void verify_args(size_t num_args, const struct Argument* args) {
+  bool unique_short_names[256];
+  memset(unique_short_names, 0, sizeof(unique_short_names));
+
+  TreeMap unique_long_names;
+  string_tree_map_construct(&unique_long_names);
+
+  for (const struct Argument* it = args; it != &args[num_args]; ++it) {
+    if (it->short_name == 0)
+      continue;
+
+    ASSERT_MSG(!unique_short_names[(unsigned char)it->short_name],
+               "Found duplicate short name '%c'", it->short_name);
+    ASSERT_MSG(!tree_map_has(&unique_long_names, it->long_name),
+               "Found duplicate long name '%s'", it->long_name);
+
+    unique_short_names[(unsigned char)it->short_name] = true;
+    tree_map_set(&unique_long_names, it->long_name, NULL);
+  }
+
+  tree_map_destroy(&unique_long_names);
+}
+
 void parse_args(size_t num_args, const struct Argument* args,
                 TreeMap* parsed_args, int argc, char** argv) {
+  verify_args(num_args, args);
+
   const struct Argument* args_end = &args[num_args];
   size_t num_parsed_pos_args = 0;
 

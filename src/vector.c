@@ -1,5 +1,8 @@
 #include "vector.h"
 
+#include <assert.h>
+#include <stdint.h>
+
 #include "common.h"
 
 static const size_t kDefaultVectorCapacity = 16;
@@ -36,6 +39,12 @@ void vector_reserve(vector* v, size_t new_capacity) {
   assert((uintptr_t)v->data % v->data_alignment == 0);
 }
 
+void vector_resize(vector* v, size_t new_size) {
+  if (v->size < new_size)
+    vector_reserve(v, new_size);
+  v->size = new_size;
+}
+
 // Allocate more storage to the vector and return a pointer to the new
 // storage so it can be initialized by the user.
 void* vector_append_storage(vector* v) {
@@ -60,6 +69,11 @@ void* vector_back(const vector* v) {
 void* vector_begin(const vector* v) { return v->data; }
 
 void* vector_end(const vector* v) { return vector_at(v, v->size); }
+
+void vector_pop_back(vector* v) {
+  assert(v->size > 0);
+  v->size--;
+}
 
 ///
 /// Start Vector Tests
@@ -128,11 +142,35 @@ static void TestVectorResizing() {
   vector_destroy(&v);
 }
 
+static void TestVectorResize() {
+  vector v;
+  vector_construct(&v, sizeof(int), alignof(int));
+  assert(v.size == 0);
+
+  vector_resize(&v, 8);
+  assert(v.size == 8);
+
+  vector_destroy(&v);
+}
+
+static void TestVectorPopBack() {
+  vector v;
+  vector_construct(&v, sizeof(int), alignof(int));
+
+  vector_append_storage(&v);
+  vector_pop_back(&v);
+  assert(v.size == 0);
+
+  vector_destroy(&v);
+}
+
 void RunVectorTests() {
   TestVectorConstruction();
   TestVectorCapacityReservation();
   TestVectorAppend();
   TestVectorResizing();
+  TestVectorResize();
+  TestVectorPopBack();
 }
 
 ///

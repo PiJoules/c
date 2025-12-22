@@ -18,11 +18,13 @@ typedef struct {
 void vector_construct(vector* v, size_t data_size, size_t data_alignment);
 void vector_destroy(vector* v);
 void vector_reserve(vector* v, size_t new_capacity);
+void vector_resize(vector* v, size_t new_size);
 void* vector_append_storage(vector* v);
 void* vector_at(const vector* v, size_t i);
 void* vector_back(const vector* v);
 void* vector_begin(const vector* v);
 void* vector_end(const vector* v);
+void vector_pop_back(vector* v);
 
 void RunVectorTests();
 

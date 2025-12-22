@@ -2,6 +2,7 @@
 #define CSTRING_H_
 
 #include <string.h>
+#include <stdlib.h>
 
 typedef struct {
   char* data;
@@ -13,6 +14,12 @@ typedef struct {
 
 void string_construct(string* s);
 void string_destroy(string* s);
+
+static inline void string_destroy_and_free(string* s) {
+  string_destroy(s);
+  free(s);
+}
+
 void string_clear(string* s);
 void string_reserve(string* s, size_t new_capacity);
 void string_append(string* s, const char* suffix);

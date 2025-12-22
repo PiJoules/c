@@ -11,9 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #include "argparse.h"
 #include "ast-dump.h"
@@ -24,6 +21,8 @@
 #include "istream.h"
 #include "lexer.h"
 #include "parser.h"
+#include "path.h"
+#include "preprocessor.h"
 #include "sema.h"
 #include "sstream.h"
 #include "stmt.h"
@@ -41,227 +40,6 @@
 // This is probably fine since AFAICT, upstream clang doesn't have any backends
 // where a byte is not 8 bits. If there was, that would be pretty interesting.
 static const int kCharBit = 8;
-
-///
-/// Start Path Implementation
-///
-
-const char kPathSeparator = '/';
-
-typedef struct {
-  string path_;
-} Path;
-
-void path_construct(Path* path, string* other) {
-  string_construct(&path->path_);
-  string_assign(&path->path_, other);
-}
-
-void path_destroy(Path* path) { string_destroy(&path->path_); }
-
-bool path_is_abs(const Path* this) {
-  // FIXME: Only works on *nix systems.
-  return this->path_.data[0] == '/';
-}
-
-bool path_exists(const Path* this) {
-  return access(this->path_.data, F_OK) == 0;
-}
-
-void path_append(Path* this, const Path* other) {
-  // Do not append an absolute path to anything.
-  assert(!path_is_abs(other));
-
-  if (string_back(&this->path_) != kPathSeparator)
-    string_append_char(&this->path_, kPathSeparator);
-
-  string_append(&this->path_, other->path_.data);
-}
-
-bool path_is_file(const Path* this) {
-  struct stat path_stat;
-  stat(this->path_.data, &path_stat);
-  return S_ISREG(path_stat.st_mode);
-}
-
-bool path_is_dir(const Path* this) {
-  struct stat path_stat;
-  stat(this->path_.data, &path_stat);
-  return S_ISDIR(path_stat.st_mode);
-}
-
-///
-/// End Path Implementation
-///
-
-///
-/// Start Input Stream Implementation
-///
-
-void preprocessor_input_stream_destroy(InputStream*);
-int preprocessor_input_stream_read(InputStream*);
-bool preprocessor_input_stream_eof(InputStream*);
-
-const InputStreamVtable PreprocessorInputStreamVtable = {
-    .dtor = preprocessor_input_stream_destroy,
-    .read = preprocessor_input_stream_read,
-    .eof = preprocessor_input_stream_eof,
-};
-
-struct PreprocessorInputStream {
-  InputStream base;
-
-  InputStream* input_;
-
-  // This is a buffer used for saving chars when handling directives. This needs
-  // to have a persistent state in the event we read `#pragma` which isn't
-  // handled by the preprocessor directly and needs to be handled by the
-  // compiler proper.
-  string saved_directive_chars;
-
-  // If we hit an `include` which we would expand, this nested stream will
-  // represent a stream to that included file.
-  struct PreprocessorInputStream* included_stream_;
-};
-typedef struct PreprocessorInputStream PreprocessorInputStream;
-
-void preprocessor_input_stream_construct(PreprocessorInputStream* pp,
-                                         InputStream* input) {
-  input_stream_construct(&pp->base, &PreprocessorInputStreamVtable);
-  pp->input_ = input;
-  assert(input);
-  string_construct(&pp->saved_directive_chars);
-  pp->included_stream_ = NULL;
-}
-
-void preprocessor_input_stream_destroy(InputStream* input) {
-  PreprocessorInputStream* pp = (PreprocessorInputStream*)input;
-  input_stream_destroy(pp->input_);
-  free(pp->input_);
-  string_destroy(&pp->saved_directive_chars);
-
-  if (pp->included_stream_) {
-    input_stream_destroy(&pp->included_stream_->base);
-    free(pp->included_stream_);
-  }
-}
-
-int preprocessor_input_stream_read(InputStream* input) {
-  PreprocessorInputStream* pp = (PreprocessorInputStream*)input;
-
-  if (pp->saved_directive_chars.size > 0) {
-    // FIXME: We should be adding an implicit cast in the AST so we don't need
-    // to explicitly cast here.
-    return (int)string_pop_front(&pp->saved_directive_chars);
-  }
-
-  if (!pp->included_stream_) {
-    // Handle preprocessor expansions.
-    int c = input_stream_read(pp->input_);
-
-    // Take into account string literals where we cannot treat `# <directive>`
-    // with normal directive-handlign logic.
-    if (c == '"' || c == '\'') {
-      char starting_char = (char)c;
-      string_append_char(&pp->saved_directive_chars, starting_char);
-
-      // Keep reading chars until the closing char, accounting for escaped
-      // chars.
-      while (1) {
-        c = input_stream_read(pp->input_);
-        string_append_char(&pp->saved_directive_chars, (char)c);
-
-        if (c == '\\') {
-          c = input_stream_read(pp->input_);
-          string_append_char(&pp->saved_directive_chars, (char)c);
-        } else if (c == starting_char) {
-          break;
-        }
-      }
-
-      return (int)string_pop_front(&pp->saved_directive_chars);
-    }
-
-    if (c != '#')
-      return c;
-
-    // Need to save it in case this is a #pragma.
-    string_append_char(&pp->saved_directive_chars, '#');
-
-    // Skip WS.
-    while (isspace(c = input_stream_read(pp->input_))) {
-      assert(c != EOF);
-      string_append_char(&pp->saved_directive_chars, (char)c);
-    }
-    assert(c != EOF);
-
-    string directive;
-    string_construct(&directive);
-    string_append_char(&directive, (char)c);
-    string_append_char(&pp->saved_directive_chars, (char)c);
-
-    while (isalpha(c = input_stream_read(pp->input_))) {
-      string_append_char(&directive, (char)c);
-      string_append_char(&pp->saved_directive_chars, (char)c);
-    }
-
-    if (string_equals(&directive, "include")) {
-      // Found a `#include`. Read either <path> or "path".
-      while (isspace(c)) c = input_stream_read(pp->input_);
-
-      assert(c == '<' || c == '"');
-      int closing_c = c == '<' ? '>' : '"';
-
-      string include_path;
-      string_construct(&include_path);
-
-      // Now read the path. Note the path can have spaces in it.
-      while ((c = input_stream_read(pp->input_)) != closing_c) {
-        assert(c != EOF);
-        string_append_char(&include_path, (char)c);
-      }
-
-      // Open the file and assign it to a new nested preprocessor.
-      FileInputStream* include_file = malloc(sizeof(FileInputStream));
-      file_input_stream_construct(include_file, include_path.data);
-      pp->included_stream_ = malloc(sizeof(PreprocessorInputStream));
-      preprocessor_input_stream_construct(pp->included_stream_,
-                                          &include_file->base);
-
-      string_destroy(&include_path);
-    } else if (string_equals(&directive, "pragma")) {
-      // #pragmas are the one exception where the preprocessor doesn't handle
-      // them, so we need to save the characters for passing them to the
-      // compiler proper for handling.
-      //
-      // Just add the last read char back to `saved_directive_chars` so it can
-      // eventually be popped later.
-      assert(c != EOF);
-      string_append_char(&pp->saved_directive_chars, (char)c);
-      string_destroy(&directive);
-      return (int)string_pop_front(&pp->saved_directive_chars);
-    } else {
-      UNREACHABLE_MSG("TODO: Handle preprocessor directive '%s'",
-                      directive.data);
-    }
-
-    string_destroy(&directive);
-    string_clear(&pp->saved_directive_chars);
-  }
-
-  return input_stream_read(&pp->included_stream_->base);
-}
-
-bool preprocessor_input_stream_eof(InputStream* input) {
-  PreprocessorInputStream* pp = (PreprocessorInputStream*)input;
-  if (pp->included_stream_)
-    return input_stream_eof(&pp->included_stream_->base);
-  return input_stream_eof(pp->input_);
-}
-
-///
-/// End Input Stream Implementation
-///
 
 ///
 /// Start Compiler Implementation
@@ -2452,6 +2230,9 @@ const struct Argument kArguments[] = {
     {0, "emit-llvm", "Emit LLVM IR to output instead of object code",
      PM_StoreTrue},
     {0, "ast-dump", "Dump the AST", PM_StoreTrue},
+    {'E', "only-preprocess",
+     "Stop after the preprocessing stage and only output the processed file",
+     PM_StoreTrue},
 };
 const size_t kNumArguments = sizeof(kArguments) / sizeof(struct Argument);
 
@@ -2462,6 +2243,14 @@ static void destroy_ast_nodes(vector* ast_nodes) {
     free(node);
   }
   vector_destroy(ast_nodes);
+}
+
+static void destroy_include_dirs(vector* include_dir_paths) {
+  for (Path* it = vector_begin(include_dir_paths);
+       it != vector_end(include_dir_paths); ++it) {
+    path_destroy(it);
+  }
+  vector_destroy(include_dir_paths);
 }
 
 int main(int argc, char** argv) {
@@ -2480,6 +2269,12 @@ int main(int argc, char** argv) {
 
   vector include_dir_paths;  // vector of Paths
   vector_construct(&include_dir_paths, sizeof(Path), alignof(Path));
+
+  for (const char** it = vector_begin(include_dirs->value);
+       it != vector_end(include_dirs->value); ++it) {
+    Path* path = vector_append_storage(&include_dir_paths);
+    path_construct_from_c_str(path, *it);
+  }
 
   struct ParsedArgument* verbose;
   if (tree_map_get(&parsed_args, "verbose", &verbose) &&
@@ -2501,10 +2296,25 @@ int main(int argc, char** argv) {
   vector ast_nodes;
   vector_construct(&ast_nodes, sizeof(TopLevelNode*), alignof(TopLevelNode*));
   {
-    FileInputStream* file_input = malloc(sizeof(FileInputStream));
-    file_input_stream_construct(file_input, input_filename);
+    FileInputStream file_input;
+    file_input_stream_construct(&file_input, input_filename);
     PreprocessorInputStream pp;
-    preprocessor_input_stream_construct(&pp, &file_input->base);
+    preprocessor_input_stream_construct(&pp, &file_input, &include_dir_paths);
+
+    struct ParsedArgument* only_preprocess;
+    if (tree_map_get(&parsed_args, "only-preprocess", &only_preprocess) &&
+        only_preprocess->stored_value) {
+      while (!input_stream_eof(&pp.base)) {
+        putchar((char)input_stream_read(&pp.base));
+      }
+
+      destroy_parsed_args(&parsed_args);
+      input_stream_destroy(&pp.base);
+      input_stream_destroy(&file_input.base);
+      destroy_include_dirs(&include_dir_paths);
+      return 0;
+    }
+
     Parser parser;
     parser_construct(&parser, &pp.base, input_filename);
 
@@ -2535,12 +2345,14 @@ int main(int argc, char** argv) {
       destroy_ast_nodes(&ast_nodes);
       parser_destroy(&parser);
       input_stream_destroy(&pp.base);
-      vector_destroy(&include_dir_paths);
+
+      destroy_include_dirs(&include_dir_paths);
       return 0;
     }
 
     parser_destroy(&parser);
     input_stream_destroy(&pp.base);
+    input_stream_destroy(&file_input.base);
   }
 
   Sema sema;
@@ -2690,8 +2502,9 @@ int main(int argc, char** argv) {
 
   compiler_destroy(&compiler);
   sema_destroy(&sema);
-  vector_destroy(&include_dir_paths);
   destroy_parsed_args(&parsed_args);
+
+  destroy_include_dirs(&include_dir_paths);
 
   LLVMDisposeModule(mod);
   LLVMDisposeTargetData(data_layout);
